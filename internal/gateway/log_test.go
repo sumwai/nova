@@ -216,25 +216,36 @@ func TestRenderAttemptShowsArrowsOnlyOnChange(t *testing.T) {
 	}
 }
 
-func TestRenderAttemptPutsErrorDetailOnItsOwnLine(t *testing.T) {
+func TestRenderAttemptPutsErrorDetailOnItsOwnRecord(t *testing.T) {
 	rec := domain.AttemptRecord{
-		RequestID: "req1", Attempt: 1, UpstreamID: "relay api.example.com",
+		RequestID: "req1", Attempt: 2, UpstreamID: "relay api.example.com",
 		ClientProtocol: domain.ProtocolOpenAIChat, UpstreamProtocol: domain.ProtocolOpenAIChat,
 		RequestedModel: "gpt-5", UpstreamModel: "gpt-5",
-		Outcome: domain.AttemptFailed, ErrorCode: "upstream_unavailable",
-		ErrorDetail: "上游 HTTP 状态码 503：{}",
+		Outcome: domain.AttemptFailed, ErrorCode: "upstream_rate_limited",
+		ErrorDetail: "上游 HTTP 状态码 429：{}",
 		StartedAt:   time.Now(), EndedAt: time.Now(),
 	}
 	lines := strings.Split(renderAttempt(rec, false), "\n")
 	if len(lines) != 2 {
-		t.Fatalf("失败尝试应占两行（正文 + 明细），实际 %d 行：%q", len(lines), lines)
+		t.Fatalf("失败尝试应占两条记录（attempt + 上游明细），实际 %d 行：%q", len(lines), lines)
 	}
-	// 明细缩进排：它是失败记录里唯一真正要看的东西，挤在长行尾部等于没有。
-	if !strings.HasPrefix(lines[1], "    ") {
-		t.Errorf("明细行应缩进，实际 %q", lines[1])
+	// 明细带自己的时间与级别，因此能被按级别单独筛出来；它也因此不能是缩进的尾巴。
+	detail := lines[1]
+	if !strings.Contains(detail, "ERROR") {
+		t.Errorf("明细行的级别应为 ERROR：%q", detail)
 	}
-	if !strings.Contains(lines[1], "503") {
-		t.Errorf("明细行应带上游状态码，实际 %q", lines[1])
+	if !strings.Contains(detail, "upstream") {
+		t.Errorf("明细行应有自己的消息名：%q", detail)
+	}
+	if strings.HasPrefix(detail, " ") {
+		t.Errorf("明细行不该缩进：%q", detail)
+	}
+	if !strings.Contains(detail, "429") {
+		t.Errorf("明细行应带上游状态码：%q", detail)
+	}
+	// 带上 request_id 与尝试序号，才能在一堆日志里认出它属于哪一次尝试。
+	if !strings.Contains(detail, "req1") || !strings.Contains(detail, "#2") {
+		t.Errorf("明细行应带上关联键：%q", detail)
 	}
 }
 

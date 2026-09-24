@@ -292,9 +292,8 @@ func renderAccess(record transport.AccessRecord, color bool) string {
 // 协议与模型只在真的不同时才写，且写成箭头：同协议同模型是最常见的情形，那时这两个字段
 // 只是把访问日志里的名字重抄一遍。真的跨协议或改写模型时，「进了什么、出成什么」必须一眼可见。
 //
-// 上游明细（上游状态码与响应片段）另起一行缩进排：它是失败记录里唯一真正要看的东西，
-// 挤在一行尾部等于没有。它也因此不受级别过滤之外的任何裁剪——超长时由生产端截断
-// （见 internal/domain 对 ErrorDetail 的约定）。
+// 上游明细（上游状态码与响应片段）另起一条 ERROR 记录：它是失败记录里唯一真正要看的东西，
+// 挤在一行尾部等于没有。超长时由生产端截断（见 internal/domain 对 ErrorDetail 的约定）。
 func renderAttempt(rec domain.AttemptRecord, color bool) string {
 	level := attemptLevel(rec.Outcome)
 	fields := []string{rec.RequestID, "#" + strconv.Itoa(rec.Attempt), rec.UpstreamID}
@@ -313,7 +312,22 @@ func renderAttempt(rec domain.AttemptRecord, color bool) string {
 	}
 	line := clockNow() + " " + paintLevel(level, color) + "  attempt  " + joinFields(fields...)
 	if rec.ErrorDetail != "" {
-		line += "\n    " + rec.ErrorDetail
+		line += "\n" + renderUpstreamDetail(rec, color)
 	}
 	return line
+}
+
+// renderUpstreamDetail 把上游的原始错误单独渲染成一条 ERROR 记录。
+//
+// 不缩进附在主行下面，因为两个原因：它常常是一整段上游报文（可能带 JSON），缩进会让人
+// 读不出它到底属于哪一次尝试；而带上级别前缀之后，它还能被 journalctl 或 grep 按级别
+// 单独筛出来——它恰恰是失败请求里唯一真正要看的那一行。
+//
+// 级别固定 ERROR，不跟主行走：主行的 WARN 说的是「这次尝试失败了，还要不要换候选」，
+// 而这一行说的是「上游明确回了一个错误」，后者无论如何都要被人看到。
+//
+// json 模式不另起一条记录：那里 error_detail 与其它字段同级，缩进与换行都不是问题。
+func renderUpstreamDetail(rec domain.AttemptRecord, color bool) string {
+	fields := []string{rec.RequestID, "#" + strconv.Itoa(rec.Attempt), rec.ErrorDetail}
+	return clockNow() + " " + paintLevel(slog.LevelError, color) + "  upstream  " + joinFields(fields...)
 }
