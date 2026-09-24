@@ -133,21 +133,31 @@ func TestModelRouteResolverMissReturnsNoCandidates(t *testing.T) {
 	}
 }
 
-func TestUpstreamIDRedactsUserinfo(t *testing.T) {
+func TestUpstreamIDUsesProviderAndHost(t *testing.T) {
 	tests := []struct {
 		name    string
 		address string
 		want    string
 	}{
 		{
-			name:    "没有 userinfo 时原样",
+			name:    "只留主机名，不写完整地址",
 			address: "https://api.example.com/v1/chat/completions",
-			want:    "relay https://api.example.com/v1/chat/completions",
+			want:    "relay api.example.com",
 		},
 		{
-			name:    "带 userinfo 时抹掉口令",
+			name:    "带端口时端口跟着主机名走",
+			address: "http://127.0.0.1:18080/v1/messages",
+			want:    "relay 127.0.0.1:18080",
+		},
+		{
+			name:    "带 userinfo 时口令不进标识",
 			address: "https://user:secret@api.example.com/v1/chat/completions",
-			want:    "relay https://user:xxxxx@api.example.com/v1/chat/completions",
+			want:    "relay api.example.com",
+		},
+		{
+			name:    "解析不出主机名时退回抹掉口令的原文",
+			address: "user:secret@not-a-url",
+			want:    "relay user:xxxxx@not-a-url",
 		},
 	}
 	for _, tt := range tests {

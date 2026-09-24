@@ -9,7 +9,6 @@ package gateway
 import (
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"sync"
 
@@ -27,7 +26,7 @@ import (
 // 旧的日志句柄」这类半旧半新的状态，而这种状态只在并发下才暴露。
 type Assembly struct {
 	Config  *config.Config
-	Logger  *slog.Logger
+	Logger  *logger
 	Handler http.Handler
 
 	// clients 是这次装配独占的 HTTP 客户端。换出时逐个关掉它们的空闲连接：
@@ -132,7 +131,7 @@ func Assemble(cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
 		return nil, fmt.Errorf("构造上游客户端失败：%w", err)
 	}
 
-	forwarder, err := pipeline.New(forwarderOptions(routesByModel(cfg), lookup, upstreamClient))
+	forwarder, err := pipeline.New(forwarderOptions(routesByModel(cfg), lookup, upstreamClient, logger))
 	if err != nil {
 		return nil, fmt.Errorf("构造转发流水线失败：%w", err)
 	}
@@ -141,6 +140,9 @@ func Assemble(cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
 	forward, err := transport.New(transport.Options{
 		Forwarder: forwarder,
 		Adapters:  resolve,
+		// 访问日志与上游尝试日志用同一个输出口：两类记录靠 request_id 关联，
+		// 格式与时间基准因此天然一致，不必在排查时对两条不同风格的日志。
+		Logger: logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("构造 HTTP 入口失败：%w", err)
@@ -152,27 +154,6 @@ func Assemble(cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
 		Handler: newDataPlane(forward, cfg, resolve),
 		clients: []*http.Client{upstreamHTTP},
 	}, nil
-}
-
-// newLogger 按配置里的日志级别建一个 slog 句柄。
-//
-// 级别在装配期就判定，非法取值当场报错：退化成缺省级别会让「我明明写了 debug
-// 却没有 debug 日志」变成一桩要靠读解析器源码才能破的悬案。
-func newLogger(cfg *config.Config, out io.Writer) (*slog.Logger, error) {
-	var level slog.Level
-	switch cfg.LogLevel {
-	case "debug":
-		level = slog.LevelDebug
-	case "info":
-		level = slog.LevelInfo
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		return nil, fmt.Errorf("日志级别 %q 不认识，取值只能是 debug / info / warn / error", cfg.LogLevel)
-	}
-	return slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})), nil
 }
 
 // healthzPath 是存活探针的路径。

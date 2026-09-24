@@ -7,8 +7,8 @@
 网关可以转发：客户端请求经鉴权后按对外模型名选路，需要时在三种线协议之间转换，
 前一条候选失败时按配置里的声明顺序回退，流式与非流式都支持。
 
-尚未实现的是**可观测性**：上游尝试记录与访问日志还没有接入，因此一次失败的转发在
-日志里看不到上游的状态码。`log_level` 目前只影响启动横幅与 reload 提醒。
+尚未实现的是可观测性的**采集侧**：上游尝试记录与访问日志已经接上（见「日志」一节），
+但还没有导出为指标或追踪。`log_level` 与 `log_format` 共同决定这些记录怎么输出。
 
 ## 安装
 
@@ -38,6 +38,7 @@ version 1
 listen 127.0.0.1:8080
 admin 127.0.0.1:2026
 log_level info
+log_format text
 client_key {env.NOVA_CLIENT_KEY}
 
 provider openai {
@@ -51,8 +52,8 @@ provider openai {
 完整规格与逐条注释见 [`Novafile.example`](Novafile.example)。
 
 顶层指令：`listen`（缺省 `127.0.0.1:8080`，只绑回环）、`admin`（缺省 `localhost:2026`）、
-`log_level`（缺省 `info`）、`client_key`（可写多条；不写则不鉴权，并在绑非回环时告警）、
-`import`（把另一个文件拼进来）。
+`log_level`（缺省 `info`）、`log_format`（缺省 `text`）、`client_key`（可写多条；不写则不鉴权，
+并在绑非回环时告警）、`import`（把另一个文件拼进来）。
 
 ### 上游渠道
 
@@ -106,6 +107,39 @@ provider relay {
 `client_key` 列出允许调用网关的凭据，可写多条。客户端用 `Authorization: Bearer <key>`
 或 `x-api-key: <key>` 提交，任一匹配即放行。不写 `client_key` 时不鉴权，并在 `listen`
 绑到非回环地址时记一条警告。
+
+### 日志
+
+`log_level` 决定**哪些记录被输出**，`log_format` 决定**记录长什么样**。两者都是配置指令，
+不留一半在环境变量里——否则「这个 nova 会输出什么」就有了两个来源。
+
+每个请求稳定产生两条记录，用 `request_id` 关联：
+
+- **access**：入口层看到的事实（客户端协议、请求的模型名、HTTP 状态、耗时、客户端地址）。
+- **attempt**：每次上游尝试（打到哪条渠道、两侧协议与模型名、上游用量、错误码与上游的响应片段）。
+  一次请求可能有多条：候选回退时每条候选各一条，`#1` `#2` 就是回退顺序。
+
+级别按结果分档：access 的 5xx 记 `error`、4xx 记 `warn`、其余 `info`；attempt 的成功记 `info`、
+失败记 `warn`、客户端取消记 `debug`。取消之所以记 debug，是因为长流场景下客户端主动断开
+很常见，记成 warn 会把真正的上游故障淹没。
+
+启动横幅不受级别过滤：它回答的是「这个进程在用哪份配置跑」。
+
+**两种格式的分工是「给人看」与「给机器看」**，不是同一条记录的两种排版：
+
+```
+13:06:30 INFO   access  c3ccfe…  openai_chat  gpt-test  200  1ms  127.0.0.1:33012
+13:06:30 WARN   attempt  f7ba49…  #1  chatmock 127.0.0.1:18080  gpt-fail→fail-model  failed  42ms  upstream_unavailable
+    上游 HTTP 状态码 503：{"error": {"message": "upstream is having a bad day"}}
+13:06:30 ERROR  access  f7ba49…  openai_chat  gpt-fail  502  42ms  upstream_unavailable  127.0.0.1:33014
+```
+
+text 会省略「常见情况下不提供信息」的字段（同协议不写协议、同模型不写模型、用量只写非零子项），
+因此它**不可逆，不能拿来当数据源**；要解析就切 `log_format json`，那里字段齐全，
+用量收在 `usage` 对象里，时间戳是 RFC3339。
+
+能不能显示颜色**不是配置项**：它是环境事实，不是使用者的意图。输出落在终端上、
+未设 `NO_COLOR`、且 `TERM` 不是 `dumb` 时才给级别与错误码着色。
 
 ### 环境变量与拆分文件
 

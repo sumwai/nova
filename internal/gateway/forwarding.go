@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/sumwai/nova/internal/adapters/anthropic"
 	"github.com/sumwai/nova/internal/adapters/openaichat"
@@ -94,29 +95,56 @@ func routesByModel(cfg *config.Config) map[string][]domain.Route {
 	return table
 }
 
-// upstreamID 是端点在上游尝试记录与熔断键里的标识：provider 名 + 空格 + 地址。
+// upstreamID 是端点在上游尝试记录里的标识：provider 名 + 空格 + 主机名。
 //
-// nova 的端点没有名字（块头就是地址），因此标识里放地址。地址一律走 redactAddress：
-// 地址原文可能带 userinfo，而这个标识会进日志。
+// 不写完整地址是有意的：scheme、版本根与端点路径对「分辨是哪条渠道」没有帮助，
+// 却占了日志行里很大一截。主机名是能一眼分辨「打到哪台机器」的那部分，
+// 而同一 provider 下多条端点打同一台机器的情形（同一家的两个协议端点），
+// 由同一条记录里的 upstream_protocol 区分。
 //
-// 它既不可逆也不是单射：一个本身就形如「provider 地址」的地址，与「两段拼起来」在
-// 肉眼上无法区分。它只供观测使用，消费者不得解析它，也不得由它反推 provider 与地址。
+// 它不是可逆编码，也不是单射：一个本身就形如「provider 主机名」的主机名是无法防的，
+// 但它只供观测使用，消费者不得解析它，也不得由它反推 provider 与地址。
 func upstreamID(provider string, endpoint *config.Endpoint) string {
-	return provider + " " + redactAddress(endpoint.URL)
+	return provider + " " + endpointHost(endpoint.URL)
 }
 
-// redactAddress 抹掉地址里的 userinfo 口令，供日志与标识使用。
+// endpointHost 取地址里的主机名与端口。
 //
-// 用 url.Redacted 而不是自己切字符串：它按 RFC 3986 的 userinfo 文法处理，口令之外
-// 的字符原样保留。解析失败时原样返回而不报错——日志脱敏不该成为转发失败的原因，
-// 而配置层已经校验过地址形态，走到这里说明它是我们没预料到的写法。
-func redactAddress(raw string) string {
+// 取不到时退回抹掉 userinfo 的原文：配置层已经校验过地址形态，走到这里说明遇上了没预料到的
+// 写法。此时宁可显示得长一点，也不要回一个空串——那会让「这条尝试打到了哪里」彻底消失。
+func endpointHost(raw string) string {
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.User == nil {
+	if err != nil || parsed.Host == "" {
+		return redactAddress(raw)
+	}
+	return parsed.Host
+}
+
+// redactAddress 抹掉地址里的 userinfo 口令，供日志使用。
+//
+// 先试 url.Redacted：对合法 URL 它按 RFC 3986 的 userinfo 文法处理，结果是标准的。
+// 但它盖不住一种写法：地址没有主机名时（比如漏了 scheme 的 user:secret@host），
+// url.Parse 会把整串当成 opaque 部分，此时 parsed.User 是 nil，Redacted 原样返回带口令的串。
+// 配置层会拒掉这类地址，但这个函数是日志的最后一道出口——那时候更不能把口令漏出去，
+// 所以再按 userinfo 文法切一层。
+func redactAddress(raw string) string {
+	if parsed, err := url.Parse(raw); err == nil && parsed.User != nil {
+		return parsed.Redacted()
+	}
+	at := strings.LastIndex(raw, "@")
+	if at < 0 {
 		return raw
 	}
-	return parsed.Redacted()
+	colon := strings.Index(raw[:at], ":")
+	if colon < 0 {
+		// 只有用户名没有口令：用户名本身不是秘密，原样保留。
+		return raw
+	}
+	return raw[:colon+1] + maskedCredential + raw[at:]
 }
+
+// maskedCredential 是口令被抹掉后留下的替换串，与 upstream 那侧的写法一致。
+const maskedCredential = "xxxxx"
 
 // credentialsByRef 把配置里的渠道整理成「引用名 → 凭据」表。
 //
@@ -163,14 +191,17 @@ func forwarderOptions(
 	routes map[string][]domain.Route,
 	adapters pipeline.AdapterLookup,
 	caller domain.UpstreamCaller,
+	observer domain.Observer,
 ) pipeline.Options {
 	return pipeline.Options{
 		Adapters: adapters,
 		Upstream: caller,
 		Routes:   modelRouteResolver{routes: routes},
-		// Observer 与 Breaker 都留零值，两者的理由不同：
-		// 前者等日志输出重新设计时再接，现在没有能承载尝试记录的日志实现；
-		// 后者上游本来就没有在生产装配里生效过（它的 router 包是死代码，没有搬过来）。
+		// Observer 记每次上游尝试：客户端只拿到聚合后的错误码，
+		// 上游的状态码与响应片段只在尝试记录里可见，缺了它排障只能靠猜。
+		Observer: observer,
+		// Breaker 留零值：本版不做熔断，候选按声明顺序逐个尝试。
+		// 上游那份实现（internal/router）在生产装配里本来就没生效过，没有搬过来。
 		MaxAttempts: maxUpstreamAttempts(routes),
 	}
 }

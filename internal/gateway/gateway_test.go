@@ -10,11 +10,27 @@ import (
 	"github.com/sumwai/nova/internal/config"
 )
 
-// testAssembly 造一份可供测试使用的装配。cfg 为 nil 时用一套无害的缺省值。
+// testAssembly 造一份可供测试使用的装配。
+//
+// 它把 cfg 里没写的字段补成缺省：config.Load 总会填上它们，而测试手写 Config 时很容易漏。
+// 漏掉的结果是一个与本次测试无关的装配错误（比如「日志格式 "" 不认识」），
+// 那会让人去查被测逻辑，而问题其实在构造输入那一行。
 func testAssembly(t *testing.T, cfg *config.Config) *Assembly {
 	t.Helper()
 	if cfg == nil {
-		cfg = &config.Config{LogLevel: "info", Listen: ":0", Admin: "localhost:0"}
+		cfg = &config.Config{}
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	if cfg.LogFormat == "" {
+		cfg.LogFormat = "text"
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = ":0"
+	}
+	if cfg.Admin == "" {
+		cfg.Admin = "localhost:0"
 	}
 	assembled, err := Assemble(cfg, io.Discard)
 	if err != nil {
@@ -68,7 +84,7 @@ func TestHolderServeHTTPDelegatesToCurrentAssembly(t *testing.T) {
 }
 
 func TestAssembleRejectsUnknownLogLevel(t *testing.T) {
-	_, err := Assemble(&config.Config{LogLevel: "verbose"}, io.Discard)
+	_, err := Assemble(&config.Config{LogLevel: "verbose", LogFormat: "text"}, io.Discard)
 	if err == nil {
 		t.Fatal("期望 Assemble 报错，但它成功了")
 	}

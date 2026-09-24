@@ -12,6 +12,7 @@ import (
 const (
 	directiveVersion   = "version"
 	directiveLogLevel  = "log_level"
+	directiveLogFormat = "log_format"
 	directiveListen    = "listen"
 	directiveAdmin     = "admin"
 	directiveClientKey = "client_key"
@@ -36,8 +37,8 @@ const (
 // 而对外的清单一旦说谎，排障时被它带偏的人根本无从察觉。
 var (
 	globalDirectives = []string{
-		directiveVersion, directiveLogLevel, directiveListen, directiveAdmin,
-		directiveClientKey, directiveProvider, directiveImport,
+		directiveVersion, directiveLogLevel, directiveLogFormat, directiveListen,
+		directiveAdmin, directiveClientKey, directiveProvider, directiveImport,
 	}
 
 	providerDirectives = []string{
@@ -233,6 +234,17 @@ func (p *parser) applyGlobal(ln line) error {
 			}
 			return errorf(ln.file, v.line, v.col,
 				"日志级别 %q 不认识，取值只能是 debug / info / warn / error", v.text)
+		})
+
+	case directiveLogFormat:
+		return p.setValue(ln, func(v token) error {
+			switch v.text {
+			case "text", "json":
+				p.cfg.LogFormat = v.text
+				return nil
+			}
+			return errorf(ln.file, v.line, v.col,
+				"日志格式 %q 不认识，取值只能是 text / json", v.text)
 		})
 
 	case directiveListen:
