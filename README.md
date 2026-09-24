@@ -173,8 +173,9 @@ nova version
 nova version --json          # 给脚本消费：程序版本 + 支持的配置代数 + 指令清单
 ```
 
-版本号由 `make build-binary` 注入，取值顺序为 `VERSION=` > `git describe --tags --dirty`
-> `0.0.0`。二进制内嵌的 VCS 信息会单独报出「构建自哪个提交」。
+版本号由 `make build-binary` 注入，取值顺序为 `VERSION=` > **最近的 git tag**（工作区有
+未提交改动时带 `-dirty`）> `0.0.0`。二进制内嵌的 VCS 信息会单独报出「构建自哪个提交」，
+两件事不合并成一个字段：合并后的 `v0.0.0-2-g4700f09` 既不能当版本号比较，也不是提交号。
 
 ## 开发
 
