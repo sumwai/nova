@@ -197,7 +197,7 @@ func attemptPayload(rec domain.AttemptRecord) any {
 		ErrorDetail:      rec.ErrorDetail,
 	}
 	// 用量未知时整个 usage 分组不出现：一个全零的 usage 对象看起来像「这次没花钱」，
-	// 与「上游没告诉我们」是两件相反的事（见 domain.Usage.Known）。
+	// 与「上游没有给出用量」是两件相反的事（见 domain.Usage.Known）。
 	if rec.Usage.Known() {
 		payload.Usage = &jsonUsage{
 			Source:           string(rec.Usage.Source),

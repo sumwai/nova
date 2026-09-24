@@ -314,7 +314,7 @@ func (p *parser) validate() error {
 		p.cfg.Warnings = append(p.cfg.Warnings, Warning{
 			File: p.cfg.Path,
 			Msg: fmt.Sprintf(
-				"listen %s 不是回环地址，且没有声明 client_key：任何能连上这个地址的人都能用你的上游凭据",
+				"listen %s 不是回环地址，且没有声明 client_key：任何能连上这个地址的人都能用这份配置里的上游凭据",
 				p.cfg.Listen),
 		})
 	}

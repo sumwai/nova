@@ -322,7 +322,7 @@ func TestJSONPayloadOmitsUnknownUsage(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
 		t.Fatalf("解析失败：%v", err)
 	}
-	// 全零的 usage 对象看起来像「这次没花钱」，与「上游没告诉我们」是两件相反的事。
+	// 全零的 usage 对象看起来像「这次没花钱」，与「上游没有给出用量」是两件相反的事。
 	if _, exists := got["usage"]; exists {
 		t.Errorf("用量未知时不该有 usage 分组：%v", got["usage"])
 	}
