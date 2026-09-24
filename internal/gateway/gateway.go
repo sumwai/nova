@@ -14,6 +14,10 @@ import (
 	"sync"
 
 	"github.com/sumwai/nova/internal/config"
+	"github.com/sumwai/nova/internal/credential"
+	"github.com/sumwai/nova/internal/pipeline"
+	"github.com/sumwai/nova/internal/transport"
+	"github.com/sumwai/nova/internal/upstream"
 )
 
 // Assembly 是一次配置装配的产物。
@@ -25,16 +29,26 @@ type Assembly struct {
 	Config  *config.Config
 	Logger  *slog.Logger
 	Handler http.Handler
+
+	// clients 是这次装配独占的 HTTP 客户端。换出时逐个关掉它们的空闲连接：
+	// 不关的话，每次 reload 都会把上一份配置的连接池留到空闲超时才释放，
+	// 而上游视角里那些连接仍然开着。
+	clients []*http.Client
 }
 
-// Close 释放这次装配独占的资源。
+// Close 释放这次装配独占的资源，即上游 HTTP 客户端的空闲连接。
 //
-// 本版没有任何需要显式关闭的东西，因此它是空操作。保留这个方法是给「换出旧装配」
-// 一个明确的收口点：转发链路接进来之后，上游连接池与空闲连接都在这里释放，
-// 而调用方不必为此改一行。
+// 只关空闲连接，不打断在途请求：换出发生在「新装配已经生效」之后，此刻旧装配上
+// 还可能挂着正在流式返回的请求，掐断它们会让客户端收到一个截断的 200。
 //
 // 对 nil 接收者返回 nil：调用方在「没有旧装配」这个边界上不该还要先判空。
 func (a *Assembly) Close() error {
+	if a == nil {
+		return nil
+	}
+	for _, client := range a.clients {
+		client.CloseIdleConnections()
+	}
 	return nil
 }
 
@@ -95,10 +109,48 @@ func Assemble(cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 三种协议的适配器做成单例：客户端侧按请求路径取，上游侧按路由协议取，
+	// 两处用同一张表，因此「客户端能进来的协议」与「上游能解码的协议」不会漂移。
+	adapters := newAdapters()
+	lookup := upstreamAdapterLookup(adapters)
+
+	// 凭据表按 provider 名字建：它就是 domain.Route.CredentialRef 的取值，
+	// 两张表因此天然对齐。运行期由路由取出该用哪份密钥，注入形态由路由协议决定，
+	// 所以同一份配置里 OpenAI 系端点与 Anthropic 端点可以各用各的头形态。
+	credentials := credential.New(credentialsByRef(cfg.Providers))
+
+	// 上游客户端持有自己的 HTTP 客户端：Assembly 要能在换出时关掉它的空闲连接。
+	// 这里不设全局默认超时，每条候选都带着自己端点的 timeout（配置层已兜底 60s）。
+	upstreamHTTP := &http.Client{}
+	upstreamClient, err := upstream.New(upstream.Options{
+		HTTPClient: upstreamHTTP,
+		Headers:    credentials,
+		Adapters:   lookup,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("构造上游客户端失败：%w", err)
+	}
+
+	forwarder, err := pipeline.New(forwarderOptions(routesByModel(cfg), lookup, upstreamClient))
+	if err != nil {
+		return nil, fmt.Errorf("构造转发流水线失败：%w", err)
+	}
+
+	resolve := adapterResolver(adapters)
+	forward, err := transport.New(transport.Options{
+		Forwarder: forwarder,
+		Adapters:  resolve,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("构造 HTTP 入口失败：%w", err)
+	}
+
 	return &Assembly{
 		Config:  cfg,
 		Logger:  logger,
-		Handler: newDataPlane(),
+		Handler: newDataPlane(forward, cfg, resolve),
+		clients: []*http.Client{upstreamHTTP},
 	}, nil
 }
 
@@ -123,19 +175,26 @@ func newLogger(cfg *config.Config, out io.Writer) (*slog.Logger, error) {
 	return slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level})), nil
 }
 
+// healthzPath 是存活探针的路径。
+const healthzPath = "/healthz"
+
 // newDataPlane 造数据面的 HTTP 处理器。
 //
-// 本版只实现存活探针，其余路径固定回 501 而不是 404：对调用方来说「路径对、
-// 功能还没做」与「路径本身不存在」是两件事，混成 404 会让人反复检查自己拼的
-// URL，而真相是这一版还没有转发能力。
-func newDataPlane() http.Handler {
+// 转发入口挂在根路径上，由它自己按固定映射判定路径是否受支持，并给出协议化的 404；
+// 健康检查另挂一条，不经鉴权也不经转发——探活只关心进程是否在线，让它依赖客户端凭据
+// 会让编排系统在上游或凭据出问题时，重启一个本身健康的网关。
+func newDataPlane(forward http.Handler, cfg *config.Config, resolve transport.AdapterResolver) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = io.WriteString(w, "ok")
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "转发链路尚未实现", http.StatusNotImplemented)
-	})
+	mux.HandleFunc(healthzPath, healthz)
+	mux.Handle("/", authorize(forward, cfg.ClientKeys, resolve))
 	return mux
+}
+
+// healthz 是存活探针：任何方法都回 200 与纯文本 ok。
+//
+// 不在此处探活上游：那会让探活随上游抖动而失败，进而在编排系统里反复重启一个本身
+// 健康的网关。
+func healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, "ok")
 }
