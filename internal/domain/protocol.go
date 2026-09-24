@@ -13,12 +13,18 @@ const (
 	ProtocolOpenAIChat        Protocol = "openai_chat"        // POST /v1/chat/completions
 	ProtocolOpenAIResponses   Protocol = "openai_responses"   // POST /v1/responses
 	ProtocolAnthropicMessages Protocol = "anthropic_messages" // POST /v1/messages
+	// ProtocolGemini 是 Google Generative Language 的 generateContent 协议。
+	//
+	// 它与上面三种协议的形状不同：模型名与动作（是否流式）都写在路径上
+	// （/v1beta/models/{model}:generateContent 与 :streamGenerateContent），
+	// 请求体里没有这两个字段，因此它的端点路径不是一条定长字面量。
+	ProtocolGemini Protocol = "gemini"
 )
 
 // Valid 报告协议取值是否受支持。
 func (p Protocol) Valid() bool {
 	switch p {
-	case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolAnthropicMessages:
+	case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolAnthropicMessages, ProtocolGemini:
 		return true
 	default:
 		return false
@@ -27,11 +33,14 @@ func (p Protocol) Valid() bool {
 
 // EndpointPath 返回该协议在客户端侧的端点路径：POST 到该路径的请求按本协议处理。
 //
-// 这三个字面量只有这一处来源，装配层用它把请求路径映射为协议。
+// 这些字面量只有这一处来源，装配层用它把请求路径映射为协议。
 // 它不参与上游地址拼接：上游地址由配置的 url 显式写全，
 // 因为不同供应商对「版本根 + 端点路径」的拼法并不一致。
 //
-// 取值恒等于 "/v1" 与 EndpointSegment() 的拼接，两条事实同源，由测试守住这层关系。
+// 除 Gemini 外，取值恒等于 "/v1" 与 EndpointSegment() 的拼接，两条事实同源，由测试守住这层关系。
+// Gemini 是例外：它的模型名写在路径上，返回值是一份带 {model} 占位符的模板，
+// 既不是可直接比较的字面量、也不以 /v1 开头（它的版本根是 /v1beta）。
+// 装配层因此不能只用等值比较识别它，Gemini 的路径识别由适配器自己的路径解析承担。
 func (p Protocol) EndpointPath() string {
 	switch p {
 	case ProtocolOpenAIChat:
@@ -40,6 +49,8 @@ func (p Protocol) EndpointPath() string {
 		return "/v1/responses"
 	case ProtocolAnthropicMessages:
 		return "/v1/messages"
+	case ProtocolGemini:
+		return "/v1beta/models/{model}:generateContent"
 	default:
 		return ""
 	}
@@ -52,21 +63,37 @@ func (p Protocol) EndpointPath() string {
 // 火山方舟写成 /api/v3，百度千帆写成 /v2。因此校验上游 url 时只能比对端点段：
 // 它既拦得住「漏写了端点路径」，又不会把版本根与 OpenAI 不一致的供应商一并拒掉。
 func (p Protocol) EndpointSegment() string {
+	segments := p.EndpointSegments()
+	if len(segments) == 0 {
+		return ""
+	}
+	return segments[0]
+}
+
+// EndpointSegments 返回该协议在地址末段上的全部可识别写法，首项与 EndpointSegment() 相同。
+//
+// 多数协议只有一种写法；Gemini 有两种：非流式与流式的动作段不同
+// （:generateContent 与 :streamGenerateContent），而两者是同一个端点协议。
+// 之所以列全部而不是只列一种：配置里的端点地址写哪种动作都应该被认出来，
+// 实际发往上游的动作由适配器按本次请求是否流式改写（见 domain.UpstreamURLBuilder）。
+func (p Protocol) EndpointSegments() []string {
 	switch p {
 	case ProtocolOpenAIChat:
-		return "/chat/completions"
+		return []string{"/chat/completions"}
 	case ProtocolOpenAIResponses:
-		return "/responses"
+		return []string{"/responses"}
 	case ProtocolAnthropicMessages:
-		return "/messages"
+		return []string{"/messages"}
+	case ProtocolGemini:
+		return []string{":generateContent", ":streamGenerateContent"}
 	default:
-		return ""
+		return nil
 	}
 }
 
 // ProtocolForEndpointPath 由上游地址的路径推导它属于哪种协议。
 //
-// 判据是路径末尾是否等于某个协议的端点段（见 EndpointSegment），而不是完整端点路径：
+// 判据是路径末尾是否等于某个协议的端点段（见 EndpointSegments），而不是完整端点路径：
 // 各供应商把版本根写在路径的哪一段并不一致，能确定协议的只有末尾那一段。
 // 只有唯一命中才算推导成功：命中不了时调用方要报「地址写错了」，命中多个时同样返回 false，
 // 因为随手挑一个会把「两个协议都说得通」的配置静默解释成其中一个。
@@ -76,8 +103,16 @@ func ProtocolForEndpointPath(path string) (Protocol, bool) {
 		ProtocolOpenAIChat,
 		ProtocolOpenAIResponses,
 		ProtocolAnthropicMessages,
+		ProtocolGemini,
 	} {
-		if !strings.HasSuffix(path, protocol.EndpointSegment()) {
+		hit := false
+		for _, segment := range protocol.EndpointSegments() {
+			if strings.HasSuffix(path, segment) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
 			continue
 		}
 		if matched != "" {
@@ -90,11 +125,11 @@ func ProtocolForEndpointPath(path string) (Protocol, bool) {
 
 // CrossProtocolRebuildable 报告本协议能否与其它协议互相重建请求与响应。
 //
-// 三种会话式协议在内部统一协议里有完整字段可以互相表达，选路因此允许把一个协议的
+// 四种会话式协议在内部统一协议里有完整字段可以互相表达，选路因此允许把一个协议的
 // 请求交给另一个协议的渠道，由适配器重建。
 func (p Protocol) CrossProtocolRebuildable() bool {
 	switch p {
-	case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolAnthropicMessages:
+	case ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolAnthropicMessages, ProtocolGemini:
 		return true
 	default:
 		return false
@@ -147,7 +182,7 @@ func PreferRoutesForProtocol(protocol Protocol, routes []Route) []Route {
 	return append(preferred, fallback...)
 }
 
-// Role 是消息角色，已归一化到三种协议的交集。
+// Role 是消息角色，已归一化到各协议的交集。
 type Role string
 
 const (
@@ -170,7 +205,7 @@ const (
 	// 不新增字段：Kind 决定哪些字段有效的既有约定可以表达它。
 	//
 	// 它只在解码方向建模：编码方向（EncodeResponse 与跨协议请求重建）不下发推理内容，
-	// 因为三种协议对可回传形态的要求不同——Anthropic 的 thinking 块要求签名、
+	// 因为各协议对可回传形态的要求不同——Anthropic 的 thinking 块要求签名、
 	// OpenAI Responses 的 reasoning 条目要求上下文标识，从别的协议取到的纯文本无法重建。
 	PartReasoning PartKind = "reasoning"
 )
@@ -217,7 +252,7 @@ type ToolSpec struct {
 // ToolChoiceMode 是归一化后的工具选择模式。
 //
 // 各协议的工具选择字面量与对象形态各不相同，
-// 映射到本枚举由各适配器负责：`auto`、`none`、`required` 三种字符串取值在三种协议间
+// 映射到本枚举由各适配器负责：`auto`、`none`、`required` 三种字符串取值在各协议间
 // 通用，指定具体工具在各协议上是对象形态。
 type ToolChoiceMode string
 
@@ -365,7 +400,7 @@ func (p Part) validate() error {
 	return nil
 }
 
-// FinishReason 是归一化后的结束原因，取三种协议语义的交集。
+// FinishReason 是归一化后的结束原因，取各协议语义的交集。
 //
 // 各上游的具体字面量（如 `end_turn`、`max_output_tokens`）由各自的适配器
 // 负责映射到本枚举：字面量属于协议差异，放在这里会迫使新增协议修改本包。

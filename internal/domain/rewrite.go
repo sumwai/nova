@@ -31,7 +31,7 @@ type RewriteOptions struct {
 // OutputLimit 按统一口径计算要向上游请求声明的输出上限，返回值 <= 0 表示不设置该字段。
 //
 // declared 是客户端声明的输出上限，<= 0 表示未声明；limit 是渠道配置的上限。
-// 三种协议的输出上限字段名不同，但口径由本函数单一实现。
+// 各协议的输出上限字段名不同，但口径由本函数单一实现。
 func OutputLimit(declared int, limit *int) int {
 	if limit == nil || *limit <= 0 {
 		return declared

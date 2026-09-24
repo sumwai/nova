@@ -166,12 +166,14 @@ func TestDataPlaneRequiresMatchingClientKey(t *testing.T) {
 		path     string
 		bearer   string
 		xAPIKey  string
+		googKey  string
 		wantCode int
 	}{
 		{name: "没有凭据", path: "/v1/chat/completions", wantCode: http.StatusUnauthorized},
 		{name: "Bearer 命中第一条", path: "/v1/chat/completions", bearer: "first", wantCode: http.StatusTeapot},
 		{name: "Bearer 命中第二条", path: "/v1/chat/completions", bearer: "second", wantCode: http.StatusTeapot},
 		{name: "x-api-key 命中", path: "/v1/messages", xAPIKey: "second", wantCode: http.StatusTeapot},
+		{name: "x-goog-api-key 命中（Gemini 客户端）", path: "/v1beta/models/gemini-2.5-flash:generateContent", googKey: "first", wantCode: http.StatusTeapot},
 		{name: "方案名大小写不敏感", path: "/v1/responses", bearer: "first", wantCode: http.StatusTeapot},
 		{name: "凭据不匹配", path: "/v1/chat/completions", bearer: "wrong", wantCode: http.StatusUnauthorized},
 		{name: "凭据是前缀也不算命中", path: "/v1/chat/completions", bearer: "firs", wantCode: http.StatusUnauthorized},
@@ -189,6 +191,9 @@ func TestDataPlaneRequiresMatchingClientKey(t *testing.T) {
 			}
 			if tt.xAPIKey != "" {
 				req.Header.Set(apiKeyHeader, tt.xAPIKey)
+			}
+			if tt.googKey != "" {
+				req.Header.Set(googleAPIKeyHeader, tt.googKey)
 			}
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, req)

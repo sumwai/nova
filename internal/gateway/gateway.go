@@ -123,7 +123,7 @@ func Assemble(ctx context.Context, cfg *config.Config, logOutput io.Writer) (*As
 		return nil, err
 	}
 
-	// 三种协议的适配器做成单例：客户端侧按请求路径取，上游侧按路由协议取，
+	// 各协议的适配器做成单例：客户端侧按请求路径取，上游侧按路由协议取，
 	// 两处用同一张表，因此「客户端能进来的协议」与「上游能解码的协议」不会漂移。
 	adapters := newAdapters()
 	lookup := upstreamAdapterLookup(adapters)

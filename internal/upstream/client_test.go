@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sumwai/nova/internal/adapters/gemini"
 	"github.com/sumwai/nova/internal/adapters/openaichat"
 	"github.com/sumwai/nova/internal/domain"
 )
@@ -20,6 +21,39 @@ func (stubHeaders) UpstreamHeaders(context.Context, domain.Route) (http.Header, 
 
 // openAIChatAdapters 返回只认 Chat Completions 报文的适配器查找函数。
 func openAIChatAdapters(domain.Protocol) (domain.Adapter, error) { return openaichat.New(), nil }
+
+// TestCompleteUsesAdapterUpstreamURL 守护「适配器可自行构造上游地址」这条路径。
+//
+// Gemini 的模型名与动作在路径上，route.BaseURL 只是带 {model} 的模板；
+// 上游客户端必须优先取适配器给出的地址，而不是直接请求模板。
+func TestCompleteUsesAdapterUpstreamURL(t *testing.T) {
+	var gotTarget string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTarget = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"modelVersion":"gemini-2.5-flash"}`))
+	}))
+	defer server.Close()
+
+	adapters := func(domain.Protocol) (domain.Adapter, error) { return gemini.New(), nil }
+	client, err := New(Options{Headers: stubHeaders{}, Adapters: adapters})
+	if err != nil {
+		t.Fatalf("构造上游客户端失败: %v", err)
+	}
+	route := domain.Route{
+		UpstreamID:    "gemini",
+		Protocol:      domain.ProtocolGemini,
+		BaseURL:       server.URL + "/v1beta/models/{model}:generateContent",
+		UpstreamModel: "gemini-2.5-flash",
+	}
+	if _, err := client.Complete(context.Background(), route, &domain.Request{Model: "m"}, []byte(`{"contents":[]}`)); err != nil {
+		t.Fatalf("上游调用失败: %v", err)
+	}
+	const want = "/v1beta/models/gemini-2.5-flash:generateContent"
+	if gotTarget != want {
+		t.Errorf("上游请求地址 = %q，期望 %q", gotTarget, want)
+	}
+}
 
 // TestCompleteAttachesUpstreamBodyToDecodeFailure 守护「上游响应无法解析」的排障信息。
 //

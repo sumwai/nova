@@ -19,10 +19,12 @@ import (
 )
 
 // 凭据请求头的标准名。Authorization 是 OpenAI 系两家（Chat 与 Responses）的形态，
-// x-api-key 是 Anthropic Messages 的形态。写成常量避免字面量在多处漂移。
+// x-api-key 是 Anthropic Messages 的形态，x-goog-api-key 是 Gemini 的形态。
+// 写成常量避免字面量在多处漂移。
 const (
 	headerAuthorization = "Authorization"
 	headerXAPIKey       = "x-api-key"
+	headerXGoogAPIKey   = "x-goog-api-key"
 )
 
 // 凭据被打印时一律替换成占位符，且不含引用名与协议：列出任何一项都会让日志成为
@@ -176,6 +178,11 @@ func credentialHeaders(protocol domain.Protocol, apiKey string) (http.Header, st
 	case domain.ProtocolAnthropicMessages:
 		headers.Set(headerXAPIKey, apiKey)
 		return headers, http.CanonicalHeaderKey(headerXAPIKey), nil
+	case domain.ProtocolGemini:
+		// Gemini 的凭据也可以写成 ?key= 查询参数，但查询参数会随地址进日志与尝试记录；
+		// 专有请求头与其它两个协议的形态一致，选它。
+		headers.Set(headerXGoogAPIKey, apiKey)
+		return headers, http.CanonicalHeaderKey(headerXGoogAPIKey), nil
 	default:
 		return nil, "", domain.NewError(domain.CodeInternal,
 			fmt.Sprintf("协议 %q 不支持凭据注入", string(protocol)))

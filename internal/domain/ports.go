@@ -3,17 +3,19 @@ package domain
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
 // Adapter 负责一种线协议与内部统一格式的双向转换。
 //
-// 三种协议各自实现本接口：
+// 四种协议各自实现本接口：
 //
 //   - OpenAI Chat Completions（POST /v1/chat/completions）；
 //   - OpenAI Responses（POST /v1/responses）；
-//   - Anthropic Messages（POST /v1/messages）。
+//   - Anthropic Messages（POST /v1/messages）；
+//   - Google Gemini generateContent（POST /v1beta/models/{model}:generateContent）。
 //
 // 流水线只依赖本接口，不感知协议细节。
 //
@@ -244,7 +246,7 @@ type UpstreamCaller interface {
 //
 // 之所以新增独立接口而不继续给 Adapter 加方法：Adapter 的方法集合由
 // internal/domain/contract_test.go 锁定，且已有三个协议实现；请求侧的构建能力
-// 只有共享转发层需要，扩大 Adapter 会让三个协议实现与契约测试一起被迫改动。
+// 只有共享转发层需要，扩大 Adapter 会让既有协议实现与契约测试一起被迫改动。
 type UpstreamRequestBuilder interface {
 	// EncodeRequest 按内部统一格式重建上游请求体，用于跨协议转发路径。
 	//
@@ -293,6 +295,43 @@ type UpstreamHeaderProvider interface {
 	//
 	// 使用标准库 http.Header 承载，避免 domain 依赖具体 HTTP 客户端库。
 	UpstreamHeaders(channelHeaders http.Header) http.Header
+}
+
+// UpstreamURLBuilder 描述「上游地址由适配器按本次请求构造」的能力。
+//
+// 多数协议的上游地址是一条定长地址，模型名与流式形态都写在请求体里，
+// 因此 route.BaseURL 就是最终地址。Gemini 是例外：模型名与动作都在路径上
+// （.../models/{model}:generateContent 与 :streamGenerateContent?alt=sse），
+// 两者都不出现在请求体里，地址因此必须在发送前才定下来。
+//
+// 实现本接口的适配器由上游客户端优先调用：它拿到本次路由与是否流式两个事实，
+// 返回最终要请求的地址。协议细节（改哪一段、query 怎么写）因此留在适配器内，
+// 共享的上游客户端不出现任何协议字面量。
+//
+// 未实现本接口的适配器沿用 route.BaseURL。
+type UpstreamURLBuilder interface {
+	// UpstreamURL 返回本次调用要请求的上游地址。
+	//
+	// stream 报告本次是否为流式调用；同一端点在两种形态下可能是两条不同地址。
+	// 返回错误时按平台内部错误处理，不发起请求。
+	UpstreamURL(route Route, stream bool) (string, error)
+}
+
+// RequestBinder 描述「请求路径本身携带协议参数」的适配器。
+//
+// 路径定长的协议里，解码请求体所需的全部事实都在请求体与请求头上，
+// 适配器因此可以是一个无状态的单例。Gemini 的模型名与是否流式写在请求路径上，
+// 请求体里没有这两项，因此需要在解码请求体之前把路径事实绑定到适配器上，
+// 由适配器在 DecodeRequest 时把模型名与流式标记补进已解码的请求。
+//
+// 入口层按请求取客户端适配器时调用本方法：它返回一个只服务本次请求的副本，
+// 单例适配器本身不被修改，并发请求不会串用彼此的路径事实。
+type RequestBinder interface {
+	// BindRequest 返回服务本次请求的适配器副本。
+	//
+	// 返回值必须非 nil：路径解不出模型名时返回一个在 DecodeRequest 上报告该失败的副本，
+	// 使错误仍能经本协议的 EncodeError 编码，而不是让入口层去拼一个与协议不符的错误体。
+	BindRequest(path string, query url.Values) Adapter
 }
 
 // CloneHeader 返回标准库 http.Header 的一份独立拷贝。
@@ -415,7 +454,7 @@ type Observer interface {
 //   - 凭据或权限不足；
 //   - 资源不存在。
 //
-// 三种线协议都用同一套字面量表达请求级错误，判据与协议无关，故放在统一协议包，
+// 各线协议都用同一套字面量表达请求级错误，判据与协议无关，故放在统一协议包，
 // 避免各适配器各写一份而漂移。
 //
 // 当前登记的字面量包括：

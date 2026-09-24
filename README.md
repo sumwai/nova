@@ -65,11 +65,11 @@ provider openai {
 
 | 指令 | 位置 | 必填 | 说明 |
 |---|---|---|---|
-| `url` | 端点 | 是 | 完整地址，含协议段与端点路径 |
-| `protocol` | 端点 | 否 | `openai_chat` / `openai_responses` / `anthropic_messages`；省略时从 `url` 末段推导，写了则必须与推导一致 |
+| `url` | 端点 | 是 | 完整地址，含协议段与端点路径；Gemini 端点里用 `{model}` 指代模型名 |
+| `protocol` | 端点 | 否 | `openai_chat` / `openai_responses` / `anthropic_messages` / `gemini`；省略时从 `url` 末段推导，写了则必须与推导一致 |
 | `timeout` | 端点 | 否 | 单次上游调用超时，缺省 `60s` |
 | `model <对外名> [<上游名>]` | 端点 | 至少一条 `model` 或一条 `discover` | 对外名是客户端请求里要匹配的名字；省略上游名时，发往上游的名字与对外名相同 |
-| `discover [<地址>]` | 端点 | 否 | 模型来自上游清单；省略地址时从 `url` 推导 |
+| `discover [<地址>]` | 端点 | 否 | 模型来自上游清单；省略地址时从 `url` 推导；Gemini 端点不支持 |
 | `allow <模式>` | 端点 | 否，可多条 | 白名单，只保留命中的发现模型 |
 | `deny <模式>` | 端点 | 否，可多条 | 黑名单，排除命中的发现模型 |
 | `expose <上游模式> <对外名模式>` | 端点 | 否，可多条 | 把清单里的上游 id 改写成对外名，第一条命中即生效 |
@@ -97,6 +97,27 @@ provider relay {
     }
 }
 ```
+
+### Gemini 端点
+
+Gemini 把模型名与动作（是否流式）都写在请求路径上
+（`/v1beta/models/{model}:generateContent` 与 `:streamGenerateContent?alt=sse`），
+请求体里没有这两项。端点的 `url` 因此用 `{model}` 指代本次请求的模型名，**并要加引号**——
+不加引号时 `{` 会被词法器当成块开启，取值被切成多段。
+
+```
+provider gemini {
+    api_key {env.GEMINI_API_KEY}
+
+    url "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    model gemini-2.5-flash
+    model gemini-2.5-pro
+}
+```
+
+网关按本次请求是否流式把地址末段改成 `:generateContent` 或 `:streamGenerateContent?alt=sse`，
+凭据以 `x-goog-api-key` 注入。`discover` 本版不支持 Gemini 端点：清单响应的形状不同，
+且地址里带占位符、推不出清单地址；模型用 `model` 逐条声明。
 
 ### 一个渠道多个账号
 
@@ -279,14 +300,16 @@ OpenAI 形状；与其它路径一样要过 `client_key`。想在动手改配置
 
 ### 协议转换
 
-客户端协议由请求路径决定（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`），
-与端点协议不一致时由网关转换，配置里不需要声明。
+客户端协议由请求路径决定（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，
+以及 Gemini 的 `/v1beta/models/<模型>:generateContent` 与 `:streamGenerateContent`），
+与端点协议不一致时由网关转换，配置里不需要声明。Gemini 客户端路径里的模型名取 `models/`
+前缀之后的部分，与另外三种协议一样按对外名匹配选路。
 
 ### 客户端鉴权
 
-`client_key` 列出允许调用网关的凭据，可写多条。客户端用 `Authorization: Bearer <key>`
-或 `x-api-key: <key>` 提交，任一匹配即放行。不写 `client_key` 时不鉴权，并在 `listen`
-绑到非回环地址时记一条警告。
+`client_key` 列出允许调用网关的凭据，可写多条。客户端用 `Authorization: Bearer <key>`、
+`x-api-key: <key>` 或 `x-goog-api-key: <key>`（Gemini 客户端）提交，任一匹配即放行。
+不写 `client_key` 时不鉴权，并在 `listen` 绑到非回环地址时记一条警告。
 
 ### 日志
 

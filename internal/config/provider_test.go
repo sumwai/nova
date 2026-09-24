@@ -211,6 +211,37 @@ func TestProtocolIsDerivedFromURL(t *testing.T) {
 	}
 }
 
+// TestGeminiEndpointFromConfig 守护 Gemini 端点由地址末段的动作段推出协议。
+//
+// 地址里的 {model} 必须加引号：未加引号时 `{` 会被词法器当成块开启，取值被切成多段。
+func TestGeminiEndpointFromConfig(t *testing.T) {
+	src := "version 1\nprovider p {\n    api_key k\n" +
+		"    url \"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent\"\n" +
+		"    model gemini-2.5-flash\n}\n"
+	cfg := mustParse(t, src)
+	endpoint := cfg.Providers[0].Endpoints[0]
+	if endpoint.Protocol != domain.ProtocolGemini {
+		t.Errorf("协议 = %q，期望 %q", string(endpoint.Protocol), string(domain.ProtocolGemini))
+	}
+	wantURL := "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+	if endpoint.URL != wantURL {
+		t.Errorf("地址 = %q，期望 %q", endpoint.URL, wantURL)
+	}
+
+	// 具名端点块头里的地址同样要加引号；块头只接受一个取值记号。
+	blockSrc := "version 1\nprovider p {\n    api_key k\n" +
+		"    endpoint \"https://a.example.com/v1beta/models/{model}:generateContent\" {\n" +
+		"        model gemini-2.5-flash\n    }\n}\n"
+	blockCfg := mustParse(t, blockSrc)
+	blockEndpoint := blockCfg.Providers[0].Endpoints[0]
+	if blockEndpoint.Protocol != domain.ProtocolGemini {
+		t.Errorf("具名端点协议 = %q，期望 %q", string(blockEndpoint.Protocol), string(domain.ProtocolGemini))
+	}
+	if blockEndpoint.URL != "https://a.example.com/v1beta/models/{model}:generateContent" {
+		t.Errorf("具名端点地址 = %q", blockEndpoint.URL)
+	}
+}
+
 func TestProviderConfigErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -301,6 +332,20 @@ func TestProviderConfigErrors(t *testing.T) {
 			name:    "协议名不认识",
 			src:     "provider p {\n    api_key k\n    url https://a.example.com/v1/chat/completions\n    protocol openai\n    model m\n}\n",
 			wantMsg: []string{"线协议", "不认识"},
+		},
+		{
+			name: "gemini 端点地址缺少模型名占位符",
+			src: "provider p {\n    api_key k\n" +
+				"    url \"https://a.example.com/v1beta/models/gemini-2.5-flash:generateContent\"\n" +
+				"    model m\n}\n",
+			wantMsg: []string{"必须用 {model} 指代"},
+		},
+		{
+			name: "gemini 端点不支持 discover",
+			src: "provider p {\n    api_key k\n" +
+				"    url \"https://a.example.com/v1beta/models/{model}:generateContent\"\n" +
+				"    discover\n    model m\n}\n",
+			wantMsg: []string{"不支持 discover"},
 		},
 		{
 			name:    "model 只有对外名之外的多余取值",
