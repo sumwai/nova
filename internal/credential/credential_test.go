@@ -22,7 +22,7 @@ var _ upstream.HeaderProvider = (*Provider)(nil)
 
 // singleRef 构造只含一条凭据的提供者，供只关心注入形态的用例复用。
 func singleRef(ref string, cred Credential) *Provider {
-	return New(map[string]Credential{ref: cred})
+	return New(map[string][]Account{ref: {{Ref: "#1", APIKey: cred.APIKey}}})
 }
 
 // TestUpstreamHeadersInjectsPerProtocol 覆盖三个协议各自的凭据注入形态。
@@ -163,9 +163,9 @@ func TestUpstreamHeadersProtocolDrivesHeaderStyle(t *testing.T) {
 // 并且注入形态按该路由自己的协议决定——全局唯一的密钥或全局唯一的协议
 // 都会让其中一个渠道拿到错误的密钥或错误的头名。
 func TestUpstreamHeadersSelectsCredentialByRef(t *testing.T) {
-	provider := New(map[string]Credential{
-		"openai": {APIKey: "sk-openai"},
-		"claude": {APIKey: "sk-claude"},
+	provider := New(map[string][]Account{
+		"openai": {{Ref: "#1", APIKey: "sk-openai"}},
+		"claude": {{Ref: "#1", APIKey: "sk-claude"}},
 	})
 
 	openaiHeaders, err := provider.UpstreamHeaders(context.Background(),
@@ -357,12 +357,12 @@ func TestUpstreamHeadersReturnsIndependentMaps(t *testing.T) {
 // TestNewCopiesCredentialTable 守护构造时整表拷贝：调用方之后继续改自己的表，
 // 不得改变已生效的凭据表——凭据表在运行期只读，被外部改动会让注入结果与装配时的意图不一致。
 func TestNewCopiesCredentialTable(t *testing.T) {
-	table := map[string]Credential{
-		"openai": {APIKey: "sk-before"},
+	table := map[string][]Account{
+		"openai": {{Ref: "#1", APIKey: "sk-before"}},
 	}
 	provider := New(table)
-	table["openai"] = Credential{APIKey: "sk-after"}
-	table["late"] = Credential{APIKey: "sk-late"}
+	table["openai"] = []Account{{Ref: "#1", APIKey: "sk-after"}}
+	table["late"] = []Account{{Ref: "#1", APIKey: "sk-late"}}
 
 	headers, err := provider.UpstreamHeaders(context.Background(),
 		domain.Route{CredentialRef: "openai", Protocol: domain.ProtocolOpenAIChat})
@@ -391,7 +391,7 @@ func TestCredentialRedactsPlaintextInFmt(t *testing.T) {
 		ref    = "ref-must-not-appear"
 	)
 	cred := Credential{APIKey: secret}
-	provider := New(map[string]Credential{ref: cred})
+	provider := New(map[string][]Account{ref: {{Ref: "#1", APIKey: secret}}})
 
 	cases := []struct {
 		name string
@@ -430,7 +430,7 @@ func TestCredentialRedactsPlaintextInSlog(t *testing.T) {
 		ref    = "ref-must-not-appear"
 	)
 	cred := Credential{APIKey: secret}
-	provider := New(map[string]Credential{ref: cred})
+	provider := New(map[string][]Account{ref: {{Ref: "#1", APIKey: secret}}})
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
@@ -447,5 +447,101 @@ func TestCredentialRedactsPlaintextInSlog(t *testing.T) {
 		if !strings.Contains(out, field+"=<redacted>") {
 			t.Errorf("日志字段 %s 应是占位符，实际输出：%s", field, out)
 		}
+	}
+}
+
+// TestUpstreamHeadersSelectsAccountWithinChannel 守护「按 route.AccountRef 在同一个渠道里选账号」。
+//
+// 同一个渠道的多份凭据共用地址、协议与模型，差异只在密钥本身。
+// 选不到账号时退回第一份会让分摊静默退化成只用主账号，因此必须按引用精确选取。
+func TestUpstreamHeadersSelectsAccountWithinChannel(t *testing.T) {
+	provider := New(map[string][]Account{
+		"relay": {
+			{Ref: "#1", APIKey: "sk-first"},
+			{Ref: "#2", APIKey: "sk-second"},
+		},
+	})
+
+	headers, err := provider.UpstreamHeaders(context.Background(), domain.Route{
+		CredentialRef: "relay",
+		AccountRef:    "#2",
+		Protocol:      domain.ProtocolOpenAIChat,
+	})
+	if err != nil {
+		t.Fatalf("UpstreamHeaders 返回错误：%v", err)
+	}
+	if got := headers.Get("Authorization"); got != "Bearer sk-second" {
+		t.Fatalf("Authorization = %q，期望第二个账号的密钥", got)
+	}
+}
+
+// TestEmptyAccountRefUsesFirstAccount 守护单账号配置不必在路由里写账号引用。
+//
+// 账号池引入之前的路由没有这个字段；空引用取声明顺序的第一项，
+// 因此单账号渠道的既有点位一个都不用改。
+func TestEmptyAccountRefUsesFirstAccount(t *testing.T) {
+	provider := New(map[string][]Account{
+		"relay": {
+			{Ref: "#1", APIKey: "sk-first"},
+			{Ref: "#2", APIKey: "sk-second"},
+		},
+	})
+
+	headers, err := provider.UpstreamHeaders(context.Background(), domain.Route{
+		CredentialRef: "relay",
+		Protocol:      domain.ProtocolAnthropicMessages,
+	})
+	if err != nil {
+		t.Fatalf("UpstreamHeaders 返回错误：%v", err)
+	}
+	if got := headers.Get("x-api-key"); got != "sk-first" {
+		t.Fatalf("x-api-key = %q，期望默认账号的密钥", got)
+	}
+}
+
+// TestUnknownAccountAndChannelReportSeparately 守护两种失败分开报。
+//
+// 渠道不存在说明装配时漏了整个渠道，账号不存在说明装配时少了一个账号：
+// 它们指向配置里的不同地方，合成一句「凭据取不到」会把排查引到错的方向。
+func TestUnknownAccountAndChannelReportSeparately(t *testing.T) {
+	provider := New(map[string][]Account{
+		"relay": {{Ref: "#1", APIKey: "sk-first"}},
+	})
+
+	_, err := provider.UpstreamHeaders(context.Background(), domain.Route{
+		CredentialRef: "missing",
+		Protocol:      domain.ProtocolOpenAIChat,
+	})
+	if err == nil || !strings.Contains(err.Error(), "不在凭据表里") {
+		t.Errorf("未知渠道应报「不在凭据表里」，实际：%v", err)
+	}
+
+	_, err = provider.UpstreamHeaders(context.Background(), domain.Route{
+		CredentialRef: "relay",
+		AccountRef:    "#9",
+		Protocol:      domain.ProtocolOpenAIChat,
+	})
+	if err == nil || !strings.Contains(err.Error(), "没有账号") || !strings.Contains(err.Error(), "#9") {
+		t.Errorf("未知账号应报出渠道与账号引用，实际：%v", err)
+	}
+}
+
+// TestNewCopiesAccountSlices 守护构造时连每个渠道的账号切片一起拷贝：
+// 调用方之后继续改自己切片的元素，不得改变已生效的凭据表。
+func TestNewCopiesAccountSlices(t *testing.T) {
+	accounts := []Account{{Ref: "#1", APIKey: "sk-before"}}
+	table := map[string][]Account{"relay": accounts}
+	provider := New(table)
+	accounts[0] = Account{Ref: "#1", APIKey: "sk-after"}
+
+	headers, err := provider.UpstreamHeaders(context.Background(), domain.Route{
+		CredentialRef: "relay",
+		Protocol:      domain.ProtocolOpenAIChat,
+	})
+	if err != nil {
+		t.Fatalf("UpstreamHeaders 返回错误：%v", err)
+	}
+	if got := headers.Get("Authorization"); got != "Bearer sk-before" {
+		t.Errorf("装配后修改入参切片改变了凭据：Authorization = %q", got)
 	}
 }

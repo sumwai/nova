@@ -322,7 +322,7 @@ func (p *Pipeline) allowRoute(route domain.Route) bool {
 	if p.breaker == nil {
 		return true
 	}
-	return p.breaker.Allow(route.UpstreamID)
+	return p.breaker.Allow(route.BreakerKey())
 }
 
 // recordRouteOutcome 把一次上游尝试的结果上报给渠道熔断器；未装配熔断器时为空操作。
@@ -330,7 +330,7 @@ func (p *Pipeline) recordRouteOutcome(route domain.Route, err error) {
 	if p.breaker == nil {
 		return
 	}
-	p.breaker.Record(route.UpstreamID, err)
+	p.breaker.Record(route.BreakerKey(), err)
 }
 
 // recordAttempt 把一次上游尝试写入观测记录；未配置观测器时不做任何事。
@@ -361,6 +361,7 @@ func (p *Pipeline) recordAttempt(
 		RequestedModel:   req.Model,
 		UpstreamID:       route.UpstreamID,
 		UpstreamModel:    route.UpstreamModel,
+		AccountRef:       route.AccountRef,
 		Outcome:          outcome,
 		Usage:            result.Usage,
 		ErrorCode:        errorCode(result.Err),

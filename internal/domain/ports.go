@@ -165,6 +165,10 @@ type Route struct {
 	// CredentialRef 是不透明引用，装配层的请求头提供者按它取出明文凭据并注入请求头。
 	// 它本身不携带明文，以免随日志泄露。
 	CredentialRef string
+	// AccountRef 是渠道内账号的引用，形如 "#2"；空串表示该渠道的默认账号
+	// （即声明顺序里的第一个）。它只在渠道声明了多个账号时非空：单账号时
+	// 留空串，日志、熔断键与折叠键因此与多账号之前的输出逐字一致。
+	AccountRef string
 	// Headers 是渠道级静态请求头，与凭据头合并后交适配器补协议内置必需头。
 	// nil 表示该渠道没有额外请求头。
 	Headers http.Header
@@ -184,6 +188,18 @@ type Route struct {
 	// CredentialHeaderStyle 是调用本渠道上游时凭据请求头的注入形态，由渠道配置给出；
 	// 零值 CredentialHeaderAuto 表示未配置，按协议现状注入。
 	CredentialHeaderStyle CredentialHeaderStyle
+}
+
+// BreakerKey 返回一次尝试在熔断与折叠口径下的渠道键。
+//
+// 声明了账号池的渠道按「渠道 + 账号」分开计：一个账号被限流不应该把整条渠道熔断，
+// 而同一账号的重复失败仍然归到同一个窗口里折叠。单账号时不加后缀，
+// 键与账号池引入之前逐字一致。
+func (r Route) BreakerKey() string {
+	if r.AccountRef == "" {
+		return r.UpstreamID
+	}
+	return r.UpstreamID + " " + r.AccountRef
 }
 
 // RouteResolver 返回按有效优先级升序排列的候选渠道列表。
@@ -367,7 +383,11 @@ type AttemptRecord struct {
 	RequestedModel string
 	UpstreamID     string
 	UpstreamModel  string
-	Outcome        AttemptOutcome
+	// AccountRef 是本次尝试使用的渠道内账号引用，空串表示单账号渠道。
+	// 它与 UpstreamID 一起回答「这一条打到哪个账号上」：多账号排障时
+	// 光看渠道名看不出是哪个账号在限流。
+	AccountRef string
+	Outcome    AttemptOutcome
 	// Usage 是上游本次尝试陈述的用量；未取得时为来源未知的零值（见 Usage.Known）。
 	Usage Usage
 	// ErrorCode 是本次失败尝试的错误码；成功时为空串。

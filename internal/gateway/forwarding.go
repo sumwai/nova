@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 
 	"github.com/sumwai/nova/internal/adapters/anthropic"
 	"github.com/sumwai/nova/internal/adapters/openaichat"
@@ -93,7 +94,7 @@ func protocolForRequest(r *http.Request) (domain.Protocol, bool) {
 // 它是「配置说的」与「上游现在有的」合并后的结果，选路表与对外目录都由它派生。
 // 发现失败的端点落回只有显式声明的那一份。
 type effectiveEndpoint struct {
-	provider string
+	provider *config.Provider
 	endpoint *config.Endpoint
 	models   []config.Model
 }
@@ -135,17 +136,24 @@ func resolveEndpointModels(endpoint *config.Endpoint, discovered []catalog.Model
 // 各成一条候选，它们共用地址、协议、超时与凭据，只有上游模型名不同；同一个对外名
 // 出现在多条端点下时，它们按声明顺序构成这个名字的回退链路。发现模型与显式模型
 // 在同一条端点上排出同一种候选，因此两类来源在转发路径上没有区别。
-func routesByModel(endpoints []effectiveEndpoint) map[string][]domain.Route {
-	table := make(map[string][]domain.Route)
+//
+// 账号池不在这里展开：它只有一个渠道内的账号序号这一个变量，而展开顺序要看本次请求
+// 从哪个账号起算。展开因此留给请求期的 resolver（见 accountPool.order）。
+func routesByModel(endpoints []effectiveEndpoint) map[string][]endpointRoute {
+	table := make(map[string][]endpointRoute)
 	for _, item := range endpoints {
+		provider := item.provider.Name
 		for _, model := range item.models {
-			table[model.Name] = append(table[model.Name], domain.Route{
-				UpstreamID:    upstreamID(item.provider, item.endpoint),
-				Protocol:      item.endpoint.Protocol,
-				UpstreamModel: model.Upstream,
-				BaseURL:       item.endpoint.URL,
-				Timeout:       item.endpoint.Timeout,
-				CredentialRef: item.provider,
+			table[model.Name] = append(table[model.Name], endpointRoute{
+				provider: provider,
+				Route: domain.Route{
+					UpstreamID:    upstreamID(provider, item.endpoint),
+					Protocol:      item.endpoint.Protocol,
+					UpstreamModel: model.Upstream,
+					BaseURL:       item.endpoint.URL,
+					Timeout:       item.endpoint.Timeout,
+					CredentialRef: provider,
+				},
 			})
 		}
 	}
@@ -250,22 +258,307 @@ func redactAddress(raw string) string {
 // maskedCredential 是口令被抹掉后留下的替换串，与 upstream 那侧的写法一致。
 const maskedCredential = "xxxxx"
 
-// credentialsByRef 把配置里的渠道整理成「引用名 → 凭据」表。
+// credentialsByRef 把配置里的渠道整理成「引用名 → 账号表」表。
 //
 // 引用名取 provider 名：它同时是 domain.Route.CredentialRef 的取值，两张表因此天然
-// 对齐，不需要另建一套标识。凭据只带密钥，注入形态由本次路由的协议决定
-// （见 internal/credential），因此这里不需要也不该记协议。
-func credentialsByRef(providers []config.Provider) map[string]credential.Credential {
-	table := make(map[string]credential.Credential, len(providers))
+// 对齐，不需要另建一套标识。每个渠道的账号切片按声明顺序保存，
+// 因此「该渠道的默认账号」有确定答案（第一项），不依赖 map 的遍历顺序。
+// 凭据只带密钥，注入形态由本次路由的协议决定（见 internal/credential），
+// 因此这里不需要也不该记协议。
+func credentialsByRef(providers []config.Provider) map[string][]credential.Account {
+	table := make(map[string][]credential.Account, len(providers))
 	for i := range providers {
-		table[providers[i].Name] = credential.Credential{APIKey: providers[i].APIKey}
+		provider := &providers[i]
+		accounts := make([]credential.Account, 0, len(provider.Accounts))
+		for _, account := range provider.Accounts {
+			accounts = append(accounts, credential.Account{Ref: account.Ref(), APIKey: account.APIKey})
+		}
+		table[provider.Name] = accounts
 	}
 	return table
 }
 
 // modelRouteResolver 是按对外模型名选路的实现。
 type modelRouteResolver struct {
-	routes map[string][]domain.Route
+	routes map[string][]endpointRoute
+	// accounts 按渠道存账号池；models 按对外名存候选分摊段。
+	// 两层各有一颗轮转计数器：外层决定先试哪个渠道，内层决定先试哪份凭据。
+	accounts map[string]*accountPool
+	models   map[string]*modelCandidatePool
+}
+
+// endpointRoute 是一条端点级候选：一个对外模型名落到某条端点上的结果。
+//
+// 它嵌 domain.Route 而不另建一套字段，是为了让选路表在未展开账号时
+// 就已经是一条可直接交给流水线的路由；账号只差一个取值。
+// provider 单独存一份，供请求期按渠道取账号池：
+// UpstreamID 里虽然也有渠道名，但那是一个给人读的字符串，不得由它反推渠道。
+type endpointRoute struct {
+	domain.Route
+	provider string
+}
+
+// accountPool 是一个渠道的账号池及其轮转状态。
+//
+// 只有声明了多个账号的渠道才有池：单账号不需要一个稳定的账号标识，
+// AccountRef 因此留空串，日志与凭据表与多账号之前的行为逐字一致。
+type accountPool struct {
+	// refs 是账号引用，weights 是与它一一对应的分摊权重，total 是权重之和。
+	refs    []string
+	weights []int
+	total   int
+	// balanced 报告这个池按权重轮询分摊；为假时按声明顺序调度。
+	balanced bool
+	// counter 是轮转计数，自增一次就把起点前移一个位置。
+	// 它挂在渠道而不是模型上：同一渠道下不同模型共享一条轮转序列，
+	// 否则并发请求会各查各的计数器而全压在同一个账号上。
+	counter atomic.Uint64
+}
+
+// order 返回本次请求使用的账号顺序。
+//
+// 不分摊时就是声明顺序，每个请求完全一样。分摊时把起点按权重前移：
+// 先按累计权重找出这次轮到谁，再把它后面的账号按声明顺序接上。
+// 链尾保留全部账号，因此分摊只改起点，不改「失败换下一个」的回退语义。
+func (p *accountPool) order() []string {
+	if !p.balanced {
+		return append([]string(nil), p.refs...)
+	}
+
+	// Add 返回自增后的值，减一才是本次的轮转位置。
+	position := int((p.counter.Add(1) - 1) % uint64(p.total))
+	first := 0
+	acc := 0
+	for i, weight := range p.weights {
+		acc += weight
+		if position < acc {
+			first = i
+			break
+		}
+	}
+
+	out := make([]string, 0, len(p.refs))
+	out = append(out, p.refs[first])
+	for i := range p.refs {
+		if i != first {
+			out = append(out, p.refs[i])
+		}
+	}
+	return out
+}
+
+// newModelRouteResolver 由生效端点集合与配置建选路表，并返回装配期的两条提醒。
+//
+// 提醒只能在装配期算：一条规则能不能命中对外名、一个候选渠道有没有作用对象，
+// 都取决于此时实际存在的对外名集合（含从清单发现来的那些）。
+func newModelRouteResolver(endpoints []effectiveEndpoint, cfg *config.Config) (*modelRouteResolver, []config.Warning) {
+	routes, models, warnings := applyModelRoutes(routesByModel(endpoints), cfg)
+	return &modelRouteResolver{
+		routes:   routes,
+		accounts: accountPools(cfg.Providers),
+		models:   models,
+	}, warnings
+}
+
+// modelCandidatePool 是一个对外模型名下参与分摊的候选段及其轮转状态。
+//
+// 段是「规则里列出的一个渠道」在候选链上的连续区间：同一渠道的多条端点候选
+// 不被拆开，先试完这条渠道再换下一条。未列出的候选不在段里，接在链尾当回退。
+type modelCandidatePool struct {
+	segments []candidateSegment
+	// tail 是参与分摊的候选在链上的长度：[0, tail) 是分摊段，之后是回退段。
+	tail    int
+	total   int
+	counter atomic.Uint64
+}
+
+// candidateSegment 是链上的一段候选及其权重。
+type candidateSegment struct {
+	start, end int
+	weight     int
+}
+
+// order 返回本次请求使用的候选顺序：分摊段按权重轮转起点，回退段原样接在后面。
+//
+// 只有一段时不重排：起点永远是它，重排只是白花一次拷贝。
+func (p *modelCandidatePool) order(candidates []endpointRoute) []endpointRoute {
+	if len(p.segments) <= 1 || p.total <= 0 {
+		return candidates
+	}
+	position := int((p.counter.Add(1) - 1) % uint64(p.total))
+	first := 0
+	acc := 0
+	for i, segment := range p.segments {
+		acc += segment.weight
+		if position < acc {
+			first = i
+			break
+		}
+	}
+
+	out := make([]endpointRoute, 0, len(candidates))
+	for _, segment := range p.segments[first:] {
+		out = append(out, candidates[segment.start:segment.end]...)
+	}
+	for _, segment := range p.segments[:first] {
+		out = append(out, candidates[segment.start:segment.end]...)
+	}
+	return append(out, candidates[p.tail:]...)
+}
+
+// applyModelRoutes 按规则重排每个对外名下的候选，并为分摊的模型建轮转状态。
+//
+// 候选分三段：主用候选（`provider` 行，按书写顺序，写 balance 时按权重轮转）→
+// 显式回退候选（`fallback` 行，按书写顺序，不参与轮转）→ 规则没提到的渠道
+// （按声明顺序，最后兜底）。后两段永远待在前一段之后，因此「主用全部失败才切换」
+// 是结构上的事实，而不是靠权重或运气。
+//
+// 返回的提醒对应两件事：一条规则没有命中任何对外名；一条规则里的某个渠道
+// 没有提供任何匹配该模式的模型。两者都只能在装配期回答，因为对外名集合包含
+// 从上游清单发现来的那些。
+func applyModelRoutes(
+	routes map[string][]endpointRoute,
+	cfg *config.Config,
+) (map[string][]endpointRoute, map[string]*modelCandidatePool, []config.Warning) {
+	out := make(map[string][]endpointRoute, len(routes))
+	models := make(map[string]*modelCandidatePool)
+
+	hit := make([]bool, len(cfg.ModelRoutes))
+	seenCandidate := make([]map[string]bool, len(cfg.ModelRoutes))
+	for i := range seenCandidate {
+		seenCandidate[i] = map[string]bool{}
+	}
+
+	for name, chain := range routes {
+		index := cfg.ModelRouteIndexFor(name)
+		if index < 0 {
+			out[name] = chain
+			continue
+		}
+		hit[index] = true
+		rule := &cfg.ModelRoutes[index]
+
+		// 按渠道分组：同一渠道的多条端点候选保持相对声明顺序，整组移动。
+		groups, at := groupByProvider(chain)
+		used := make([]bool, len(groups))
+
+		var preferred []endpointRoute
+		var fallbacks []endpointRoute
+		var segments []candidateSegment
+		total := 0
+		for _, candidate := range rule.Candidates {
+			group, ok := at[candidate.Provider]
+			if !ok {
+				continue
+			}
+			seenCandidate[index][candidate.Provider] = true
+			used[group] = true
+			if candidate.Fallback {
+				fallbacks = append(fallbacks, groups[group]...)
+				continue
+			}
+			start := len(preferred)
+			preferred = append(preferred, groups[group]...)
+			if rule.Balanced {
+				segments = append(segments, candidateSegment{
+					start: start, end: len(preferred), weight: candidate.Weight,
+				})
+				total += candidate.Weight
+			}
+		}
+
+		// 三段依次拼起来：主用候选 → fallback 行声明的回退候选 → 规则没提到的渠道。
+		// 后两段都不参与轮转，它们只在前面全部失败之后才被用到。
+		tail := len(preferred)
+		reordered := append(preferred, fallbacks...)
+		for i, group := range groups {
+			if !used[i] {
+				reordered = append(reordered, group...)
+			}
+		}
+		out[name] = reordered
+		// 有规则就建池，即使没写 balance（segments 为空）：它同时是一个标记，
+		// 告诉请求期这个名字的候选顺序已经由规则定下，不再做同协议优先的隐式划分。
+		models[name] = &modelCandidatePool{segments: segments, tail: tail, total: total}
+	}
+	return out, models, routeWarnings(cfg.ModelRoutes, hit, seenCandidate)
+}
+
+// groupByProvider 把一条候选链按渠道切成若干组，并返回渠道名到组下标。
+//
+// 组内保持原顺序，组的顺序按首次出现：同一渠道的多条端点候选因此不会被拆开。
+func groupByProvider(chain []endpointRoute) ([][]endpointRoute, map[string]int) {
+	at := make(map[string]int, len(chain))
+	var groups [][]endpointRoute
+	for _, candidate := range chain {
+		index, ok := at[candidate.provider]
+		if !ok {
+			index = len(groups)
+			at[candidate.provider] = index
+			groups = append(groups, nil)
+		}
+		groups[index] = append(groups[index], candidate)
+	}
+	return groups, at
+}
+
+// routeWarnings 把两条「写了但没起作用」的事实整理成带位置的提醒。
+//
+// 一条规则没命中任何对外名时不再逐条报它的渠道：那种情况下每个渠道都没有作用对象，
+// 报一次模式对不上就够，逐条报只会把真正的信号淹掉。
+func routeWarnings(
+	rules []config.ModelRoute,
+	hit []bool,
+	seenCandidate []map[string]bool,
+) []config.Warning {
+	var warnings []config.Warning
+	for i := range rules {
+		rule := &rules[i]
+		if !hit[i] {
+			warnings = append(warnings, config.Warning{
+				File: rule.File,
+				Line: rule.Line,
+				Msg: fmt.Sprintf("route %s 没有命中任何对外名；"+
+					"检查模式是否与 provider 里声明的模型名一致（匹配大小写敏感）", rule.Pattern),
+			})
+			continue
+		}
+		for _, candidate := range rule.Candidates {
+			if seenCandidate[i][candidate.Provider] {
+				continue
+			}
+			warnings = append(warnings, config.Warning{
+				File: candidate.File,
+				Line: candidate.Line,
+				Msg: fmt.Sprintf("route %s 里的渠道 %q 没有提供任何匹配该模式的模型",
+					rule.Pattern, candidate.Provider),
+			})
+		}
+	}
+	return warnings
+}
+
+// accountPools 按渠道建账号池，只保留声明了多个账号的渠道。
+func accountPools(providers []config.Provider) map[string]*accountPool {
+	pools := make(map[string]*accountPool, len(providers))
+	for i := range providers {
+		provider := &providers[i]
+		if !provider.HasAccountPool() {
+			continue
+		}
+		pool := &accountPool{
+			refs:     make([]string, 0, len(provider.Accounts)),
+			weights:  make([]int, 0, len(provider.Accounts)),
+			balanced: provider.Balanced,
+		}
+		for _, account := range provider.Accounts {
+			pool.refs = append(pool.refs, account.Ref())
+			pool.weights = append(pool.weights, account.Weight)
+			pool.total += account.Weight
+		}
+		pools[provider.Name] = pool
+	}
+	return pools
 }
 
 // Candidates 返回该 model 命中某个对外名时的候选渠道。
@@ -277,7 +570,7 @@ type modelRouteResolver struct {
 //
 // 未命中任何对外名时返回空候选与 nil 错误，把「该回什么错误码」留给流水线统一判定：
 // 选路层只回答「有哪些候选」，不决定对外呈现。
-func (r modelRouteResolver) Candidates(_ context.Context, req *domain.Request) ([]domain.Route, error) {
+func (r *modelRouteResolver) Candidates(_ context.Context, req *domain.Request) ([]domain.Route, error) {
 	if req == nil {
 		return nil, nil
 	}
@@ -285,14 +578,76 @@ func (r modelRouteResolver) Candidates(_ context.Context, req *domain.Request) (
 	if len(candidates) == 0 {
 		return nil, nil
 	}
+	// 候选层先轮转：决定这次先试哪个渠道；账号展开再跟在它后面。
+	// 命中规则时不再做同协议优先：规则是显式写下的顺序，跨协议的候选同样是被
+	// 明确列出的等价来源，把它推到链尾会让分摊失效。没写规则时才用这条隐式优化。
+	ruled := false
+	if pool := r.models[req.Model]; pool != nil {
+		candidates = pool.order(candidates)
+		ruled = true
+	}
+
+	// orders 缓存本次请求每个渠道的账号顺序：同一渠道的多条端点候选共用一个起点，
+	// 否则一个请求会在 E1 上从 #2 开始、在 E2 上又从 #1 开始。
+	orders := make(map[string][]string, len(r.accounts))
+	expanded := make([]domain.Route, 0, len(candidates))
+	for _, candidate := range candidates {
+		order, cached := orders[candidate.provider]
+		if !cached {
+			if pool := r.accounts[candidate.provider]; pool != nil {
+				order = pool.order()
+			}
+			orders[candidate.provider] = order
+		}
+		if len(order) == 0 {
+			expanded = append(expanded, candidate.Route)
+			continue
+		}
+		for _, ref := range order {
+			route := candidate.Route
+			route.AccountRef = ref
+			expanded = append(expanded, route)
+		}
+	}
+
 	// 返回值必须是新切片：候选表会被并发读，就地排序会让一个请求的选路次序
 	// 影响另一个请求正在用的那份数据。
-	return domain.PreferRoutesForProtocol(req.Protocol, candidates), nil
+	if !ruled {
+		expanded = domain.PreferRoutesForProtocol(req.Protocol, expanded)
+	}
+	return expanded, nil
+}
+
+// maxCandidates 返回单个模型展开账号后最长的候选链长度。
+//
+// 上限必须覆盖整条链：流水线按「每条候选一次尝试」推进，上限取一个与候选数无关的
+// 小常量时，排在它之后的候选永远轮不到，配置里写下的回退链路形同虚设。
+//
+// 这不会让「多配一个账号」无端多出重试：候选循环的推进条件是「本次失败且可重试」，
+// 每条候选仍最多尝试一次，上限只是把循环的边界放到链尾。
+func (r *modelRouteResolver) maxCandidates() int {
+	longest := 0
+	for _, candidates := range r.routes {
+		total := 0
+		for _, candidate := range candidates {
+			total++
+			if pool := r.accounts[candidate.provider]; pool != nil {
+				total += len(pool.refs) - 1
+			}
+		}
+		if total > longest {
+			longest = total
+		}
+	}
+	if longest < 1 {
+		return 1
+	}
+	return longest
 }
 
 // forwarderOptions 组装流水线的依赖与边界。
 func forwarderOptions(
-	routes map[string][]domain.Route,
+	resolver *modelRouteResolver,
 	adapters pipeline.AdapterLookup,
 	caller domain.UpstreamCaller,
 	observer domain.Observer,
@@ -300,34 +655,14 @@ func forwarderOptions(
 	return pipeline.Options{
 		Adapters: adapters,
 		Upstream: caller,
-		Routes:   modelRouteResolver{routes: routes},
+		Routes:   resolver,
 		// Observer 记每次上游尝试：客户端只拿到聚合后的错误码，
 		// 上游的状态码与响应片段只在尝试记录里可见，缺了它排障只能靠猜。
 		Observer: observer,
 		// Breaker 留零值：本版不做熔断，候选按声明顺序逐个尝试。
 		// 上游那份实现（internal/router）在生产装配里本来就没生效过，没有搬过来。
-		MaxAttempts: maxUpstreamAttempts(routes),
+		MaxAttempts: resolver.maxCandidates(),
 	}
-}
-
-// maxUpstreamAttempts 返回单请求最多发起的上游尝试次数：整条候选链的长度。
-//
-// 上限必须覆盖整条链：流水线按「每条候选一次尝试」推进，上限取一个与候选数无关的
-// 小常量时，排在它之后的候选永远轮不到，配置里写下的回退链路形同虚设。
-//
-// 这不会让「多配一个候选」无端多出重试：候选循环的推进条件是「本次失败且可重试」，
-// 每条候选仍最多尝试一次，上限只是把循环的边界放到链尾。
-func maxUpstreamAttempts(routes map[string][]domain.Route) int {
-	longest := 0
-	for _, candidates := range routes {
-		if len(candidates) > longest {
-			longest = len(candidates)
-		}
-	}
-	if longest < 1 {
-		return 1
-	}
-	return longest
 }
 
 // upstreamAdapterLookup 供上游客户端与流水线按上游协议取适配器。

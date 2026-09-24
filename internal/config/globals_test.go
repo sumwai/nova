@@ -96,7 +96,7 @@ provider p {
 }
 `, map[string]string{"TEST_KEY": "sk-from-env"})
 
-	if got := cfg.Providers[0].APIKey; got != "sk-from-env" {
+	if got := cfg.Providers[0].Accounts[0].APIKey; got != "sk-from-env" {
 		t.Errorf("凭据 = %q，期望从环境变量展开", got)
 	}
 }

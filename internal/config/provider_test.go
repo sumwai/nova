@@ -26,8 +26,8 @@ provider openai {
 	if provider.Name != "openai" {
 		t.Errorf("名字 = %q，期望 openai", provider.Name)
 	}
-	if provider.APIKey != "sk-test" {
-		t.Errorf("凭据 = %q，期望 sk-test", provider.APIKey)
+	if provider.Accounts[0].APIKey != "sk-test" {
+		t.Errorf("凭据 = %q，期望 sk-test", provider.Accounts[0].APIKey)
 	}
 	if len(provider.Endpoints) != 1 {
 		t.Fatalf("端点 数 = %d，期望 1", len(provider.Endpoints))
@@ -220,7 +220,7 @@ func TestProviderConfigErrors(t *testing.T) {
 		{
 			name:    "缺 api_key",
 			src:     "provider p {\n    url https://a.example.com/v1/chat/completions\n    model m\n}\n",
-			wantMsg: []string{"缺少 api_key"},
+			wantMsg: []string{"没有任何凭据", "api_key"},
 		},
 		{
 			name:    "缺 url",
@@ -235,7 +235,7 @@ func TestProviderConfigErrors(t *testing.T) {
 		{
 			name:    "空 provider 块（两者都缺时先报凭据）",
 			src:     "provider p {\n}\n",
-			wantMsg: []string{"缺少 api_key"},
+			wantMsg: []string{"没有任何凭据"},
 		},
 		{
 			name:    "有凭据但一个端点都没有",

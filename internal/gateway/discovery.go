@@ -332,7 +332,7 @@ func assembleEndpoints(
 		for j := range provider.Endpoints {
 			endpoint := &provider.Endpoints[j]
 			endpoints = append(endpoints, effectiveEndpoint{
-				provider: provider.Name,
+				provider: provider,
 				endpoint: endpoint,
 				models:   resolveEndpointModels(endpoint, discovered[endpoint]),
 			})

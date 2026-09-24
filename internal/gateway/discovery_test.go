@@ -23,8 +23,8 @@ func discoveryConfig(listing string, models ...config.Model) *config.Config {
 		LogLevel:  "info",
 		LogFormat: "text",
 		Providers: []config.Provider{{
-			Name:   "relay",
-			APIKey: "sk-test",
+			Name:     "relay",
+			Accounts: []config.Account{{APIKey: "sk-test", Weight: 1, Index: 1}},
 			Endpoints: []config.Endpoint{{
 				URL:      "https://relay.example.com/v1/chat/completions",
 				Protocol: domain.ProtocolOpenAIChat,
@@ -156,8 +156,8 @@ func TestDiscoveryReusesProtocolHeaders(t *testing.T) {
 	cfg := &config.Config{
 		LogLevel: "info", LogFormat: "text",
 		Providers: []config.Provider{{
-			Name:   "anthropic",
-			APIKey: "sk-ant",
+			Name:     "anthropic",
+			Accounts: []config.Account{{APIKey: "sk-ant", Weight: 1, Index: 1}},
 			Endpoints: []config.Endpoint{{
 				URL:      "https://api.anthropic.com/v1/messages",
 				Protocol: domain.ProtocolAnthropicMessages,

@@ -59,7 +59,8 @@ client_key {env.NOVA_CLIENT_KEY}
 #
 # `provider <名>` 描述一条上游渠道。名字只用于日志与错误定位，不参与选路，
 # 因此重名会被拒绝，但叫什么名字不影响转发。
-# 凭据 api_key 写在 provider 一级，本块的所有端点共用这一份。
+# 凭据 api_key 写在 provider 一级，本块的所有端点共用它；写多条就是多个账号，
+# 见下面「一个渠道多个账号」一节。
 #
 # 一条端点由三件事构成：地址、协议、它提供哪些模型。
 # 「哪些模型属于哪条端点」必须写在同一条端点里——把 endpoint 与 model 平铺在 provider
@@ -129,6 +130,94 @@ provider relay {
 #         model claude-sonnet-4
 #     }
 # }
+
+# ── 一个渠道多个账号 ───────────────────────────────────────────────
+#
+# api_key 可以写多条，一条一个账号：它们共用本块的地址、协议、超时与模型声明，
+# 只有凭据不同。加一个账号就是复制一行。
+#
+# provider openai {
+#     api_key {env.OPENAI_KEY_1}
+#     api_key {env.OPENAI_KEY_2}
+#     url https://api.openai.com/v1/chat/completions
+#     model gpt-5
+# }
+#
+# 不写 balance 时按声明顺序调度：前面的账号失败且可重试，才换后面的。
+#
+# 写 balance 时按权重轮询分摊：每次请求把起点前移一个位置，链尾仍保留全部账号，
+# 因此分摊在正常情况下生效、故障时照常回退。权重写在 api_key 的取值后面，
+# 省略即 1；下面两行表示每轮里第一个账号轮到三次、第二个账号轮到一次。
+#
+# provider openai {
+#     api_key {env.OPENAI_KEY_1} 3
+#     api_key {env.OPENAI_KEY_2}
+#     balance
+#     url https://api.openai.com/v1/chat/completions
+#     model gpt-5
+# }
+#
+# 写了权重却没写 balance 时权重没有作用，单账号写 balance 时没有可分摊的对象，
+# 两种都记一条提醒。
+#
+# 账号多了就单独放一个文件，用 import 拼进来：被导入的文件就是一段 provider 块体，
+# 因此走同一套词法、注释与 {env.NAME}，写错的一行也报出池文件自己的位置。
+# 一条 glob 内的文件按文件名字典序拼接，文件名前缀因此决定账号顺序。
+#
+# provider openai {
+#     import accounts/openai-*.nova
+#     url https://api.openai.com/v1/chat/completions
+#     model gpt-5
+# }
+#
+# accounts/openai-01.nova:
+#     api_key {env.OPENAI_KEY_1}
+#     api_key {env.OPENAI_KEY_2}
+
+# ── 跨渠道分摊与回退 ──────────────────────────────────
+#
+# 同一个对外名落在多条渠道上时，缺省按渠道的声明顺序回退：前面那条失败且可重试，
+# 才换下一条。要让它们分摊流量就用顶层 route 块声明候选与规则。
+#
+# route <对外名模式> {
+#     balance                      # 可选：主用候选按权重轮询分摊
+#     provider <渠道名> [<权重>]…  # 主用候选，一行可列多个
+#     fallback <渠道名> [<权重>]…  # 回退候选，主用全部失败后才轮到
+# }
+#
+# 候选按三段的固定顺序拼成一条链：
+#   1. provider 行：主用候选，按书写顺序；写 balance 时按权重轮转起点
+#   2. fallback 行：显式回退候选，主用候选全部失败之后才轮到，不参与轮转
+#   3. 规则没提到的渠道：按声明顺序接在最后兜底
+# 「主用全部失败才切换」因此是结构上的事实，而不是靠权重或运气。
+#
+# 模式不含 * / ? 时就是那一个名字，含通配时匹配一组名字。匹配大小写敏感（对外名
+# 本身是精确匹配的），多条规则按声明顺序取第一条命中（更具体的写在前面）。
+#
+# route deepseek* {
+#     balance
+#     provider relay-a 3
+#     provider relay-b 1
+#     fallback relay-c
+# }
+#
+# 上面的 relay-a 与 relay-b 按 3:1 轮转，它们的每一条账号都失败之后才轮到 relay-c。
+# 分摊只改起点，链尾一个候选都不丢。
+#
+# 一行可以列多个渠道名（各权重 1）：provider relay-a relay-b。权重写在它所属
+# 渠道名之后，因此渠道名不能是纯数字。
+#
+# 不写 balance 时主用段按书写顺序回退，用来重排优先级：
+#
+# route deepseek-chat {
+#     provider relay-b
+#     provider relay-a
+# }
+#
+# 同一个渠道的多条端点候选作为一个整体移动：先试完这条渠道的全部端点，再换下一条。
+# 命中规则的模型不再做「同协议候选优先」那条隐式排序：规则写下的顺序就是最终顺序。
+# 一条规则没有命中任何对外名、或规则里的某个渠道没有提供匹配该模式的模型时，
+# 加载会各记一条提醒。
 
 # ── 模型自动发现与过滤 ─────────────────────────────────────────────
 #

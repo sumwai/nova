@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/sumwai/nova/internal/domain"
@@ -90,6 +91,10 @@ type Config struct {
 	// Providers 是上游渠道，按声明顺序。这个顺序就是同名模型之间的回退顺序。
 	Providers []Provider
 
+	// ModelRoutes 是对外模型名的候选声明，按声明顺序。
+	// 一个名字取第一条命中它的规则；没有规则命中时，候选按 Providers 的声明顺序回退。
+	ModelRoutes []ModelRoute
+
 	// Warnings 是解析期攒下的、不阻止加载的提醒。
 	// 收集起来统一输出，让一次加载里的全部问题一次说完，而不是报一条改一条。
 	Warnings []Warning
@@ -98,12 +103,18 @@ type Config struct {
 // Provider 是一条上游渠道。
 //
 // 名字只用于日志与错误定位，不参与选路——选路的唯一依据是对外模型名。
-// 凭据是本块共用的：同一个渠道下的每条端点都走同一份密钥。
+// 凭据是本块共用的：同一个渠道下的每条端点都走这里的账号池。
 type Provider struct {
 	Name string
 
-	// APIKey 是这条渠道的凭据，由 api_key 指令给出。
-	APIKey string
+	// Accounts 是这条渠道的账号池，按声明顺序。
+	// 每条 api_key 指令一项，一份配置里写几条就有几个账号；
+	// 账号之间只是凭据不同，共用全部端点、协议与模型声明。
+	Accounts []Account
+
+	// Balanced 表示写了 balance：账号池按权重轮询分摊。
+	// 为假时按账号声明顺序调度，前面的失败才用后面的。
+	Balanced bool
 
 	// Endpoints 是这条渠道的端点，按声明位置排序。
 	// 顺序有意义：同一个对外模型名落在多条端点上时，它就是回退顺序。
@@ -113,6 +124,44 @@ type Provider struct {
 	File string
 	Line int
 	Col  int
+}
+
+// Account 是渠道里的一份凭据。
+//
+// 它只承载凭据与它的分摊权重，不承载地址、协议或模型：那些是端点的事实。
+// 同一渠道的多份凭据因此不必重复声明端点，也不会随两份声明而漂移。
+type Account struct {
+	// APIKey 是明文密钥，由 api_key 指令给出，{env.NAME} 已在解析期展开。
+	APIKey string
+
+	// Weight 是 balance 下的分摊权重，缺省 1。
+	// 未写 balance 时它没有作用，加载期会记一条提醒。
+	Weight int
+
+	// Index 是声明序号，从 1 起，按 api_key 行的出现顺序。
+	// 日志、凭据引用与轮转顺序都用它定位账号。
+	Index int
+
+	// File / Line / Col 指向这条 api_key 指令，用于报错与提醒的定位。
+	File string
+	Line int
+	Col  int
+}
+
+// Ref 返回账号在渠道内的引用，形如 "#1"。
+//
+// 引用只有这一个出处：凭据表按它建键，domain.Route.AccountRef 取它，
+// 日志用它定位账号。另写一份拼接会在两处慢慢长出不同的形状。
+func (a Account) Ref() string {
+	return "#" + strconv.Itoa(a.Index)
+}
+
+// HasAccountPool 报告这条渠道是否声明了多个账号。
+//
+// 只有账号池需要一个稳定的账号标识：单账号时引用为空串，日志与凭据表因此
+// 与既有输出逐字一致，多账号才多出一列。
+func (p *Provider) HasAccountPool() bool {
+	return len(p.Accounts) > 1
 }
 
 // Endpoint 是一条上游端点：一个地址、一种线协议、一组对外模型名。
@@ -281,6 +330,147 @@ func (c *Config) DiscoveryCount() int {
 		}
 	}
 	return count
+}
+
+// AccountPoolStats 返回声明了多个账号的渠道数，以及这些渠道的账号总数。
+//
+// 只统计账号池：单账号渠道与账号池引入之前没有区别，把它计进去只会让「有几个账号池」
+// 这个数看不出重点。启动横幅与 config check 用它回答「这份配置有没有在分摊凭据」。
+func (c *Config) AccountPoolStats() (channels, accounts int) {
+	for i := range c.Providers {
+		if !c.Providers[i].HasAccountPool() {
+			continue
+		}
+		channels++
+		accounts += len(c.Providers[i].Accounts)
+	}
+	return channels, accounts
+}
+
+// AccountPoolPolicyText 用一句话描述账号池的调度口径。
+//
+// 两种口径不混写：有的渠道写 balance、有的没写，是同一份配置里的两种事实，
+// 只报其中一种会让另一种渠道的调度成为没说出口的默认。
+func (c *Config) AccountPoolPolicyText() string {
+	balanced, sequential := 0, 0
+	for i := range c.Providers {
+		provider := &c.Providers[i]
+		if !provider.HasAccountPool() {
+			continue
+		}
+		if provider.Balanced {
+			balanced++
+		} else {
+			sequential++
+		}
+	}
+	switch {
+	case balanced == 0:
+		return "按声明顺序调度"
+	case sequential == 0:
+		return "按权重轮询分摊"
+	default:
+		return fmt.Sprintf("%d 个按权重轮询分摊，%d 个按声明顺序", balanced, sequential)
+	}
+}
+
+// ModelRoute 是一条对外模型名的候选声明。
+//
+// 它回答「这个名字下有哪些渠道、按什么次序」：省略整条规则时候选按渠道的声明顺序回退；
+// 写了规则时，被列出的渠道排在前（写 balance 则按权重轮询分摊），未列出的渠道
+// 按声明顺序接在后面作回退。轮转只改起点，链尾保留全部候选。
+type ModelRoute struct {
+	// Pattern 是对外名模式。不含通配符时就是那一个名字，含 * / ? 时匹配一组名字。
+	// 匹配大小写敏感：对外名本身是精确匹配的，模式若大小写不敏感就会出现
+	// 「规则命中了、请求却找不到模型」。
+	Pattern string
+
+	// Balanced 表示写了 balance：列出的候选按权重轮询分摊。
+	// 为假时块内顺序就是优先级，逐条回退。
+	Balanced bool
+
+	// Candidates 是规则里列出的候选渠道，按声明顺序。
+	Candidates []RouteCandidate
+
+	// File / Line / Col 指向 route 块头，用于报错与提醒的定位。
+	File string
+	Line int
+	Col  int
+}
+
+// RouteCandidate 是规则里列出的一条候选渠道。
+type RouteCandidate struct {
+	// Provider 是候选渠道名，必须已经有同名的 provider 块。
+	Provider string
+
+	// Weight 是 balance 下的分摊权重，缺省 1。
+	Weight int
+
+	// Fallback 报告这条候选来自 fallback 行：它在主用候选全部失败之后才轮到，
+	// 也不参与轮转。
+	Fallback bool
+
+	// File / Line / Col 指向这条候选声明，用于报错定位。
+	File string
+	Line int
+	Col  int
+}
+
+// ModelRouteIndexFor 返回第一条命中该对外名的规则下标，没有则返回 -1。
+//
+// 按声明顺序取第一条命中，不按「哪个更具体」排序：声明顺序是配置里唯一可读到的
+// 优先级，把更具体的写在前面即可。这与 expose 的多条规则同一种口径。
+func (c *Config) ModelRouteIndexFor(name string) int {
+	for i := range c.ModelRoutes {
+		if matchModelPattern(c.ModelRoutes[i].Pattern, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// ModelRouteFor 返回第一条命中该对外名的规则，没有则返回 nil。
+func (c *Config) ModelRouteFor(name string) *ModelRoute {
+	if index := c.ModelRouteIndexFor(name); index >= 0 {
+		return &c.ModelRoutes[index]
+	}
+	return nil
+}
+
+// matchModelPattern 报告对外名是否命中模式。
+//
+// 与 catalog 里给上游 id 用的那套不同，这里大小写敏感：对外名本身就是精确匹配的，
+// 模式如果宽于它，就会出现一条规则命中了某个名字、而客户端请求该名字时找不到模型的
+// 怪相。两端隐式锚定，`*` 可以跨 `/`（模型名里的斜杠是名字的一部分），`?` 匹配一个字符。
+func matchModelPattern(pattern, name string) bool {
+	pat := []rune(pattern)
+	target := []rune(name)
+
+	p, n := 0, 0
+	star, mark := -1, 0
+	for n < len(target) {
+		switch {
+		case p < len(pat) && (pat[p] == '?' || pat[p] == target[n]):
+			p++
+			n++
+		case p < len(pat) && pat[p] == '*':
+			// 记住这个星号的位置，回溯时从这里重新展开。
+			star = p
+			mark = n
+			p++
+		case star >= 0:
+			// 上一个星号多吞一个字符，模式回到星号之后重新比。
+			mark++
+			n = mark
+			p = star + 1
+		default:
+			return false
+		}
+	}
+	for p < len(pat) && pat[p] == '*' {
+		p++
+	}
+	return p == len(pat)
 }
 
 // Warning 是一条带位置的提醒。

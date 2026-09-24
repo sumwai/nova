@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -106,8 +107,11 @@ func (p *parser) applyProviderLine(
 		return p.unknownDirective(head, providerDirectives)
 	}
 	// model 、allow / deny 与 expose 可以写多次，其余指令在同一个作用域里只能出现一次。
+	// api_key 同样可以写多次：一条 api_key 声明一个账号，多账号是同一句指令的重复，
+	// 不是另一种写法。
 	if head.text != directiveModel && head.text != directiveAllow &&
-		head.text != directiveDeny && head.text != directiveExpose {
+		head.text != directiveDeny && head.text != directiveExpose &&
+		head.text != directiveAPIKey {
 		if err := p.rejectRepeat(head); err != nil {
 			return err
 		}
@@ -115,14 +119,10 @@ func (p *parser) applyProviderLine(
 
 	switch head.text {
 	case directiveAPIKey:
-		return p.setValue(ln, func(v token) error {
-			value, err := p.expand(v, ln)
-			if err != nil {
-				return err
-			}
-			provider.APIKey = value
-			return nil
-		})
+		return p.appendAccount(ln, provider)
+
+	case directiveBalance:
+		return p.setBalance(ln, provider)
 
 	case directiveEndpoint:
 		// endpoint 子块走 blockOpener 分支；走到这里说明这一行没带 `{`。
@@ -140,6 +140,65 @@ func (p *parser) applyProviderLine(
 		*hasDefault = true
 		return p.applyEndpointLine(ln, endpoint)
 	}
+}
+
+// appendAccount 追加一个账号。
+//
+// 形态是 `api_key <密钥> [<权重>]`：与 model 的双记号同形，第二取值是对第一取值的补充。
+// 只有这一种写法——具名账号块与它表达的是同一件事，两种写法并存会让「用哪个」
+// 成为每次书写的额外决定，而两者能表达的东西完全一样。
+func (p *parser) appendAccount(ln line, provider *Provider) error {
+	head := ln.tokens[0]
+	switch {
+	case len(ln.tokens) < 2:
+		return errorf(ln.file, head.line, valueColumn(head),
+			"%s 缺少密钥（形如 %s {env.OPENAI_KEY}；要加权就写 %s {env.OPENAI_KEY} 3）",
+			directiveAPIKey, directiveAPIKey, directiveAPIKey)
+	case len(ln.tokens) > 3:
+		extra := ln.tokens[3]
+		return errorf(ln.file, extra.line, extra.col,
+			"%s 至多接受两个取值（密钥与分摊权重），多出来的是 %q", directiveAPIKey, extra.text)
+	}
+
+	value, err := p.expand(ln.tokens[1], ln)
+	if err != nil {
+		return err
+	}
+
+	account := Account{
+		APIKey: value,
+		Weight: 1,
+		Index:  len(provider.Accounts) + 1,
+		File:   ln.file,
+		Line:   ln.no,
+		Col:    head.col,
+	}
+	if len(ln.tokens) == 3 {
+		weightTok := ln.tokens[2]
+		weight, err := strconv.Atoi(weightTok.text)
+		if err != nil || weight < 1 {
+			return errorf(ln.file, weightTok.line, weightTok.col,
+				"分摊权重 %q 不是正整数（形如 %s {env.OPENAI_KEY} 3）",
+				weightTok.text, directiveAPIKey)
+		}
+		account.Weight = weight
+	}
+	provider.Accounts = append(provider.Accounts, account)
+	return nil
+}
+
+// setBalance 处理 balance 指令。
+//
+// 它不接受取值：账号池只有两种调度——不写时的「按声明顺序」与写了时的「按权重分摊」——
+// 把两种调度收进一个取值域，会让同一件事有「写 balance」与「写 balance xxx」两种表达。
+func (p *parser) setBalance(ln line, provider *Provider) error {
+	if len(ln.tokens) > 1 {
+		extra := ln.tokens[1]
+		return errorf(ln.file, extra.line, extra.col,
+			"%s 不接受取值：它把账号池从按声明顺序改为按权重轮询分摊", directiveBalance)
+	}
+	provider.Balanced = true
+	return nil
 }
 
 // parseEndpointBlock 解析一个 endpoint 子块。块头就是这条端点的地址。
@@ -522,9 +581,10 @@ func deriveListingURL(endpointURL string, protocol domain.Protocol) (string, boo
 
 // finishProvider 校验一条渠道，并在协议省略时从地址把它推出来。
 func (p *parser) finishProvider(provider *Provider) error {
-	if provider.APIKey == "" {
+	if len(provider.Accounts) == 0 {
 		return errorf(provider.File, provider.Line, provider.Col,
-			"provider %s 缺少 api_key", provider.Name)
+			"provider %s 没有任何凭据：至少需要一条 %s",
+			provider.Name, directiveAPIKey)
 	}
 	if len(provider.Endpoints) == 0 {
 		return errorf(provider.File, provider.Line, provider.Col,
@@ -540,7 +600,40 @@ func (p *parser) finishProvider(provider *Provider) error {
 	sort.SliceStable(provider.Endpoints, func(i, j int) bool {
 		return provider.Endpoints[i].Line < provider.Endpoints[j].Line
 	})
+	p.warnAccountPolicy(provider)
 	return nil
+}
+
+// warnAccountPolicy 在账号池与调度声明对不上时记一条提醒。
+//
+// 两种对不上都是「写下的配置没有作用对象」：balance 对着一个账号无处分摊，
+// 权重在按声明顺序调度时轮不到生效。它们不阻止加载——单账号加 balance 是一份
+// 将来准备扩到多账号的配置——但不能静默，否则使用者以为写下的那个数已经生效了。
+func (p *parser) warnAccountPolicy(provider *Provider) {
+	if provider.Balanced && len(provider.Accounts) == 1 {
+		p.cfg.Warnings = append(p.cfg.Warnings, Warning{
+			File: provider.File,
+			Line: provider.Line,
+			Msg: fmt.Sprintf("provider %s 写了 %s，但只声明了一个账号，没有可分摊的对象",
+				provider.Name, directiveBalance),
+		})
+		return
+	}
+	if provider.Balanced {
+		return
+	}
+	for _, account := range provider.Accounts {
+		if account.Weight == 1 {
+			continue
+		}
+		p.cfg.Warnings = append(p.cfg.Warnings, Warning{
+			File: account.File,
+			Line: account.Line,
+			Msg: fmt.Sprintf("provider %s 未写 %s，账号按声明顺序调度，这条 %s 的权重没有作用",
+				provider.Name, directiveBalance, directiveAPIKey),
+		})
+		return
+	}
 }
 
 // finishEndpoint 校验一条端点并补齐缺省值。

@@ -57,6 +57,13 @@ func newConfigCheckCmd() *cobra.Command {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"%s 校验通过（配置代数 %d，监听 %s，管理端点 %s）\n",
 				cfg.Path, cfg.Schema, cfg.Listen, cfg.Admin)
+			// 账号池摘要回答「同一个渠道里的凭据怎么选」：缺省是声明顺序，
+			// 想分摊要写 balance。这一行是首次让使用者知道调度这件事存在的地方。
+			if pools, accounts := cfg.AccountPoolStats(); pools > 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
+					"账号池：%d 个渠道共 %d 个账号，%s；写 balance 改为按权重轮询分摊\n",
+					pools, accounts, cfg.AccountPoolPolicyText())
+			}
 			return nil
 		},
 	}

@@ -31,6 +31,8 @@ func TestDiscoveryLogTextReportsCounts(t *testing.T) {
 		Shape:    catalog.ShapeOpenAI,
 		Found:    128,
 		Kept:     keptN(42),
+		// 显式声明的模型不在清单视角里，但同样是客户端可用的名字，必须列出来。
+		Declared: []config.Model{{Name: "configured", Upstream: "vendor/configured"}},
 		Filtered: 86,
 		Duration: 320 * time.Millisecond,
 	})
@@ -39,7 +41,7 @@ func TestDiscoveryLogTextReportsCounts(t *testing.T) {
 	for _, want := range []string{"catalog", "relay", "https://relay.example.com/v1/models",
 		"openai", "发现 128", "保留 42", "排除 86", "320ms",
 		// 名单直接列在行上，超过上限时截断并给出总数。
-		"保留：m0 m1", "共 42 个"} {
+		"显式：configured", "保留：m0 m1", "共 42 个"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("日志 = %q，期望含 %q", out, want)
 		}
@@ -105,6 +107,7 @@ func TestDiscoveryLogJSONCarriesFields(t *testing.T) {
 		Shape:    catalog.ShapeOpenAI,
 		Found:    10,
 		Kept:     keptN(4),
+		Declared: []config.Model{{Name: "configured"}},
 		Filtered: 6,
 		HasMore:  true,
 		Duration: 1500 * time.Millisecond,
@@ -130,6 +133,11 @@ func TestDiscoveryLogJSONCarriesFields(t *testing.T) {
 	models, ok := got["models"].([]any)
 	if !ok || len(models) != 4 || models[0] != "m0" {
 		t.Errorf("models = %v，期望 4 个对外名且首个是 m0", got["models"])
+	}
+	// 显式声明另占一个字段：它与清单保留项合起来才是客户端可用的集合。
+	declared, ok := got["declared"].([]any)
+	if !ok || len(declared) != 1 || declared[0] != "configured" {
+		t.Errorf("declared = %v，期望一条显式声明的对外名", got["declared"])
 	}
 }
 

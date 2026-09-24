@@ -183,7 +183,11 @@ func Assemble(ctx context.Context, cfg *config.Config, logOutput io.Writer) (*As
 		return nil, fmt.Errorf("构造上游客户端失败：%w", err)
 	}
 
-	forwarder, err := pipeline.New(forwarderOptions(routesByModel(endpoints), lookup, upstreamClient, logger))
+	resolver, routeWarnings := newModelRouteResolver(endpoints, cfg)
+	for _, warning := range routeWarnings {
+		logger.warning(warning)
+	}
+	forwarder, err := pipeline.New(forwarderOptions(resolver, lookup, upstreamClient, logger))
 	if err != nil {
 		return nil, fmt.Errorf("构造转发流水线失败：%w", err)
 	}
