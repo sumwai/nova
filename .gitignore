@@ -1,0 +1,25 @@
+# 构建产物的唯一出口是 bin/，安装的唯一出口是 $(PREFIX)/bin。
+# 下面两条兜住「手敲 go build -o nova ./cmd/nova」在仓库根留下的游离二进制：
+# 它不带版本号、不来自 makfile，留在树里只会让人分不清跑的是哪一份。
+/bin/
+/nova
+
+# 测试与覆盖率产物
+*.test
+*.out
+coverage.txt
+
+# 环境与密钥
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# 本机 agent 工具的运行目录（任务输出等），不属于项目源
+.pi/
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store
