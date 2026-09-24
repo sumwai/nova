@@ -43,7 +43,7 @@ const MinSchema = 1
 // 帮助文本、启动横幅与版本输出都要说这件事。
 const (
 	defaultLogLevel = "info"
-	// 缺省输出人读的一行一条：nova 的多数实例跑在终端或 systemd 下，两者都要人眼能读；
+	// 缺省输出人读的文本：nova 的多数实例跑在终端或 systemd 下，两者都要人眼能读；
 	// 需要给日志采集器喂结构化数据时显式写 log_format json。
 	defaultLogFormat = "text"
 	// 缺省只绑回环：本版的数据面没有别的兜底鉴别手段，绑到所有接口就等于
