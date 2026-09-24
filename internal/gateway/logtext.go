@@ -17,9 +17,62 @@ import (
 // 本文件是人读模式（log_format text）的全部排版规则。
 //
 // 它与 json 模式的分工是「给人看」与「给机器看」：这里的每一次省略（同协议不写协议、
-// 同模型不写模型、零值子项不写）都是为了让人一眼扫出哪条不对，代价是信息不再完整。
-// 需要完整字段时应当切到 json 模式，而不是来补这里的省略——把省略一个个去掉，
-// text 就退化成一行塞满键值的机器输出，那还不如直接用 json。
+// 同模型不写模型、零值子项不写、单次成功尝试不单独成行）都是为了让人一眼扫出哪条不对，
+// 代价是信息不再完整。需要完整字段时应当切到 json 模式，而不是来补这里的省略——
+// 把省略一个个去掉，text 就退化成一行塞满键值的机器输出，那还不如直接用 json。
+//
+// text 的排版单位是**一次请求一个块**：主行是 access（客户端侧终态），
+// 其后是同一请求的上游明细（上游 id、两侧协议与模型、用量、上游报文）。
+// 块内所有行共用主行的时刻与种类列宽度，字段起始列一致，因此能整块扫过；
+// 块与块之间靠时间戳与关联键前缀分开。块由 logger 组装（见 log.go）。
+
+// 级别标签之外的消息名。宽度固定（见 kindColumn），它们在行里的位置因此固定。
+const (
+	kindAccess   = "access"
+	kindUpstream = "upstream"
+	kindReload   = "reload"
+	kindWarning  = "提醒"
+)
+
+// kindWidth 是消息名列的显示宽度，取最长的一个（upstream）。
+const kindWidth = 8
+
+// kindColumn 渲染消息名列。
+//
+// 宽度固定是为了让字段起始列在所有记录上一致：消息名不等宽时，字段会随记录种类左右漂移，
+// 而「一眼扫过一屏找出异常」正是固定列要买的东西。
+func kindColumn(kind string) string {
+	pad := kindWidth - displayWidth(kind)
+	if pad < 0 {
+		pad = 0
+	}
+	return "  " + kind + strings.Repeat(" ", pad) + "  "
+}
+
+// requestIDWidth 是人读模式里关联键的字符数。
+//
+// 关联键是 128 位随机标识，完整值 32 个字符，在一个主行加若干明细行的块里会重复出现多次。
+// 截成前缀之后仍能用前缀 grep 命中（截断值就是完整值的前缀），碰撞概率在单个日志窗口内
+// 可忽略。需要完整值时用 log_format json 或看该块的其它行。
+const requestIDWidth = 8
+
+func shortRequestID(id string) string {
+	if len(id) <= requestIDWidth {
+		return id
+	}
+	return id[:requestIDWidth]
+}
+
+// oneLineText 把上游报文压成一行。
+//
+// 明细行按「一条记录一行」读：报文里的换行会让一个块看起来像多了几条记录，
+// 也会让按行 grep 的结果停在半截 JSON 上。报文本身是数据，压成一行只是排版处理。
+func oneLineText(text string) string {
+	if !strings.ContainsAny(text, "\r\n") {
+		return text
+	}
+	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
+}
 
 // ANSI 转义序列。只用到四个颜色，因此不引入终端能力库：引一棵依赖树来做四件事，
 // 换来的是每次升级都要跟着看它的变更。
@@ -89,7 +142,15 @@ func detectColor(out io.Writer) bool {
 // 外部工具自会补上时间戳。需要带日期与纳秒的完整时刻时用 log_format json——
 // 那条路走的是 RFC3339，本来就是给机器解析的。
 func clockNow() string {
-	return time.Now().Format("15:04:05")
+	return clockAt(time.Now())
+}
+
+// clockAt 把时刻渲染成行首的时间戳。
+//
+// 一个块里的所有行都用主行的时刻：明细与主行属于同一次请求，各写各的时刻会让它们看起来
+// 是先后发生的两件事。
+func clockAt(moment time.Time) string {
+	return moment.Format("15:04:05")
 }
 
 // levelName 是级别在人读模式下的固定宽度标签。
@@ -245,7 +306,7 @@ const labelWidth = 10
 // renderWarning 渲染一条配置提醒。
 func renderWarning(warn config.Warning, color bool) string {
 	level := slog.LevelWarn
-	return clockNow() + " " + paintLevel(level, color) + "  提醒  " + warn.String()
+	return clockNow() + " " + paintLevel(level, color) + kindColumn(kindWarning) + warn.String()
 }
 
 // joinFields 用两个空格连接非空片段。
@@ -263,14 +324,24 @@ func joinFields(fields ...string) string {
 	return strings.Join(kept, "  ")
 }
 
-// renderAccess 渲染一条访问日志。
+// accessExtras 是主行从同一请求的上游尝试里带出的附加事实。
 //
-// 字段顺序按「排查时先看哪个」排：先是关联键，再是「谁问了什么」，最后是结果与来源。
+// 三者都只在「上游那一侧没有独立成行」时出现：尝试折叠进主行时，用量与上游 id 由主行承载；
+// 尝试数大于一时，主行要交代这次请求打过几次上游，因为明细行只在真正有增量的请求上出现。
+type accessExtras struct {
+	usage *domain.Usage
+	via   string
+	tries int
+}
+
+// renderAccess 渲染一个块的主行：客户端侧终态，以及折叠进来的上游事实。
+//
+// 字段顺序按「排查时先看哪个」排：先是关联键，再是「谁问了什么」，然后结果与来源。
 // 空值字段一律不出现，因此行内位置不是固定的——这是人读模式的固有代价，
 // 需要固定字段位置时用 json 模式。
-func renderAccess(record transport.AccessRecord, color bool) string {
+func renderAccess(clock string, record transport.AccessRecord, extras accessExtras, color bool) string {
 	level := accessLevel(record.HTTPStatus)
-	fields := []string{record.RequestID, string(record.Protocol), record.Model}
+	fields := []string{shortRequestID(record.RequestID), string(record.Protocol), record.Model}
 	if record.Stream {
 		fields = append(fields, "stream")
 	}
@@ -278,56 +349,86 @@ func renderAccess(record transport.AccessRecord, color bool) string {
 		strconv.Itoa(record.HTTPStatus),
 		durationText(time.Duration(record.DurationMS)*time.Millisecond),
 	)
+	if extras.tries > 1 {
+		fields = append(fields, "tries "+strconv.Itoa(extras.tries))
+	}
 	if record.ErrorCode != "" {
 		fields = append(fields, paintError(record.ErrorCode, color, level))
+	}
+	if extras.usage != nil {
+		fields = append(fields, usageText(*extras.usage))
+	}
+	if extras.via != "" {
+		fields = append(fields, "via "+extras.via)
 	}
 	// RemoteAddr 与 User-Agent 排在最后：它们最不重要却最长，
 	// 放在中段会把结果字段挤到看不见的地方。
 	fields = append(fields, record.RemoteAddr, record.UserAgent)
-	return clockNow() + " " + paintLevel(level, color) + "  access  " + joinFields(fields...)
+	return clock + " " + paintLevel(level, color) + kindColumn(kindAccess) + joinFields(fields...)
 }
 
-// renderAttempt 渲染一条上游尝试日志。
+// renderAttemptDetail 渲染一条上游明细。
 //
-// 协议与模型只在真的不同时才写，且写成箭头：同协议同模型是最常见的情形，那时这两个字段
-// 只是把访问日志里的名字重抄一遍。真的跨协议或改写模型时，「进了什么、出成什么」必须一眼可见。
+// 它只写主行没有的事实：上游 id、两侧协议与模型的改写、上游用量、上游报文。
+// 主行已经承载的结论不重抄——单次尝试时结果与耗时都与主行同一个事实，
+// 重抄只会带来「同一个名字给了两个数」（入口耗时与上游耗时并不严格相等）。
 //
-// 上游明细（上游状态码与响应片段）另起一条 ERROR 记录：它是失败记录里唯一真正要看的东西，
-// 挤在一行尾部等于没有。超长时由生产端截断（见 internal/domain 对 ErrorDetail 的约定）。
-func renderAttempt(rec domain.AttemptRecord, color bool) string {
-	level := attemptLevel(rec.Outcome)
-	fields := []string{rec.RequestID, "#" + strconv.Itoa(rec.Attempt), rec.UpstreamID}
+// 单次尝试时结果字段也省：`ok` 对 2xx、`failed` 对 4xx/5xx 是同一次成功的两种说法。
+// 只有两侧不一致（上游成功而客户端侧失败，或反过来）与取消才写出来。
+func renderAttemptDetail(clock string, rec domain.AttemptRecord, multiple bool, status int, color bool) string {
+	level := attemptLineLevel(rec, status)
+	fields := []string{shortRequestID(rec.RequestID), "#" + strconv.Itoa(rec.Attempt), rec.UpstreamID}
 	if rec.UpstreamProtocol != rec.ClientProtocol {
 		fields = append(fields, fmt.Sprintf("%s→%s", rec.ClientProtocol, rec.UpstreamProtocol))
 	}
 	if rec.UpstreamModel != rec.RequestedModel {
 		fields = append(fields, fmt.Sprintf("%s→%s", rec.RequestedModel, rec.UpstreamModel))
 	}
-	fields = append(fields, string(rec.Outcome), durationText(rec.EndedAt.Sub(rec.StartedAt)))
-	if rec.ErrorCode != "" {
-		fields = append(fields, paintError(rec.ErrorCode, color, level))
+	if outcome := attemptOutcomeText(rec.Outcome, status, multiple); outcome != "" {
+		fields = append(fields, outcome)
+	}
+	if multiple {
+		// 多次尝试时各次耗时不同，「哪一次慢」本身就是要看的东西，必须逐条写出。
+		fields = append(fields, durationText(rec.EndedAt.Sub(rec.StartedAt)))
+		if rec.ErrorCode != "" {
+			fields = append(fields, paintError(rec.ErrorCode, color, level))
+		}
 	}
 	if rec.Usage.Known() {
 		fields = append(fields, usageText(rec.Usage))
 	}
-	line := clockNow() + " " + paintLevel(level, color) + "  attempt  " + joinFields(fields...)
 	if rec.ErrorDetail != "" {
-		line += "\n" + renderUpstreamDetail(rec, color)
+		fields = append(fields, oneLineText(rec.ErrorDetail))
 	}
-	return line
+	return clock + " " + paintLevel(level, color) + kindColumn(kindUpstream) + joinFields(fields...)
 }
 
-// renderUpstreamDetail 把上游的原始错误单独渲染成一条 ERROR 记录。
+// attemptOutcomeText 决定这次尝试的结果要不要写进明细行。
 //
-// 不缩进附在主行下面，因为两个原因：它常常是一整段上游报文（可能带 JSON），缩进会让人
-// 读不出它到底属于哪一次尝试；而带上级别前缀之后，它还能被 journalctl 或 grep 按级别
-// 单独筛出来——它恰恰是失败请求里唯一真正要看的那一行。
+// 返回空串表示主行已经说了同一件事。取消永远写：主行看不出「客户端走了」。
+func attemptOutcomeText(outcome domain.AttemptOutcome, status int, multiple bool) string {
+	if outcome == domain.AttemptCancelled || multiple {
+		return string(outcome)
+	}
+	upstreamOK := outcome == domain.AttemptOK
+	clientOK := status < 400
+	if upstreamOK == clientOK {
+		return ""
+	}
+	return string(outcome)
+}
+
+// renderSuppressed 渲染一条折叠汇总：同一类上游失败在一个窗口内被压掉了多少次。
 //
-// 级别固定 ERROR，不跟主行走：主行的 WARN 说的是「这次尝试失败了，还要不要换候选」，
-// 而这一行说的是「上游明确回了一个错误」，后者无论如何都要被人看到。
-//
-// json 模式不另起一条记录：那里 error_detail 与其它字段同级，缩进与换行都不是问题。
-func renderUpstreamDetail(rec domain.AttemptRecord, color bool) string {
-	fields := []string{rec.RequestID, "#" + strconv.Itoa(rec.Attempt), rec.ErrorDetail}
-	return clockNow() + " " + paintLevel(slog.LevelError, color) + "  upstream  " + joinFields(fields...)
+// 上游持续限流时逐字相同的报文会连刷几十行，真正的信号「上游一直在限流」反而被淹没。
+// 窗口内首条打全文，其余只计数，窗口结束时用这一行交代被压掉的量级。
+func renderSuppressed(clock string, s suppressionView, color bool) string {
+	fields := []string{
+		"×" + strconv.Itoa(s.count),
+		s.upstream,
+		s.errorCode,
+		"最近 " + durationText(s.span),
+		"（同类上游失败已折叠）",
+	}
+	return clock + " " + paintLevel(s.level, color) + kindColumn(kindUpstream) + joinFields(fields...)
 }

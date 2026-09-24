@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/domain"
@@ -18,7 +20,8 @@ import (
 //
 // 两种格式不是同一条记录的两种排版，而是两份不同的取舍：text 为人眼排版，会省略
 // 「常见情况下不提供信息」的字段（同协议不写协议、同模型不写模型、零值子项不写），
-// 因此它不可逆，也不能拿来当数据源；json 保留全部字段并按语义分组，给采集器与 jq 用。
+// 并把同一请求的记录合为一块（见 log.go 的块组装），因此它不可逆，也不能拿来当数据源；
+// json 保留全部字段并按语义分组，每个请求产出独立的记录，给采集器与 jq 用。
 type logFormat int
 
 const (
@@ -31,15 +34,85 @@ const (
 // 它同时实现 transport.AccessLogger 与 domain.Observer，装配层因此把同一个对象交给
 // 入口层与流水线，两类记录的时间基准与格式天然一致，不必两处各配一份。
 //
-// 并发安全靠一把互斥锁：一条记录可能由多次 Write 组成（人读模式下失败尝试的上游明细
-// 另起一行），不加锁时两条并发日志会交错成读不通的字节流。
+// 并发安全靠一把互斥锁：人读模式下一个请求可能由多次 Write 组成（主行与明细行），
+// 不加锁时两个并发请求的行会交错成读不通的字节流；锁同时保护暂存与折叠状态。
 type logger struct {
 	out    io.Writer
 	level  slog.Level
 	format logFormat
 	color  bool
 	mu     sync.Mutex
+
+	// pending 暂存同一 request_id 的上游尝试，等访问日志到达时成块输出。
+	// 只在 text 模式下存在：json 模式由下游按 request_id 关联，在网关内配对没有意义。
+	//
+	// 配对的前提是上游尝试恒早于访问日志到达（转发返回之后入口层才写访问日志），
+	// 且同一个 request_id 只对应一个在飞请求。客户端自带的 request_id 若被并发复用，
+	// 两次请求的尝试会落进同一槽并挂在先到的那个块下：记录不丢，但归属会错。
+	// 那种输入下两条 access 主行本就同 id、无法区分，且 request_id 的生成权在客户端。
+	pending map[string]*pendingAttempts
+	// suppressed 记录被折叠的上游失败，键是抑制键。
+	suppressed map[string]*suppression
+	// window 是同类上游失败的折叠窗口。
+	window time.Duration
+	// clock 是取当前时刻的函数；测试用它把窗口边界定在确定的位置。
+	clock func() time.Time
 }
+
+// pendingAttempts 是一个请求尚未与访问日志合并的上游尝试记录。
+type pendingAttempts struct {
+	attempts []domain.AttemptRecord
+	first    time.Time
+}
+
+// suppression 是一类上游失败在当前窗口内的折叠计数。
+type suppression struct {
+	count     int
+	first     time.Time
+	last      time.Time
+	level     slog.Level
+	upstream  string
+	errorCode string
+}
+
+// suppressionView 是渲染汇总行所需的那部分折叠状态。
+type suppressionView struct {
+	count     int
+	span      time.Duration
+	level     slog.Level
+	upstream  string
+	errorCode string
+}
+
+// view 冻结当前窗口的计数与跨度。
+func (s *suppression) view(moment time.Time) suppressionView {
+	return suppressionView{
+		count:     s.count,
+		span:      s.last.Sub(s.first),
+		level:     s.level,
+		upstream:  s.upstream,
+		errorCode: s.errorCode,
+	}
+}
+
+// suppressionKey 是折叠的归并键：同一条渠道上的同一个错误码算同一类失败。
+//
+// 成功的尝试不参与折叠，没有错误码的失败也无法判断是否同类。
+func suppressionKey(rec domain.AttemptRecord) string {
+	if rec.Outcome == domain.AttemptOK || rec.ErrorCode == "" {
+		return ""
+	}
+	return rec.UpstreamID + "\x00" + rec.ErrorCode
+}
+
+// pendingLimit 是同时暂存的请求数上限。
+//
+// 正常路径上每条暂存记录都会在同一个请求的访问日志到达时被取走；上限只防御
+// 「有尝试记录却没有访问日志」的异常情形，超限时把最旧的一条直接写出，宁可多写也不丢。
+const pendingLimit = 256
+
+// defaultSuppressionWindow 是同类上游失败的折叠窗口。
+const defaultSuppressionWindow = 10 * time.Second
 
 // 编译期断言：同一个输出口要同时满足入口层与流水线两边的观测接口。
 var (
@@ -61,7 +134,19 @@ func newLogger(cfg *config.Config, out io.Writer) (*logger, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &logger{out: out, level: level, format: format, color: detectColor(out)}, nil
+	log := &logger{
+		out:    out,
+		level:  level,
+		format: format,
+		color:  detectColor(out),
+		window: defaultSuppressionWindow,
+		clock:  time.Now,
+	}
+	if format == logText {
+		log.pending = make(map[string]*pendingAttempts)
+		log.suppressed = make(map[string]*suppression)
+	}
+	return log, nil
 }
 
 // write 输出一条受级别过滤的记录。
@@ -95,6 +180,11 @@ func (l *logger) emit(always bool, level slog.Level, line string, payload any) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.emitLocked(line, payload)
+}
+
+// emitLocked 是持锁版本的唯一写出点。
+func (l *logger) emitLocked(line string, payload any) {
 	if l.format == logJSON {
 		data, err := json.Marshal(payload)
 		if err != nil {
@@ -108,6 +198,14 @@ func (l *logger) emit(always bool, level slog.Level, line string, payload any) {
 		return
 	}
 	_, _ = io.WriteString(l.out, line+"\n")
+}
+
+// now 取当前时刻；时钟未注入时退回系统时钟。
+func (l *logger) now() time.Time {
+	if l.clock == nil {
+		return time.Now()
+	}
+	return l.clock()
 }
 
 // startup 打出这份配置生效的事实，reloaded 只影响措辞。
@@ -127,11 +225,20 @@ func (l *logger) warning(warn config.Warning) {
 }
 
 // LogAccess 写一条请求级访问日志，实现 transport.AccessLogger。
+//
+// text 模式下它是整个块的收尾：同一请求暂存的上游尝试在这一刻与主行一起渲染，
+// 因此上游尝试不必自己承担「这条记录属于哪次请求」的全部交代。
 func (l *logger) LogAccess(record transport.AccessRecord) {
 	if l == nil {
 		return
 	}
-	l.write(accessLevel(record.HTTPStatus), renderAccess(record, l.color), accessPayload(record))
+	if l.format == logJSON {
+		l.emit(false, accessLevel(record.HTTPStatus), "", accessPayload(record))
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.writeBlockLocked(record)
 }
 
 // RecordAttempt 写一条上游尝试日志，实现 domain.Observer。
@@ -142,8 +249,182 @@ func (l *logger) RecordAttempt(_ context.Context, rec domain.AttemptRecord) erro
 	if l == nil {
 		return nil
 	}
-	l.write(attemptLevel(rec.Outcome), renderAttempt(rec, l.color), attemptPayload(rec))
+	if l.format == logJSON {
+		l.emit(false, attemptLevel(rec.Outcome), "", attemptPayload(rec))
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stashAttemptLocked(rec)
 	return nil
+}
+
+// writeBlockLocked 把一个请求的访问日志与暂存的上游尝试渲染成一个块。
+//
+// 顺序固定为主行在前、明细在后：主行是这次请求的结论，明细是结论背后的上游事实。
+// 上游尝试本就先于访问日志产生（转发返回之后入口层才写访问日志），这个顺序不需要
+// 额外排序就能成立，缓冲只用来把两者凑进同一次输出。
+func (l *logger) writeBlockLocked(record transport.AccessRecord) {
+	moment := l.now()
+	l.flushExpiredLocked(moment)
+
+	var pending *pendingAttempts
+	if record.RequestID != "" {
+		pending = l.pending[record.RequestID]
+		delete(l.pending, record.RequestID)
+	}
+
+	visible := make([]domain.AttemptRecord, 0, 1)
+	if pending != nil {
+		for _, rec := range pending.attempts {
+			if attemptLineLevel(rec, record.HTTPStatus) >= l.level {
+				visible = append(visible, rec)
+			}
+		}
+	}
+	multiple := len(visible) > 1
+	folded := len(visible) == 1 && canFoldAttempt(visible[0])
+	clock := clockAt(moment)
+
+	var b strings.Builder
+	if accessLevel(record.HTTPStatus) >= l.level {
+		b.WriteString(renderAccess(clock, record, accessExtrasFor(pending, visible, folded), l.color))
+		b.WriteByte('\n')
+	}
+	if !folded {
+		for _, rec := range visible {
+			if l.suppressLocked(&b, clock, moment, rec, record.HTTPStatus) {
+				continue
+			}
+			b.WriteString(renderAttemptDetail(clock, rec, multiple, record.HTTPStatus, l.color))
+			b.WriteByte('\n')
+		}
+	}
+	if b.Len() > 0 {
+		_, _ = io.WriteString(l.out, b.String())
+	}
+}
+
+// accessExtrasFor 决定主行要承载哪些上游事实。
+//
+// 用量与上游 id 只在唯一一次尝试被折叠进主行时出现：明细行已经写了它们的时候再往主行
+// 抄一遍，就是把刚去掉的重复写回来。尝试数大于一时主行要交代总数，因为明细行只覆盖
+// 达到级别的那些尝试，而被过滤掉的尝试同样发生过。
+func accessExtrasFor(pending *pendingAttempts, visible []domain.AttemptRecord, folded bool) accessExtras {
+	var extras accessExtras
+	if pending != nil {
+		extras.tries = len(pending.attempts)
+	}
+	if !folded {
+		return extras
+	}
+	if usage := visible[0].Usage; usage.Known() {
+		extras.usage = &usage
+	}
+	extras.via = visible[0].UpstreamID
+	return extras
+}
+
+// stashAttemptLocked 暂存一条上游尝试，等同一请求的访问日志到达。
+//
+// 没有关联键的尝试无法与任何访问日志配对：直接按明细行输出，宁可失去成块排版，
+// 也不把这条记录丢掉。
+func (l *logger) stashAttemptLocked(rec domain.AttemptRecord) {
+	if rec.RequestID == "" {
+		_, _ = io.WriteString(l.out,
+			renderAttemptDetail(clockAt(l.now()), rec, false, 0, l.color)+"\n")
+		return
+	}
+	pending := l.pending[rec.RequestID]
+	if pending == nil {
+		pending = &pendingAttempts{first: l.now()}
+		l.pending[rec.RequestID] = pending
+	}
+	pending.attempts = append(pending.attempts, rec)
+	l.evictPendingLocked()
+}
+
+// evictPendingLocked 在暂存数超限时把最旧的一条直接写出。
+//
+// 这是防御「有尝试记录却没有访问日志」的异常路径（进程在请求中途退出、观测器被别处调用），
+// 正常路径不会触发。丢掉最旧的而不是最新的，是为了让仍在进行中的请求有机会保持完整。
+func (l *logger) evictPendingLocked() {
+	if len(l.pending) <= pendingLimit {
+		return
+	}
+	var oldestKey string
+	var oldest *pendingAttempts
+	for key, pending := range l.pending {
+		if oldest == nil || pending.first.Before(oldest.first) {
+			oldestKey, oldest = key, pending
+		}
+	}
+	delete(l.pending, oldestKey)
+	clock := clockAt(oldest.first)
+	multiple := len(oldest.attempts) > 1
+	for _, rec := range oldest.attempts {
+		if attemptLineLevel(rec, 0) < l.level {
+			continue
+		}
+		_, _ = io.WriteString(l.out,
+			renderAttemptDetail(clock, rec, multiple, 0, l.color)+"\n")
+	}
+}
+
+// suppressLocked 处理一条上游明细的折叠。
+//
+// 返回真表示这条明细不再单独渲染：要么已被计入当前窗口，要么已作为新窗口的首条写出。
+// 窗口过期时先补一条汇总再开新窗口——汇总的数据只存在于折叠状态里，没有第二个地方
+// 能事后补出来。
+func (l *logger) suppressLocked(
+	b *strings.Builder,
+	clock string,
+	moment time.Time,
+	rec domain.AttemptRecord,
+	status int,
+) bool {
+	key := suppressionKey(rec)
+	if key == "" {
+		return false
+	}
+	s := l.suppressed[key]
+	if s == nil || moment.Sub(s.first) >= l.window {
+		if s != nil {
+			b.WriteString(renderSuppressed(clock, s.view(moment), l.color))
+			b.WriteByte('\n')
+		}
+		l.suppressed[key] = &suppression{
+			first:     moment,
+			last:      moment,
+			level:     attemptLineLevel(rec, status),
+			upstream:  rec.UpstreamID,
+			errorCode: rec.ErrorCode,
+		}
+		return false
+	}
+	s.count++
+	s.last = moment
+	return true
+}
+
+// flushExpiredLocked 补出已过期窗口的汇总。
+//
+// 不起定时器：下一次有日志要写时顺手看一眼。持续限流时新条目自己会触发补齐，
+// 限流停下来之后，下一个请求的访问日志也会把最后一批折叠交代清楚。
+func (l *logger) flushExpiredLocked(moment time.Time) {
+	if len(l.suppressed) == 0 {
+		return
+	}
+	clock := clockAt(moment)
+	for key, s := range l.suppressed {
+		if moment.Sub(s.first) < l.window {
+			continue
+		}
+		if s.count > 0 {
+			_, _ = io.WriteString(l.out, renderSuppressed(clock, s.view(moment), l.color)+"\n")
+		}
+		delete(l.suppressed, key)
+	}
 }
 
 // reloadApplied 记录一次由管理端点触发的重载已经生效。
@@ -155,7 +436,7 @@ func (l *logger) reloadApplied(path string) {
 	if l == nil {
 		return
 	}
-	line := clockNow() + " " + paintLevel(slog.LevelInfo, l.color) + "  reload  " + path
+	line := clockNow() + " " + paintLevel(slog.LevelInfo, l.color) + kindColumn(kindReload) + path
 	l.write(slog.LevelInfo, line, reloadPayload(path))
 }
 
@@ -167,11 +448,40 @@ func (l *logger) failure(message string, err error) {
 	if l == nil {
 		return
 	}
-	line := clockNow() + " " + paintLevel(slog.LevelWarn, l.color) + "  " + message
+	line := clockNow() + " " + paintLevel(slog.LevelWarn, l.color) + kindColumn(kindWarning) + message
 	if err != nil {
 		line += "：" + err.Error()
 	}
 	l.write(slog.LevelWarn, line, failurePayload(message, err))
+}
+
+// attemptLineLevel 是一条上游明细的级别。
+//
+// 取「尝试自身的级别」与「主行级别」中的较高者：明细行属于主行那次请求，主行是 error
+// 而明细压成 warn，会让按级别过滤的人只拿到半截信息；反过来，200 请求里失败过的尝试
+// 仍要按 warn 输出，否则「重试过一次并且失败过」这条事实会随主行的 info 一起消失。
+//
+// 取消是例外：它记 debug 本就是为了不在长流场景里刷屏，跟主行走会把这条取舍作废。
+func attemptLineLevel(rec domain.AttemptRecord, status int) slog.Level {
+	level := attemptLevel(rec.Outcome)
+	if level <= slog.LevelDebug {
+		return level
+	}
+	if main := accessLevel(status); main > level {
+		level = main
+	}
+	return level
+}
+
+// canFoldAttempt 报告一次成功的上游尝试是否已经被主行完整表达。
+//
+// 条件全部满足时它不单独占行：主行已经写了协议与模型（同协议同模型因此是前提），
+// 用量与上游 id 由 accessExtrasFor 并入主行，而成功尝试没有要单独交代的上游报文。
+func canFoldAttempt(rec domain.AttemptRecord) bool {
+	return rec.Outcome == domain.AttemptOK &&
+		rec.ErrorDetail == "" &&
+		rec.UpstreamProtocol == rec.ClientProtocol &&
+		rec.UpstreamModel == rec.RequestedModel
 }
 
 // accessLevel 按 HTTP 状态码决定访问日志级别。

@@ -113,34 +113,41 @@ provider relay {
 `log_level` 决定**哪些记录被输出**，`log_format` 决定**记录长什么样**。两者都是配置指令，
 不留一半在环境变量里——否则「这个 nova 会输出什么」就有了两个来源。
 
-每个请求稳定产生两条记录，用 `request_id` 关联：
+text 模式的排版单位是**一次请求一个块**：`access` 主行在前，同一请求的上游明细在后。
+块内所有行共用主行的时刻，字段从同一列开始，块与块之间靠关联键前缀分开。
 
 - **access**：入口层看到的事实（客户端协议、请求的模型名、HTTP 状态、耗时、客户端地址）。
-- **attempt**：每次上游尝试（打到哪条渠道、两侧协议与模型名、上游用量、错误码与上游的响应片段）。
+  唯一一次成功的上游尝试会被折进这一行，用量与上游 id 因此也在主行上。
+- **upstream**：上游那一侧的事实（打到哪条渠道、两侧协议与模型名、上游用量、上游报文）。
   一次请求可能有多条：候选回退时每条候选各一条，`#1` `#2` 就是回退顺序。
+  主行已经承载的结论（客户端状态码、耗时、错误码）不在这里重抄。
 
-级别按结果分档：access 的 5xx 记 `error`、4xx 记 `warn`、其余 `info`；attempt 的成功记 `info`、
-失败记 `warn`、客户端取消记 `debug`。取消之所以记 debug，是因为长流场景下客户端主动断开
-很常见，记成 warn 会把真正的上游故障淹没。
+常见的单次成功请求只占一行，真正有增量的请求才多出行来：
+
+```
+13:06:30 INFO   access    c3ccfe…  openai_chat  gpt-test  stream  200  1ms  41/128 tok  via chatmock 127.0.0.1:18080  127.0.0.1:33012
+13:06:31 ERROR  access    f7ba49…  openai_chat  gpt-fail  502  42ms  upstream_unavailable  127.0.0.1:33014
+13:06:31 ERROR  upstream  f7ba49…  #1  chatmock 127.0.0.1:18080  gpt-fail→fail-model  上游 HTTP 状态码 503：{"error": {"message": "upstream is having a bad day"}}
+13:06:32 INFO   access    1d0c9a…  openai_chat  gpt-test  200  8.1s  tries 2  127.0.0.1:33016
+13:06:32 WARN   upstream  1d0c9a…  #1  chatmock 127.0.0.1:18080  failed  4.0s  upstream_timeout
+13:06:32 INFO   upstream  1d0c9a…  #2  chatmock 127.0.0.1:18080  ok  4.1s  41/128 tok
+```
+
+级别：主行按 HTTP 状态分档（5xx 记 `error`、4xx 记 `warn`、其余 `info`）；明细取自身级别与
+主行级别中的较高者，唯一例外是客户端取消——它记 `debug`，主行不会把它抬起来。
+取消之所以记 debug，是因为长流场景下客户端主动断开很常见，记成 warn 会把真正的上游故障淹没。
+
+同一类上游失败（同一条渠道上的同一个错误码）在 10 秒窗口内只留首条全文，其余折叠计数，
+窗口结束时补一条 `×N` 汇总行：上游持续限流时逐字相同的报文会连刷几十行，
+真正的信号「上游一直在限流」反而被淹没。
 
 启动横幅不受级别过滤：它回答的是「这个进程在用哪份配置跑」。
 
-**两种格式的分工是「给人看」与「给机器看」**，不是同一条记录的两种排版：
-
-```
-13:06:30 INFO   access    c3ccfe…  openai_chat  gpt-test  200  1ms  127.0.0.1:33012
-13:06:30 WARN   attempt   f7ba49…  #1  chatmock 127.0.0.1:18080  gpt-fail→fail-model  failed  42ms  upstream_unavailable
-13:06:30 ERROR  upstream  f7ba49…  #1  上游 HTTP 状态码 503：{"error": {"message": "upstream is having a bad day"}}
-13:06:30 ERROR  access    f7ba49…  openai_chat  gpt-fail  502  42ms  upstream_unavailable  127.0.0.1:33014
-```
-
-上游的原始错误（状态码与响应片段）**单独占一条 ERROR 记录**，而不是缩进附在主行下面：
-它常常是一整段上游报文，缩进会让人读不出它属于哪一次尝试；带上级别前缀之后，
-它还能被 `journalctl` 或 `grep` 按级别单独筛出来——而它恰恰是失败请求里唯一真正要看的东西。
-
-text 会省略「常见情况下不提供信息」的字段（同协议不写协议、同模型不写模型、用量只写非零子项），
-因此它**不可逆，不能拿来当数据源**；要解析就切 `log_format json`，那里字段齐全，
-用量收在 `usage` 对象里，时间戳是 RFC3339。
+**两种格式的分工是「给人看」与「给机器看」**，不是同一条记录的两种排版：text 会省略
+「常见情况下不提供信息」的字段（同协议不写协议、同模型不写模型、用量只写非零子项、
+单次成功尝试不单独成行、关联键只留前 8 个字符），因此它**不可逆，不能拿来当数据源**。
+要解析就切 `log_format json`：那里字段齐全，每个请求按 `request_id` 关联的 `access` 与
+`upstream_attempt` 两条记录都在，用量收在 `usage` 对象里，时间戳是 RFC3339，也不做折叠。
 
 能不能显示颜色**不是配置项**：它是环境事实，不是使用者的意图。输出落在终端上、
 未设 `NO_COLOR`、且 `TERM` 不是 `dumb` 时才给级别与错误码着色。
