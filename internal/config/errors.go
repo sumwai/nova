@@ -51,22 +51,25 @@ func maxSuggestionDistance(n int) int {
 	return 2
 }
 
-// closestDirective 在合法指令名里挑出与输入编辑距离最近的一个。
+// closestDirective 在候选指令表里挑出与输入编辑距离最近的一个。
+//
+// 候选表按当前作用域传入：顶层、provider 块与 endpoint 块各自合法，
+// 因此 provider 块里拼错一条指令时，不会被建议一条只属于顶层的指令。
 //
 // 距离超过阈值时返回空串，由调用方省略建议段：宁可只说「未知指令」，
 // 也不给一个离题万里的候选。
 //
 // 并列时取字典序更小的名字，使结果与候选表的遍历顺序无关——否则把指令表
 // 重新排序会让同一个拼写错误报出不同的建议。
-func closestDirective(input string) string {
-	best, bestDistance := "", 0
-	for _, name := range globalDirectives {
+func closestDirective(input string, table []string) string {
+	best, bestDistance := "", -1
+	for _, name := range table {
 		d := editDistance(input, name)
-		if best == "" || d < bestDistance || (d == bestDistance && name < best) {
+		if bestDistance < 0 || d < bestDistance || (d == bestDistance && name < best) {
 			best, bestDistance = name, d
 		}
 	}
-	if best == "" || bestDistance > maxSuggestionDistance(len([]rune(input))) {
+	if bestDistance < 0 || bestDistance > maxSuggestionDistance(len([]rune(input))) {
 		return ""
 	}
 	return best

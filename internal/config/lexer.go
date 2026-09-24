@@ -10,23 +10,32 @@ const (
 	// 加了引号的取值已经去掉引号并解开转义，因此同一个词无论怎么写都是同一个记号。
 	tokenWord tokenKind = iota
 
+	// tokenPlaceholder 是 {env.NAME} 形式的占位符，text 保留花括号原样。
+	//
+	// 它单独成一种记号而不是并进 tokenWord，是因为「这是个占位符」与「这是个恰好长得
+	// 像占位符的字面量」是两件事：后者被引号包住时是数据，不该被展开成环境变量。
+	tokenPlaceholder
+
 	// tokenBlockOpen 与 tokenBlockClose 是 `{` 与 `}`。
 	//
-	// 本代语法还没有块，词法器仍把它们切成独立记号，理由是错误质量：
-	// `provider openai {` 若被当成一串普通取值，报出来的会是「provider 只接受 1 个取值，
-	// 多出来的是 "{""」这类答非所问的话；切成独立记号后，语法层才能明确说出
-	// 「本代语法还不支持块」。
+	// 它们切成独立记号，是为了让「块开在哪、闭合在哪」由结构回答而不是靠缩进或行序去猜：
+	// 缩进对配置文件来说太脆（一次误按 Tab 就换了个含义），而块界要靠报错去发现也太晚。
 	tokenBlockOpen
 	tokenBlockClose
 )
 
 // token 是一个词法记号。
 //
-// line 与 col 都从 1 起算，col 按 rune 计数。位置挂在记号上而不是挂在行上，
-// 因为语法层需要指出的往往是一行里的某个具体取值，而不是整行。
+// file/line/col 用于报错定位：line 与 col 从 1 起算，col 按 rune 计数，
+// 因此含中文的行也能报出人眼可数的列号。
+//
+// file 挂在记号上而不是由调用方统一给出，是因为 import 会把多个文件的行拼在一起：
+// 拼接之后「这一行来自哪个文件」只有记号自己回答得了，否则来自被导入文件的错误
+// 会被指到主配置的某个行号上，人照着去找只会看到一段毫不相干的配置。
 type token struct {
 	kind tokenKind
 	text string
+	file string
 	line int
 	col  int
 }
@@ -49,28 +58,68 @@ func lex(src []byte, file string) ([]token, error) {
 				// 注释吃掉本行剩余内容，包括其中的花括号与引号。
 				col = len(runes)
 			case r == '{':
-				tokens = append(tokens, token{tokenBlockOpen, "{", lineNo, col + 1})
+				if placeholderFollows(runes, col) {
+					value, next, err := lexPlaceholder(runes, col, lineNo, file)
+					if err != nil {
+						return nil, err
+					}
+					tokens = append(tokens, token{tokenPlaceholder, value, file, lineNo, col + 1})
+					col = next
+					break
+				}
+				tokens = append(tokens, token{tokenBlockOpen, "{", file, lineNo, col + 1})
 				col++
 			case r == '}':
-				tokens = append(tokens, token{tokenBlockClose, "}", lineNo, col + 1})
+				tokens = append(tokens, token{tokenBlockClose, "}", file, lineNo, col + 1})
 				col++
 			case r == '"':
 				value, next, err := lexQuoted(runes, col, lineNo, file)
 				if err != nil {
 					return nil, err
 				}
-				tokens = append(tokens, token{tokenWord, value, lineNo, col + 1})
+				tokens = append(tokens, token{tokenWord, value, file, lineNo, col + 1})
 				col = next
 			default:
 				start := col
 				for col < len(runes) && !isDelimiter(runes[col]) {
 					col++
 				}
-				tokens = append(tokens, token{tokenWord, string(runes[start:col]), lineNo, start + 1})
+				tokens = append(tokens, token{tokenWord, string(runes[start:col]), file, lineNo, start + 1})
 			}
 		}
 	}
 	return tokens, nil
+}
+
+// placeholderFollows 报告 `{` 是不是一个占位符的开头。
+//
+// 判据是 `{` 后面紧跟 `env.`，而不是「后面不是空白」：后者会把紧贴取值的块开启
+// （例如 `endpoint chat{`）也当成占位符起点，于是那一行剩下的内容全被吞进这个
+// 「占位符」里，报错会指向一个谁也不认识的变量名。
+//
+// 只认 env. 的代价是命名空间写错时（`{secret.K}`）会被当成块开启，报出「块没有收尾的 }」。
+// 那种写法本来就不该出现，而这个代价换来的是块开启永远可靠——后者是常用路径。
+func placeholderFollows(runes []rune, start int) bool {
+	const namespace = "env."
+	begin := start + 1
+	end := begin + len(namespace)
+	if end > len(runes) {
+		return false
+	}
+	return string(runes[begin:end]) == namespace
+}
+
+// lexPlaceholder 从 runes[start] 的 `{` 开始读一个占位符，返回原样文本与下一个待扫描的列号。
+//
+// 占位符不跨行：`{` 到本行末尾都没等到 `}` 就是错误，而不是继续到下一行去找。
+// 跨行会让「少写一个 `}`」的后果扩散到后面几行，报出的位置离真正写错的地方很远。
+func lexPlaceholder(runes []rune, start, lineNo int, file string) (string, int, error) {
+	for i := start + 1; i < len(runes); i++ {
+		if runes[i] == '}' {
+			return string(runes[start : i+1]), i + 1, nil
+		}
+	}
+	return "", 0, errorf(file, lineNo, start+1, "占位符缺少收尾的 }")
 }
 
 // isDelimiter 报告一个 rune 能否终止一个未加引号的取值。

@@ -28,6 +28,19 @@ func parseErr(t *testing.T, src string) *Error {
 	return cerr
 }
 
+// hasWarningAbout 报告提醒里有没有提到某个关键词。
+//
+// 用它而不是断言提醒条数：后续新增的提醒（没有 provider、绑了非回环却没鉴权）
+// 与当前断言无关，把条数写死会让每加一条提醒都要来改一个不相干的测试。
+func hasWarningAbout(cfg *Config, keyword string) bool {
+	for _, warn := range cfg.Warnings {
+		if strings.Contains(warn.Msg, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestParseAppliesDefaultsWhenNothingIsWritten(t *testing.T) {
 	cfg := mustParse(t, "")
 
@@ -47,11 +60,8 @@ func TestParseAppliesDefaultsWhenNothingIsWritten(t *testing.T) {
 		t.Error("SchemaDeclared = true，但文件里没有 version")
 	}
 	// 未声明代数要有一条提醒：否则「这份配置按哪一代在解析」只能靠读源码回答。
-	if len(cfg.Warnings) != 1 {
-		t.Fatalf("提醒条数 = %d，期望 1", len(cfg.Warnings))
-	}
-	if !strings.Contains(cfg.Warnings[0].Msg, directiveVersion) {
-		t.Errorf("提醒内容 = %q，期望提到 %s", cfg.Warnings[0].Msg, directiveVersion)
+	if !hasWarningAbout(cfg, "未声明 "+directiveVersion) {
+		t.Errorf("缺少「未声明 %s」的提醒：%v", directiveVersion, cfg.Warnings)
 	}
 }
 
@@ -67,8 +77,8 @@ func TestParseAcceptsDeclaredSchemaWithoutWarning(t *testing.T) {
 	if cfg.LogLevel != "debug" {
 		t.Errorf("日志级别 = %q，期望 debug", cfg.LogLevel)
 	}
-	if len(cfg.Warnings) != 0 {
-		t.Errorf("提醒条数 = %d，期望 0：%v", len(cfg.Warnings), cfg.Warnings)
+	if hasWarningAbout(cfg, "未声明 "+directiveVersion) {
+		t.Errorf("已经写了 version 却仍报「未声明」：%v", cfg.Warnings)
 	}
 }
 
@@ -247,8 +257,8 @@ func TestParseUnquotesValues(t *testing.T) {
 	if cfg.Admin != "localhost:2026" {
 		t.Errorf("管理端点 = %q，期望去掉引号后的取值", cfg.Admin)
 	}
-	if len(cfg.Warnings) != 0 {
-		t.Errorf("提醒 = %v，期望没有：加引号的回环地址仍是回环地址", cfg.Warnings)
+	if hasWarningAbout(cfg, "管理端点") {
+		t.Errorf("带引号的回环地址仍应算回环，却报了警告：%v", cfg.Warnings)
 	}
 }
 

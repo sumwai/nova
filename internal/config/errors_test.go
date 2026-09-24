@@ -83,29 +83,38 @@ func TestClosestDirective(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := closestDirective(tt.input); got != tt.want {
+			if got := closestDirective(tt.input, globalDirectives); got != tt.want {
 				t.Errorf("closestDirective(%q) = %q，期望 %q", tt.input, got, tt.want)
 			}
 		})
 	}
 }
 
-// 候选并列时结果只由名字决定，与指令表的排列顺序无关：
-// 否则调整一次表顺序就会让同一个拼写错误报出不同的建议。
+// 候选并列时结果只由名字决定，与候选表的排列顺序无关：
+// 否则调整一次指令表顺序，同一个拼写错误就会报出不同的建议。
 func TestClosestDirectiveIsOrderIndependent(t *testing.T) {
 	original := globalDirectives
-	t.Cleanup(func() { globalDirectives = original })
 
-	first := closestDirective("lisen")
+	first := closestDirective("lisen", original)
 
 	reversed := make([]string, len(original))
 	for i, name := range original {
 		reversed[len(original)-1-i] = name
 	}
-	globalDirectives = reversed
 
-	if second := closestDirective("lisen"); second != first {
-		t.Errorf("调换指令表顺序后建议从 %q 变成 %q", first, second)
+	if second := closestDirective("lisen", reversed); second != first {
+		t.Errorf("调换候选表顺序后建议从 %q 变成 %q", first, second)
+	}
+}
+
+// 候选表按作用域给：provider 块里拼错时不该建议一条只属于顶层的指令。
+func TestClosestDirectiveRespectsScope(t *testing.T) {
+	if got := closestDirective("log_leve", providerDirectives); got != "" {
+		t.Errorf("在 provider 块里把 log_level 当拼错的指令时给出了建议 %q；"+
+			"log_level 只属于顶层，不属于这个作用域", got)
+	}
+	if got := closestDirective("api_ke", providerDirectives); got != "api_key" {
+		t.Errorf("provider 作用域里 api_ke 的建议 = %q，期望 api_key", got)
 	}
 }
 
