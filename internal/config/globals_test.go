@@ -35,6 +35,29 @@ func mustParseWithEnv(t *testing.T, src string, env map[string]string) *Config {
 	return cfg
 }
 
+// 日志格式与日志级别一样是配置指令，缺省 text。
+func TestParseLogFormat(t *testing.T) {
+	if got := mustParse(t, "version 1\n").LogFormat; got != "text" {
+		t.Errorf("缺省日志格式 = %q，期望 text", got)
+	}
+	if got := mustParse(t, "version 1\nlog_format json\n").LogFormat; got != "json" {
+		t.Errorf("显式指定的日志格式 = %q，期望 json", got)
+	}
+}
+
+// 取值不认识时报错并报出位置，而不是静默退回缺省：
+// 少打一个字母就发现日志“没变化”，比当场报错难查得多。
+func TestParseRejectsUnknownLogFormat(t *testing.T) {
+	err := parseErr(t, "version 1\nlog_format xml\n")
+
+	if !strings.Contains(err.Msg, "text / json") {
+		t.Errorf("消息 = %q，期望列出可取的值", err.Msg)
+	}
+	if err.Line != 2 {
+		t.Errorf("错误行号 = %d，期望 2", err.Line)
+	}
+}
+
 // client_key 可写多条：一份配置里给不同调用方各发一个 key 是正常用法。
 func TestParseClientKeysAcceptMultiple(t *testing.T) {
 	cfg := mustParse(t, `

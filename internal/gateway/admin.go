@@ -72,13 +72,13 @@ func (h *adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logger := h.holder.Current().Logger
 
 	if err := h.reload(r.Context(), path); err != nil {
-		logger.Error("reload_failed", "path", path, "error", err)
+		logger.failure("重载失败（"+path+"）", err)
 		// 失败一律 500，响应体就是错误文本本身：错误里已经带了 文件:行:列，
 		// 再包一层状态码语义只会让调用方多一次翻译。
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	logger.Info("reloaded", "path", path)
+	logger.reloadApplied(path)
 	w.WriteHeader(http.StatusOK)
 }
 

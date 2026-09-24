@@ -51,8 +51,8 @@ func Run(ctx context.Context, opt Options) error {
 	}
 
 	s := &server{holder: NewHolder(first), out: opt.LogOutput}
-	reportWarnings(s.out, cfg)
-	banner(s.out, cfg, false)
+	reportWarnings(first.Logger, cfg)
+	first.Logger.startup(cfg, false)
 	return s.serve(ctx)
 }
 
@@ -175,13 +175,13 @@ func (s *server) reload(ctx context.Context, path string) error {
 	}
 
 	previous := s.holder.replace(assembled)
-	reportWarnings(s.out, next)
-	banner(s.out, next, true)
+	reportWarnings(assembled.Logger, next)
+	assembled.Logger.startup(next, true)
 
 	if err := previous.Close(); err != nil {
 		// 旧装配释放失败不影响「新装配已经生效」这一事实，因此记一条警告，
 		// 而不是把这次 reload 判成失败——那会让人以为新配置没生效而去改它。
-		assembled.Logger.Warn("旧装配释放失败", "error", err)
+		assembled.Logger.failure("旧装配释放失败", err)
 	}
 	return nil
 }
@@ -209,26 +209,8 @@ func checkReloadable(old, next *config.Config) error {
 //
 // 一次说完而不是报一条改一条：正在改配置的人被逐条中断，会把一次编辑拆成
 // 好几轮往返，而每条提醒本来就没有先后依赖。
-func reportWarnings(w io.Writer, cfg *config.Config) {
+func reportWarnings(log *logger, cfg *config.Config) {
 	for _, warn := range cfg.Warnings {
-		_, _ = fmt.Fprintf(w, "提醒 %s\n", warn.String())
+		log.warning(warn)
 	}
-}
-
-// banner 打出这份配置生效的事实。
-//
-// 启动时与每次成功的 reload 后各打一遍：日志里因此可以按横幅切分「哪一段属于
-// 哪份配置」，而不必靠时间戳去猜某条日志是在哪次重载之后产生的。
-// reloaded 只影响首行措辞，让「刚启动」与「刚重载」在读日志时一眼可分。
-func banner(w io.Writer, cfg *config.Config, reloaded bool) {
-	headline := "nova 已启动"
-	if reloaded {
-		headline = "nova 已重载"
-	}
-	_, _ = fmt.Fprintf(w, "%s\n", headline)
-	_, _ = fmt.Fprintf(w, "  配置文件  %s\n", cfg.Path)
-	_, _ = fmt.Fprintf(w, "  配置代数  %d\n", cfg.Schema)
-	_, _ = fmt.Fprintf(w, "  监听      %s\n", cfg.Listen)
-	_, _ = fmt.Fprintf(w, "  管理端点  %s\n", cfg.Admin)
-	_, _ = fmt.Fprintf(w, "  日志级别  %s\n", cfg.LogLevel)
 }
