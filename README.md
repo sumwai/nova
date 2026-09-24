@@ -128,11 +128,15 @@ provider relay {
 **两种格式的分工是「给人看」与「给机器看」**，不是同一条记录的两种排版：
 
 ```
-13:06:30 INFO   access  c3ccfe…  openai_chat  gpt-test  200  1ms  127.0.0.1:33012
-13:06:30 WARN   attempt  f7ba49…  #1  chatmock 127.0.0.1:18080  gpt-fail→fail-model  failed  42ms  upstream_unavailable
-    上游 HTTP 状态码 503：{"error": {"message": "upstream is having a bad day"}}
-13:06:30 ERROR  access  f7ba49…  openai_chat  gpt-fail  502  42ms  upstream_unavailable  127.0.0.1:33014
+13:06:30 INFO   access    c3ccfe…  openai_chat  gpt-test  200  1ms  127.0.0.1:33012
+13:06:30 WARN   attempt   f7ba49…  #1  chatmock 127.0.0.1:18080  gpt-fail→fail-model  failed  42ms  upstream_unavailable
+13:06:30 ERROR  upstream  f7ba49…  #1  上游 HTTP 状态码 503：{"error": {"message": "upstream is having a bad day"}}
+13:06:30 ERROR  access    f7ba49…  openai_chat  gpt-fail  502  42ms  upstream_unavailable  127.0.0.1:33014
 ```
+
+上游的原始错误（状态码与响应片段）**单独占一条 ERROR 记录**，而不是缩进附在主行下面：
+它常常是一整段上游报文，缩进会让人读不出它属于哪一次尝试；带上级别前缀之后，
+它还能被 `journalctl` 或 `grep` 按级别单独筛出来——而它恰恰是失败请求里唯一真正要看的东西。
 
 text 会省略「常见情况下不提供信息」的字段（同协议不写协议、同模型不写模型、用量只写非零子项），
 因此它**不可逆，不能拿来当数据源**；要解析就切 `log_format json`，那里字段齐全，
