@@ -32,16 +32,21 @@ build:
 
 ## build-binary: 产出 bin/nova 并注入版本号
 #
-# 版本号取值顺序：VERSION 变量 > git describe --tags --dirty > 字面量 0.0.0。
-#   - git describe 不带 --always：没有 tag 时它失败并退出非零，这正是我们要的，
-#     因为版本号该是 tag，而「构建自哪个提交」由二进制内嵌的 vcs.revision 单独回答，
-#     两件事不该挤在同一个字段里。
+# 版本号取值顺序：VERSION 变量 > 最近的 git tag > 字面量 0.0.0。
+#   - 用 --abbrev=0 只取「最近的 tag」，不用 git describe 的默认输出：默认输出形如
+#     v0.0.0-2-g4700f09，它把「是哪个版本」与「距那个版本多远」挤进同一个字段，
+#     结果是这个字段既不能当版本号去比较，也不是一个提交号。而「构建自哪个提交」
+#     由二进制内嵌的 vcs.revision 单独回答，两件事不必合并。
+#   - 不带 --always：没有任何 tag 时它失败并退出非零，于是退到 0.0.0。这正是我们要的——
+#     版本号该是 tag，而不是一个伪装成版本号的提交哈希。
+#   - --dirty 让工作区有未提交改动时带上 -dirty：那种构建不是任何一个 tag 的内容，
+#     版本号里必须看得出来。
 #   - 取到的值按白名单校验，含其它字符即构建失败。刻意不做静默清洗：清洗会产出一个
 #     与 tag 对不上号的版本号，而那正是本目标要消灭的「不知道这是哪个版本」。
 build-binary:
 	@mkdir -p bin
 	@set -eu; \
-	version="$${VERSION_RAW:-$$(git describe --tags --dirty 2>/dev/null || echo 0.0.0)}"; \
+	version="$${VERSION_RAW:-$$(git describe --tags --dirty --abbrev=0 2>/dev/null || echo 0.0.0)}"; \
 	case "$$version" in \
 		*[!A-Za-z0-9._+-]*) \
 			echo "错误：版本号 '$$version' 含非法字符，只允许字母、数字与 . _ + -" >&2; \
