@@ -131,7 +131,13 @@ type Endpoint struct {
 	Timeout time.Duration
 
 	// Models 是这条端点提供的模型映射，按声明顺序。
+	// 它只包含显式声明的那部分；从上游清单发现来的模型不入这里，
+	// 而是由装配层在运行期与它合并。
 	Models []Model
+
+	// Discover 描述这条端点的模型发现来源与过滤规则；nil 表示不发现，
+	// 端点只提供显式声明的模型。
+	Discover *Discover
 
 	// Default 表示这是写在 provider 一级的那条默认端点，而不是 endpoint 子块。
 	// 两者在转发行为上没有区别，这个标志只用于报错与日志里把它叫对名字。
@@ -139,6 +145,57 @@ type Endpoint struct {
 
 	// File / Line / Col 指向这条端点的声明处：默认端点指它第一条端点指令，
 	// endpoint 子块指块头那一行。
+	File string
+	Line int
+	Col  int
+}
+
+// Discover 是一条端点的模型发现来源与过滤规则。
+//
+// 它是配置层的事实，不含任何运行期结果：清单内容、发现到的模型集合都由装配层在联网后
+// 得出，配置层因此能在不连上游的前提下完整校验它。
+type Discover struct {
+	// URL 是清单接口的完整地址。配置里省略时由端点 url 推导，
+	// 推导结果写回这里，运行期不再重复推导。
+	URL string
+
+	// Derived 表示 URL 由端点 url 推导而来，而不是配置里显式写下的。
+	// 它只影响报错与日志的措辞：推导失败时应当指向端点 url 那一行。
+	Derived bool
+
+	// Allow 与 Deny 是过滤模式，按声明顺序。两者都为空表示清单里的模型全部保留。
+	Allow []string
+	Deny  []string
+
+	// Expose 是改名规则，按声明顺序。空表示对外名即上游 id。
+	Expose []Alias
+
+	// Declared 表示配置里确实写了一行 discover。只有 allow / deny 而没有 discover 是错误：
+	// 那时过滤规则不作用于任何东西，而静默忽略会让人以为白名单已经生效。
+	Declared bool
+
+	// File / Line / Col 指向 discover 那一行（缺 discover 时指向第一条 allow / deny）。
+	File string
+	Line int
+	Col  int
+}
+
+// Alias 是一条改名规则：把匹配 From 的上游 id 以 To 暴露给客户端。
+//
+// 方向只有「上游 id → 对外名」这一个：规则的作用对象是清单里的项，没有清单项就没有输入。
+// From 必须含恰好一个 `*`（它决定捕获哪一段），To 里那个 `*` 用捕获值填充；
+// 两个模式都不收 `?`：捕获与「匹配一个字符」混用时，「捕获哪一段」没有确定答案。
+//
+// 不依赖清单的精确改名仍用 model 的双记号形态（`model <对外名> <上游名>`）：
+// 那种声明在上游清单漏项时仍能用，也支撑发现失败时的降级集合。
+type Alias struct {
+	// From 是上游 id 的模式，含恰好一个 `*`。
+	From string
+
+	// To 是对外名模式，含 0 或 1 个 `*`。
+	To string
+
+	// File / Line / Col 指向 From 那个取值，用于报错与「未命中」提醒的定位。
 	File string
 	Line int
 	Col  int
@@ -208,6 +265,22 @@ func (c *Config) ModelNames() []string {
 		}
 	}
 	return names
+}
+
+// DiscoveryCount 返回声明了模型发现的端点数。
+//
+// 它供 `config check` 与启动横幅报出「有几条端点的模型集合来自上游」：
+// 这类端点的可用模型在不连上游时无法校验，这件事需要被看见。
+func (c *Config) DiscoveryCount() int {
+	count := 0
+	for i := range c.Providers {
+		for j := range c.Providers[i].Endpoints {
+			if c.Providers[i].Endpoints[j].Discover != nil {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 // Warning 是一条带位置的提醒。

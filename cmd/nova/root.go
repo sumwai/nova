@@ -65,6 +65,7 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		newRunCmd(),
 		newReloadCmd(),
 		newConfigCmd(),
+		newModelsCmd(),
 		newVersionCmd(),
 	)
 	// completion 提前建出来，而不是等 cobra 在 Execute 时自己补：

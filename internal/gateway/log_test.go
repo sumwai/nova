@@ -40,7 +40,7 @@ func TestStartupIgnoresLevelFilter(t *testing.T) {
 	log.startup(&config.Config{
 		Path: "/etc/nova/Novafile", Schema: 1, Listen: "127.0.0.1:8080",
 		Admin: "localhost:2026", LogLevel: "error", LogFormat: "text",
-	}, false)
+	}, catalogStats{}, false)
 
 	out := buf.String()
 	// 横幅回答的是「这个进程在用哪份配置跑」，与「哪些日志值得看」是两件事：
@@ -363,7 +363,7 @@ func TestStartupAlignsValuesByDisplayWidth(t *testing.T) {
 		Path: "/etc/nova/Novafile", Schema: 1, Listen: "127.0.0.1:8080",
 		Admin: "localhost:2026", LogLevel: "info", LogFormat: "text",
 	}
-	lines := strings.Split(renderStartup(cfg, false), "\n")
+	lines := strings.Split(renderStartup(cfg, catalogStats{Models: 3}, false), "\n")
 	if len(lines) < 2 {
 		t.Fatalf("横幅应当是多行，实际：%q", lines)
 	}
@@ -601,7 +601,8 @@ func TestJSONStartupCarriesCountsAndAuth(t *testing.T) {
 				Models: []config.Model{{Name: "m1"}, {Name: "m2"}},
 			}},
 		}},
-	}, false)
+		// 目录大小来自本次装配的统计而不是配置里的显式模型数：发现来的模型也计入其中。
+	}, catalogStats{Models: 2}, false)
 
 	var got map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {

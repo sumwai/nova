@@ -75,7 +75,7 @@ func matchesAnyKey(presented string, keys []string) bool {
 // 不必为「先被鉴权挡住」单独写一套解析。路径本身不认识时不泄露路由事实，但仍要说清
 // 「缺凭据」：只回 404，会让一个只是漏了 token 的客户端去反复检查自己拼的 URL。
 func rejectUnauthorized(w http.ResponseWriter, r *http.Request, resolve transport.AdapterResolver) {
-	adapter, ok := resolve(r.URL.Path)
+	adapter, ok := resolve(r)
 	if !ok {
 		http.Error(w, "缺少或无效的客户端凭据", http.StatusUnauthorized)
 		return

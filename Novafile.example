@@ -92,6 +92,8 @@ provider openai {
     # 对外模型名。客户端请求里的 model 只用来选路，不会照转给上游：
     #   model gpt-5                    对外名与上游名相同；
     #   model gpt-5 gpt-5-2025-01-01   对外名 gpt-5，发往上游时改写成后者。
+    # 两个记号都按字面量使用，不做通配匹配（名字里含 * 或 ? 会记一条提醒）；
+    # 按模式筛上游清单请用下面「模型自动发现与过滤」一节里的 allow / deny。
     model gpt-5
     model gpt-5-mini
 }
@@ -127,6 +129,53 @@ provider relay {
 #         model claude-sonnet-4
 #     }
 # }
+
+# ── 模型自动发现与过滤 ─────────────────────────────────────────────
+#
+# 中转站与聚合网关单条端点下有几十到几百个模型，逐条抄写既容易抄错，也会与上游
+# 真正可用的集合随时间漂移。discover 把端点的模型集合交给上游清单接口，
+# allow / deny 决定其中哪些暴露给客户端。
+#
+# provider aggregator {
+#     api_key {env.AGGREGATOR_API_KEY}
+#
+#     url https://open.bigmodel.cn/api/coding/paas/v4/chat/completions
+#
+#     # 省略地址时从本端点的 url 推导：裁掉协议端点段，再拼 /models。
+#     # 版本根原样保留，因此 /v1、/api/coding/paas/v4、/api/v3 走同一条规则，
+#     # /v1/messages 也推出 /v1/models。清单不在这条规则上时显式写地址。
+#     discover
+#
+#     # 过滤模式匹配整个模型 id，两端隐式锚定：gpt* 是「以 gpt 开头」，
+#     # openai/gpt-4o 要用 openai/gpt-*；* 可以跨 /，? 匹配一个字符，大小写不敏感。
+#     # 一条 allow 都不写表示全部保留，但启动时会记一条提醒；deny 优先于 allow。
+#     allow gpt-5*
+#     allow claude-*
+#     deny *-preview
+#
+#     # 改名：把清单里的上游 id 按模式改写成对外名，可写多条、第一条命中即生效。
+#     # 上游模式必须含恰好一个 *（它决定捕获哪一段），对外名模式用捕获值填充，两边都不收 ?。
+#     # 改名是替换：原名不再对客户端存在；两条清单项改名后撞同一个对外名会报错；
+#     # 一条规则没命中任何清单项时记一条提醒。
+#     # 下面这一条把上游的短名统一加供应商前缀。
+#     expose * sensenova/*
+#
+#     # 显式声明的模型永远生效、不参与过滤；与发现项同名时以显式那条为准，
+#     # 于是可以借它改写上游名。
+#     model gpt-5 gpt-5-2025-01-01
+#
+#     # discover / allow / deny 都是端点作用域，写在 provider 一级只作用于默认端点。
+#     # 多端点想共享同一套规则时，用 import 引入一个只含 allow / deny 行的文件。
+# }
+#
+# 发现只在启动与 reload 时各做一次，运行中不自动刷新。失败时：端点有显式模型就退回
+# 它们并记一条 error，没有显式模型则装配失败（reload 失败时旧配置继续服务）。
+# 清单响应自动识别 OpenAI 与 Anthropic 两种形状，字段统一归一化；
+# 清单自述还有下一页时记一条提醒，本版不翻页。
+#
+# 客户端可以直接问网关有哪些模型：GET /v1/models 按 anthropic-version 头区分形状，
+# 带该头回 Anthropic 形状，其余回 OpenAI 形状，与其它路径一样要过 client_key。
+# 想在动手前看清目录用 `nova models -c Novafile --verbose`（会连上游）。
 
 # ── 选路与回退 ───────────────────────────────────────────────────────────────
 #

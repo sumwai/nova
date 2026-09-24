@@ -31,8 +31,8 @@ func TestServeHTTPRecordsClientFacts(t *testing.T) {
 	logger := &capturingLogger{}
 	handler, err := New(Options{
 		Forwarder: stubForwarder{},
-		Adapters: func(path string) (domain.Adapter, bool) {
-			if path == "/v1/chat/completions" {
+		Adapters: func(r *http.Request) (domain.Adapter, bool) {
+			if r.URL.Path == "/v1/chat/completions" {
 				return openaichat.New(), true
 			}
 			return nil, false

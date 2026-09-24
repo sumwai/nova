@@ -68,7 +68,7 @@ func testConfig() *config.Config {
 }
 
 func TestRoutesByModelKeepsCandidateOrder(t *testing.T) {
-	shared := routesByModel(testConfig())["shared"]
+	shared := routesByModel(testEndpoints(testConfig()))["shared"]
 	if len(shared) != 2 {
 		t.Fatalf("shared 的候选数 = %d，期望 2", len(shared))
 	}
@@ -98,7 +98,7 @@ func TestRoutesByModelKeepsCandidateOrder(t *testing.T) {
 }
 
 func TestModelRouteResolverPrefersSameProtocol(t *testing.T) {
-	resolver := modelRouteResolver{routes: routesByModel(testConfig())}
+	resolver := modelRouteResolver{routes: routesByModel(testEndpoints(testConfig()))}
 
 	got, err := resolver.Candidates(context.Background(), &domain.Request{
 		Model:    "shared",
@@ -121,7 +121,7 @@ func TestModelRouteResolverPrefersSameProtocol(t *testing.T) {
 }
 
 func TestModelRouteResolverMissReturnsNoCandidates(t *testing.T) {
-	resolver := modelRouteResolver{routes: routesByModel(testConfig())}
+	resolver := modelRouteResolver{routes: routesByModel(testEndpoints(testConfig()))}
 	for _, req := range []*domain.Request{
 		nil,
 		{Model: "unknown", Protocol: domain.ProtocolOpenAIChat},
@@ -131,6 +131,14 @@ func TestModelRouteResolverMissReturnsNoCandidates(t *testing.T) {
 			t.Errorf("未命中时 = %v, %v；期望空候选与 nil 错误（把错误码留给流水线判定）", got, err)
 		}
 	}
+}
+
+// testEndpoints 把一份测试配置转成生效端点集合。
+//
+// 这些测试不声明 discover，因此生效集合就是显式声明的模型集合；
+// 需要「发现来的模型也参与选路」时另造 discover 结果（见 discovery_test.go）。
+func testEndpoints(cfg *config.Config) []effectiveEndpoint {
+	return assembleEndpoints(cfg, nil)
 }
 
 func TestUpstreamIDUsesProviderAndHost(t *testing.T) {

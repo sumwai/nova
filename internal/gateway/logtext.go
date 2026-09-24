@@ -30,6 +30,7 @@ import (
 const (
 	kindAccess   = "access"
 	kindUpstream = "upstream"
+	kindCatalog  = "catalog"
 	kindReload   = "reload"
 	kindWarning  = "提醒"
 )
@@ -270,7 +271,7 @@ func isWideRune(r rune) bool {
 // 它一次列清「这个进程现在用什么配置在跑」，而不是把这些事实拆进多条日志：排查的第一步
 // 永远是确认现场，而这几个字段就是现场本身。渠道与模型只报数量不报名单——名单可能十几条，
 // 会把这屏刷掉；要看全清单应该有个单独的命令，不是在启动时刷屏。
-func renderStartup(cfg *config.Config, reloaded bool) string {
+func renderStartup(cfg *config.Config, stats catalogStats, reloaded bool) string {
 	headline := "nova 已启动"
 	if reloaded {
 		headline = "nova 已重载"
@@ -286,9 +287,21 @@ func renderStartup(cfg *config.Config, reloaded bool) string {
 		{"管理端点", cfg.Admin},
 		{"日志级别", cfg.LogLevel},
 		{"日志格式", cfg.LogFormat},
-		{"渠道", fmt.Sprintf("%d 条，对外模型 %d 个", len(cfg.Providers), len(cfg.ModelNames()))},
-		{"客户端鉴权", auth},
+		{"渠道", fmt.Sprintf("%d 条，对外模型 %d 个", len(cfg.Providers), stats.Models)},
 	}
+	// 发现相关的两行只在真的发生时才出现：不声明发现的配置与以前一字不差，
+	// 而声明了发现的配置需要一眼看出「清单给了多少、留下多少、有没有退回去」。
+	if stats.DiscoveryEndpoints > 0 {
+		rows = append(rows, [2]string{"模型发现", fmt.Sprintf(
+			"%d 条端点，清单 %d 条 → 保留 %d 条（排除 %d）",
+			stats.DiscoveryEndpoints, stats.Discovered, stats.Kept, stats.Filtered)})
+	}
+	if stats.Degraded > 0 {
+		rows = append(rows, [2]string{"发现降级", fmt.Sprintf(
+			"%d 条端点发现失败，只用显式声明的模型", stats.Degraded)})
+	}
+	rows = append(rows, [2]string{"客户端鉴权", auth})
+
 	var b strings.Builder
 	b.WriteString(headline)
 	for _, row := range rows {
@@ -307,6 +320,69 @@ const labelWidth = 10
 func renderWarning(warn config.Warning, color bool) string {
 	level := slog.LevelWarn
 	return clockNow() + " " + paintLevel(level, color) + kindColumn(kindWarning) + warn.String()
+}
+
+// renderDiscovery 渲染一条端点发现记录。
+//
+// 字段顺序与其它记录一致：先定位（渠道、清单地址），再说结果（风格、发现 / 保留 / 排除），
+// 然后是耗时与降级处置，最后是客户端可用的对外名名单。名单列在行上是故意的：
+// 启动时最常问的问题就是「网关现在认哪些模型」，答案应当在这一行里就能读到。
+// 用的是对外名而不是上游 id：`expose` 改名后，客户端看到的名字与上游的名字是两回事。
+func renderDiscovery(clock string, rec DiscoveryReport, color bool) string {
+	fields := []string{rec.Provider, rec.Listing}
+	if rec.Err != nil {
+		fields = append(fields, "发现失败")
+	} else {
+		fields = append(fields, string(rec.Shape),
+			fmt.Sprintf("发现 %d 保留 %d 排除 %d", rec.Found, len(rec.Kept), rec.Filtered))
+		if rec.HasMore {
+			fields = append(fields, "清单还有下一页")
+		}
+	}
+	fields = append(fields, durationText(rec.Duration), degradedText(rec))
+	if rec.Err != nil {
+		fields = append(fields, oneLineText(rec.Err.Error()))
+	} else {
+		fields = append(fields, keptNamesText(rec.Kept))
+	}
+	return clock + " " + paintLevel(discoveryLevel(rec), color) +
+		kindColumn(kindCatalog) + joinFields(fields...)
+}
+
+// discoveryNameLimit 是 catalog 记录里逐条列出的对外名上限。
+//
+// 一行日志的可读长度有限，而一个中转站可能有几百个模型。超出时只列前若干个
+// 并给出总数，全量名单由 `nova models` 回答；json 模式下不截断，那边是给机器读的。
+const discoveryNameLimit = 20
+
+// keptNamesText 把客户端可用的对外名排成一段，超限时截断并给出总数。
+func keptNamesText(kept []config.Model) string {
+	if len(kept) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(kept))
+	for i, model := range kept {
+		if i >= discoveryNameLimit {
+			break
+		}
+		names = append(names, model.Name)
+	}
+	text := "保留：" + strings.Join(names, " ")
+	if len(kept) > discoveryNameLimit {
+		text += fmt.Sprintf(" …（共 %d 个）", len(kept))
+	}
+	return text
+}
+
+// degradedText 描述发现失败后的降级处置。
+//
+// 只有真的退回了显式模型才有这一句：发现失败且没有可退的模型时装配会整体失败，
+// 那种情形由失败原因本身说清。
+func degradedText(rec DiscoveryReport) string {
+	if !rec.Degraded || rec.endpoint == nil {
+		return ""
+	}
+	return fmt.Sprintf("退回显式模型 %d 个", len(rec.endpoint.Models))
 }
 
 // joinFields 用两个空格连接非空片段。

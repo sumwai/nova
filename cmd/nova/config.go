@@ -47,6 +47,13 @@ func newConfigCheckCmd() *cobra.Command {
 			for _, warn := range cfg.Warnings {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "提醒 %s\n", warn.String())
 			}
+			// 发现型端点的可用模型只能在运行期确定：check 不连上游，因此这件事
+			// 必须被说出来，而不是让「校验通过」被误读成「上游那些模型也能用」。
+			if count := cfg.DiscoveryCount(); count > 0 {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"提醒 %s：%d 条端点声明了模型发现（discover），清单内容由上游决定；本次校验没有连上游，用 nova models 查看实际结果\n",
+					cfg.Path, count)
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 				"%s 校验通过（配置代数 %d，监听 %s，管理端点 %s）\n",
 				cfg.Path, cfg.Schema, cfg.Listen, cfg.Admin)

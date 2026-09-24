@@ -28,6 +28,10 @@ const (
 	directiveTimeout  = "timeout"
 	directiveModel    = "model"
 	directiveEndpoint = "endpoint"
+	directiveDiscover = "discover"
+	directiveAllow    = "allow"
+	directiveDeny     = "deny"
+	directiveExpose   = "expose"
 )
 
 // 下面四张表分别是三层作用域的合法指令名，外加一份「能开启块的名字」。
@@ -43,7 +47,8 @@ var (
 
 	providerDirectives = []string{
 		directiveAPIKey, directiveURL, directiveProtocol, directiveTimeout,
-		directiveModel, directiveEndpoint,
+		directiveModel, directiveEndpoint, directiveDiscover, directiveAllow, directiveDeny,
+		directiveExpose,
 	}
 
 	// endpointDirectives 是 endpoint 子块的合法指令名。
@@ -53,6 +58,7 @@ var (
 	// 拼写错误。真正拦它的是 applyEndpointLine。
 	endpointDirectives = []string{
 		directiveURL, directiveProtocol, directiveTimeout, directiveModel,
+		directiveDiscover, directiveAllow, directiveDeny, directiveExpose,
 	}
 
 	// blockDirectives 是能开启一个块的指令名，只为对外声明能力清单而存在。

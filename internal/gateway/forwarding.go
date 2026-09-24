@@ -3,12 +3,14 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/sumwai/nova/internal/adapters/anthropic"
 	"github.com/sumwai/nova/internal/adapters/openaichat"
 	"github.com/sumwai/nova/internal/adapters/openairesponses"
+	"github.com/sumwai/nova/internal/catalog"
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/credential"
 	"github.com/sumwai/nova/internal/domain"
@@ -55,13 +57,13 @@ func protocolForPath(path string) (domain.Protocol, bool) {
 	return "", false
 }
 
-// adapterResolver 供入口层按请求路径取客户端适配器。
+// adapterResolver 供入口层按请求取客户端适配器。
 //
-// 路径到协议的对应关系不可配置：网关只暴露约定的三个端点，多开一个入口就多一份
-// 要维护的事实来源，而「哪些路径能进来」本该是网关的固定形状。
+// 协议在转发路径上由路径决定，在模型清单上由请求头决定，两者都在这里回答；
+// 清单路径因此不需要在入口层另挂一个只为了编码错误的适配器查找。
 func adapterResolver(adapters map[domain.Protocol]domain.Adapter) transport.AdapterResolver {
-	return func(path string) (domain.Adapter, bool) {
-		protocol, ok := protocolForPath(path)
+	return func(r *http.Request) (domain.Adapter, bool) {
+		protocol, ok := protocolForRequest(r)
 		if !ok {
 			return nil, false
 		}
@@ -70,29 +72,131 @@ func adapterResolver(adapters map[domain.Protocol]domain.Adapter) transport.Adap
 	}
 }
 
-// routesByModel 由配置构造「对外模型名 → 候选端点」的选路表。
+// protocolForRequest 判定一次请求的客户端协议。
+//
+// 转发路径按路径判定，与既有行为一致；模型清单在 OpenAI 与 Anthropic 下是同一条路径，
+// 判据改为 anthropic-version 头。带该头却请求转发路径的请求仍按路径判定：
+// 头判定只作用于模型清单那一条路径。
+func protocolForRequest(r *http.Request) (domain.Protocol, bool) {
+	if protocol, ok := protocolForPath(r.URL.Path); ok {
+		return protocol, true
+	}
+	if r.URL.Path == modelsPath {
+		return protocolForModelsRequest(r), true
+	}
+	return "", false
+}
+
+// effectiveEndpoint 是一条端点及其本次装配生效的模型集合。
+//
+// 生效集合 = 显式声明的模型（按声明顺序在前）+ 从上游清单保留的模型（按上游返回顺序在后）。
+// 它是「配置说的」与「上游现在有的」合并后的结果，选路表与对外目录都由它派生。
+// 发现失败的端点落回只有显式声明的那一份。
+type effectiveEndpoint struct {
+	provider string
+	endpoint *config.Endpoint
+	models   []config.Model
+}
+
+// resolveEndpointModels 合并显式声明与发现结果。
+//
+// 同名时显式声明胜出：它无条件生效（上游清单漏项时仍能用，也支撑发现失败时的降级），
+// 而发现项只在清单命中时才有，它的对外名由 expose 决定。
+// 这一条不算「同一端点内重复声明同一个对外名」，那条校验只对显式声明之间生效。
+// 返回新切片，不修改端点上声明的模型集合。
+func resolveEndpointModels(endpoint *config.Endpoint, discovered []catalog.Model) []config.Model {
+	models := make([]config.Model, 0, len(endpoint.Models)+len(discovered))
+	models = append(models, endpoint.Models...)
+
+	declared := make(map[string]bool, len(endpoint.Models))
+	for _, model := range endpoint.Models {
+		declared[model.Name] = true
+	}
+	for _, model := range discovered {
+		name := model.Name
+		if name == "" {
+			// 兼底：对外名缺省即上游 id。catalog 一定会填它，这里防的是
+			// 调用方手搓 Model 时漏填，那会让目录里多出一个空名字。
+			name = model.ID
+		}
+		if declared[name] {
+			continue
+		}
+		declared[name] = true
+		// 对外名取自 expose 改写后的结果，上游名始终是清单里的上游 id。
+		models = append(models, config.Model{Name: name, Upstream: model.ID})
+	}
+	return models
+}
+
+// routesByModel 由生效端点集合构造「对外模型名 → 候选端点」的选路表。
 //
 // 一条候选对应一个「provider × endpoint × model」组合：同一条端点下的多个 model
 // 各成一条候选，它们共用地址、协议、超时与凭据，只有上游模型名不同；同一个对外名
-// 出现在多条端点下时，它们按声明顺序构成这个名字的回退链路。
-//
-// 复用 config 的 ModelNames 与 Routes 而不是自己遍历 Providers：选路的依据只有
-// 对外模型名这一件事，它的去重与排序规则该由配置包定义一次。
-func routesByModel(cfg *config.Config) map[string][]domain.Route {
+// 出现在多条端点下时，它们按声明顺序构成这个名字的回退链路。发现模型与显式模型
+// 在同一条端点上排出同一种候选，因此两类来源在转发路径上没有区别。
+func routesByModel(endpoints []effectiveEndpoint) map[string][]domain.Route {
 	table := make(map[string][]domain.Route)
-	for _, name := range cfg.ModelNames() {
-		for _, route := range cfg.Routes(name) {
-			table[name] = append(table[name], domain.Route{
-				UpstreamID:    upstreamID(route.Provider, route.Endpoint),
-				Protocol:      route.Endpoint.Protocol,
-				UpstreamModel: route.Upstream,
-				BaseURL:       route.Endpoint.URL,
-				Timeout:       route.Endpoint.Timeout,
-				CredentialRef: route.Provider,
+	for _, item := range endpoints {
+		for _, model := range item.models {
+			table[model.Name] = append(table[model.Name], domain.Route{
+				UpstreamID:    upstreamID(item.provider, item.endpoint),
+				Protocol:      item.endpoint.Protocol,
+				UpstreamModel: model.Upstream,
+				BaseURL:       item.endpoint.URL,
+				Timeout:       item.endpoint.Timeout,
+				CredentialRef: item.provider,
 			})
 		}
 	}
 	return table
+}
+
+// modelEntries 由生效端点集合构造对外目录，按首次出现的顺序去重。
+//
+// 顺序取首次出现而不是字典序：这个列表会被 nova models 与数据面 /v1/models 展示，
+// 让它与配置里读到的顺序一致，对着配置排查时不必来回换算位置。
+func modelEntries(endpoints []effectiveEndpoint, discovered map[*config.Endpoint][]catalog.Model) []ModelEntry {
+	var entries []ModelEntry
+	seen := make(map[string]bool)
+
+	// 发现项的展示名与创建时间按上游 id 索引：同一条端点内同名时显式声明优先，
+	// 那条不应继承发现项的展示名。
+	meta := make(map[string]catalog.Model)
+	for _, models := range discovered {
+		for _, model := range models {
+			if _, ok := meta[model.ID]; !ok {
+				meta[model.ID] = model
+			}
+		}
+	}
+
+	for _, item := range endpoints {
+		declared := make(map[string]bool, len(item.endpoint.Models))
+		for _, model := range item.endpoint.Models {
+			declared[model.Name] = true
+		}
+		for _, model := range item.models {
+			if seen[model.Name] {
+				continue
+			}
+			seen[model.Name] = true
+			entry := ModelEntry{Name: model.Name}
+			if declared[model.Name] {
+				entry.Source = ModelSourceStatic
+			} else {
+				entry.Source = ModelSourceDiscovered
+				// 上游给的展示名与时间按上游 id 查：对外名可能已经被 expose 改写，
+				// 拿它去查会查不到。
+				if found, ok := meta[model.Upstream]; ok {
+					entry.DisplayName = found.DisplayName
+					entry.CreatedAt = found.CreatedAt
+				}
+			}
+			entries = append(entries, entry)
+		}
+	}
+	return entries
 }
 
 // upstreamID 是端点在上游尝试记录里的标识：provider 名 + 空格 + 主机名。

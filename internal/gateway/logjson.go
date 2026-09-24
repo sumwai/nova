@@ -42,38 +42,90 @@ func jsonBaseFor(level slog.Level, msg string) jsonBase {
 
 type jsonStartup struct {
 	jsonBase
-	Config     string `json:"config"`
-	Schema     int    `json:"schema"`
-	Listen     string `json:"listen"`
-	Admin      string `json:"admin"`
-	LogLevel   string `json:"log_level"`
-	LogFormat  string `json:"log_format"`
-	Providers  int    `json:"providers"`
-	Models     int    `json:"models"`
-	ClientAuth bool   `json:"client_auth"`
-	ClientKeys int    `json:"client_keys"`
-	Reloaded   bool   `json:"reloaded"`
+	Config             string `json:"config"`
+	Schema             int    `json:"schema"`
+	Listen             string `json:"listen"`
+	Admin              string `json:"admin"`
+	LogLevel           string `json:"log_level"`
+	LogFormat          string `json:"log_format"`
+	Providers          int    `json:"providers"`
+	Models             int    `json:"models"`
+	DiscoveryEndpoints int    `json:"discovery_endpoints"`
+	DiscoveredModels   int    `json:"discovered_models"`
+	FilteredModels     int    `json:"filtered_models"`
+	DiscoveryDegraded  int    `json:"discovery_degraded"`
+	ClientAuth         bool   `json:"client_auth"`
+	ClientKeys         int    `json:"client_keys"`
+	Reloaded           bool   `json:"reloaded"`
 }
 
-func startupPayload(cfg *config.Config, reloaded bool) any {
+func startupPayload(cfg *config.Config, stats catalogStats, reloaded bool) any {
 	msg := "startup"
 	if reloaded {
 		msg = "reload"
 	}
 	return jsonStartup{
-		jsonBase:   jsonBaseFor(slog.LevelInfo, msg),
-		Config:     cfg.Path,
-		Schema:     cfg.Schema,
-		Listen:     cfg.Listen,
-		Admin:      cfg.Admin,
-		LogLevel:   cfg.LogLevel,
-		LogFormat:  cfg.LogFormat,
-		Providers:  len(cfg.Providers),
-		Models:     len(cfg.ModelNames()),
-		ClientAuth: len(cfg.ClientKeys) > 0,
-		ClientKeys: len(cfg.ClientKeys),
-		Reloaded:   reloaded,
+		jsonBase:           jsonBaseFor(slog.LevelInfo, msg),
+		Config:             cfg.Path,
+		Schema:             cfg.Schema,
+		Listen:             cfg.Listen,
+		Admin:              cfg.Admin,
+		LogLevel:           cfg.LogLevel,
+		LogFormat:          cfg.LogFormat,
+		Providers:          len(cfg.Providers),
+		Models:             stats.Models,
+		DiscoveryEndpoints: stats.DiscoveryEndpoints,
+		DiscoveredModels:   stats.Discovered,
+		FilteredModels:     stats.Filtered,
+		DiscoveryDegraded:  stats.Degraded,
+		ClientAuth:         len(cfg.ClientKeys) > 0,
+		ClientKeys:         len(cfg.ClientKeys),
+		Reloaded:           reloaded,
 	}
+}
+
+// jsonDiscovery 是一条端点发现记录。
+//
+// 字段齐全、不做省略：下游要能用它回答「这条端点这次发现了什么、为什么没成」。
+type jsonDiscovery struct {
+	jsonBase
+	Provider string `json:"provider"`
+	Listing  string `json:"listing"`
+	Protocol string `json:"protocol"`
+	Shape    string `json:"shape,omitempty"`
+	Found    int    `json:"found"`
+	Kept     int    `json:"kept"`
+	Filtered int    `json:"filtered"`
+	// Models 是客户端可用的对外名（`expose` 改名后的结果），不截断：
+	// 这边是给机器读的，采集侧要能用它做「模型集合变了」这类判断。
+	Models     []string `json:"models,omitempty"`
+	HasMore    bool     `json:"has_more"`
+	Degraded   bool     `json:"degraded"`
+	DurationMS int64    `json:"duration_ms"`
+	Error      string   `json:"error,omitempty"`
+}
+
+func discoveryPayload(rec DiscoveryReport) any {
+	payload := jsonDiscovery{
+		jsonBase:   jsonBaseFor(discoveryLevel(rec), "model_discovery"),
+		Provider:   rec.Provider,
+		Listing:    rec.Listing,
+		Protocol:   string(rec.Protocol),
+		Shape:      string(rec.Shape),
+		Found:      rec.Found,
+		Kept:       len(rec.Kept),
+		Filtered:   rec.Filtered,
+		HasMore:    rec.HasMore,
+		Degraded:   rec.Degraded,
+		DurationMS: rec.Duration.Milliseconds(),
+	}
+	if rec.Err != nil {
+		payload.Error = rec.Err.Error()
+	}
+	for _, model := range rec.Kept {
+		payload.Models = append(payload.Models, model.Name)
+	}
+	return payload
 }
 
 type jsonWarning struct {

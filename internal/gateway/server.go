@@ -45,14 +45,14 @@ func Run(ctx context.Context, opt Options) error {
 	if err != nil {
 		return err
 	}
-	first, err := Assemble(cfg, opt.LogOutput)
+	first, err := Assemble(ctx, cfg, opt.LogOutput)
 	if err != nil {
 		return err
 	}
 
 	s := &server{holder: NewHolder(first), out: opt.LogOutput}
 	reportWarnings(first.Logger, cfg)
-	first.Logger.startup(cfg, false)
+	first.Logger.startup(cfg, first.Stats, false)
 	return s.serve(ctx)
 }
 
@@ -156,8 +156,8 @@ func shutdownAll(servers ...*http.Server) error {
 // 顺序是「先完整装配、再换入」：装配失败时旧装配原样继续服务，现场不变。
 // 反过来先换入再装配，就会出现一段「新配置已生效、但还没装配完」的空窗。
 //
-// ctx 目前只用于提前放弃，装配本身还不做网络 IO；转发链路接进来之后，
-// 启动期的模型发现会需要它，那时这个参数就是现成的。
+// ctx 用于装配期的模型发现：启动与重载都把各自的 context 传下去，
+// 重载路径上客户端断开即取消这次发现。
 func (s *server) reload(ctx context.Context, path string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -169,14 +169,14 @@ func (s *server) reload(ctx context.Context, path string) error {
 	if err := checkReloadable(s.holder.Current().Config, next); err != nil {
 		return err
 	}
-	assembled, err := Assemble(next, s.out)
+	assembled, err := Assemble(ctx, next, s.out)
 	if err != nil {
 		return err
 	}
 
 	previous := s.holder.replace(assembled)
 	reportWarnings(assembled.Logger, next)
-	assembled.Logger.startup(next, true)
+	assembled.Logger.startup(next, assembled.Stats, true)
 
 	if err := previous.Close(); err != nil {
 		// 旧装配释放失败不影响「新装配已经生效」这一事实，因此记一条警告，
