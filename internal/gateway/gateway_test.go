@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,7 @@ func testAssembly(t *testing.T, cfg *config.Config) *Assembly {
 	if cfg.Admin == "" {
 		cfg.Admin = "localhost:0"
 	}
-	assembled, err := Assemble(cfg, io.Discard)
+	assembled, err := Assemble(context.Background(), cfg, io.Discard)
 	if err != nil {
 		t.Fatalf("Assemble 意外失败：%v", err)
 	}
@@ -84,7 +85,7 @@ func TestHolderServeHTTPDelegatesToCurrentAssembly(t *testing.T) {
 }
 
 func TestAssembleRejectsUnknownLogLevel(t *testing.T) {
-	_, err := Assemble(&config.Config{LogLevel: "verbose", LogFormat: "text"}, io.Discard)
+	_, err := Assemble(context.Background(), &config.Config{LogLevel: "verbose", LogFormat: "text"}, io.Discard)
 	if err == nil {
 		t.Fatal("期望 Assemble 报错，但它成功了")
 	}
@@ -127,7 +128,7 @@ func TestDataPlaneServesHealthzWithoutCredentials(t *testing.T) {
 	var forward stubForwarder
 	// 故意配上 client_key：探活不该因此被挡住。
 	handler := newDataPlane(&forward, &config.Config{ClientKeys: []string{"secret"}},
-		adapterResolver(newAdapters()))
+		adapterResolver(newAdapters()), nil)
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthzPath, nil))
@@ -146,7 +147,7 @@ func TestDataPlaneServesHealthzWithoutCredentials(t *testing.T) {
 
 func TestDataPlaneSkipsAuthWithoutClientKeys(t *testing.T) {
 	var forward stubForwarder
-	handler := newDataPlane(&forward, &config.Config{}, adapterResolver(newAdapters()))
+	handler := newDataPlane(&forward, &config.Config{}, adapterResolver(newAdapters()), nil)
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
@@ -181,7 +182,7 @@ func TestDataPlaneRequiresMatchingClientKey(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var forward stubForwarder
-			handler := newDataPlane(&forward, cfg, adapterResolver(newAdapters()))
+			handler := newDataPlane(&forward, cfg, adapterResolver(newAdapters()), nil)
 			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
 			if tt.bearer != "" {
 				req.Header.Set("Authorization", "Bearer "+tt.bearer)
@@ -221,7 +222,7 @@ func TestDataPlaneEncodesUnauthorizedPerClientProtocol(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
 			var forward stubForwarder
-			handler := newDataPlane(&forward, cfg, adapterResolver(newAdapters()))
+			handler := newDataPlane(&forward, cfg, adapterResolver(newAdapters()), nil)
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, tt.path, nil))
 			if got := rec.Header().Get("Content-Type"); !strings.Contains(got, tt.contentType) {

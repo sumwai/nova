@@ -7,6 +7,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +29,16 @@ type Assembly struct {
 	Config  *config.Config
 	Logger  *logger
 	Handler http.Handler
+
+	// Models 是本次装配的对外模型目录，按首现顺序去重。
+	// 它是数据面 GET /v1/models 与 `nova models` 的唯一数据来源。
+	Models []ModelEntry
+
+	// Discoveries 是本次装配逐条发现型端点的结果，供 `nova models` 展示。
+	Discoveries []DiscoveryReport
+
+	// Stats 是本次装配的目录汇总，供启动横幅与 reload 日志使用。
+	Stats catalogStats
 
 	// clients 是这次装配独占的 HTTP 客户端。换出时逐个关掉它们的空闲连接：
 	// 不关的话，每次 reload 都会把上一份配置的连接池留到空闲超时才释放，
@@ -103,7 +114,10 @@ func (h *Holder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 所有装配缺陷都在这里报出，而不是等第一个请求打进来：配置错误应该在启动与
 // reload 时以退出码和失败回应被看见。拖到运行期，它就变成某个请求的 500，
 // 而那时已经没有人记得自己刚改过配置。
-func Assemble(cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
+//
+// ctx 用于装配期的模型发现：启动路径传进程 context，reload 路径传管理端点请求的
+// context（客户端断开即取消这次发现）。为 nil 时按无上限处理，供只做装配检查的调用方使用。
+func Assemble(ctx context.Context, cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
 	logger, err := newLogger(cfg, logOutput)
 	if err != nil {
 		return nil, err
@@ -122,6 +136,44 @@ func Assemble(cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
 	// 上游客户端持有自己的 HTTP 客户端：Assembly 要能在换出时关掉它的空闲连接。
 	// 这里不设全局默认超时，每条候选都带着自己端点的 timeout（配置层已兜底 60s）。
 	upstreamHTTP := &http.Client{}
+
+	// 模型发现排在装配的这一步：它决定这次装配的选路表，而它的失败处置要看端点
+	// 有没有显式声明的模型。发现与转发共用同一个 HTTP 客户端，连接池只有一份。
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	discovered, reports := runDiscovery(ctx, cfg, listingFetcher{
+		http:        upstreamHTTP,
+		credentials: credentials,
+		adapters:    adapters,
+	})
+	for i := range reports {
+		// 有显式声明的模型可选时才算降级；没有可退的模型时装配随后整体失败，
+		// 那种情形不由「已降级」描述。
+		if reports[i].Err != nil && len(reports[i].endpoint.Models) > 0 {
+			reports[i].Degraded = true
+		}
+		logger.discovery(reports[i])
+		// 没命中的改名规则单独提一句：它多半意味着模式写错，
+		// 或者被 allow / deny 先拦掉了——那种情况下改名根本轮不到执行。
+		for _, alias := range reports[i].UnusedAliases {
+			logger.warning(config.Warning{
+				File: alias.File,
+				Line: alias.Line,
+				Msg: fmt.Sprintf("expose %s %s 没有命中清单里的任何模型；"+
+					"检查上游 id 是否与模式一致（被 allow / deny 拦下的项不会走到改名）",
+					alias.From, alias.To),
+			})
+		}
+	}
+	if err := fatalDiscovery(reports); err != nil {
+		return nil, err
+	}
+
+	endpoints := assembleEndpoints(cfg, discovered)
+	models := modelEntries(endpoints, discovered)
+	stats := catalogStatsFrom(reports, models)
+
 	upstreamClient, err := upstream.New(upstream.Options{
 		HTTPClient: upstreamHTTP,
 		Headers:    credentials,
@@ -131,7 +183,7 @@ func Assemble(cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
 		return nil, fmt.Errorf("构造上游客户端失败：%w", err)
 	}
 
-	forwarder, err := pipeline.New(forwarderOptions(routesByModel(cfg), lookup, upstreamClient, logger))
+	forwarder, err := pipeline.New(forwarderOptions(routesByModel(endpoints), lookup, upstreamClient, logger))
 	if err != nil {
 		return nil, fmt.Errorf("构造转发流水线失败：%w", err)
 	}
@@ -149,10 +201,13 @@ func Assemble(cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
 	}
 
 	return &Assembly{
-		Config:  cfg,
-		Logger:  logger,
-		Handler: newDataPlane(forward, cfg, resolve),
-		clients: []*http.Client{upstreamHTTP},
+		Config:      cfg,
+		Logger:      logger,
+		Handler:     newDataPlane(forward, cfg, resolve, models),
+		Models:      models,
+		Discoveries: reports,
+		Stats:       stats,
+		clients:     []*http.Client{upstreamHTTP},
 	}, nil
 }
 
@@ -162,11 +217,19 @@ const healthzPath = "/healthz"
 // newDataPlane 造数据面的 HTTP 处理器。
 //
 // 转发入口挂在根路径上，由它自己按固定映射判定路径是否受支持，并给出协议化的 404；
-// 健康检查另挂一条，不经鉴权也不经转发——探活只关心进程是否在线，让它依赖客户端凭据
+// 模型清单另挂一条精确路径，同样过鉴权，不带凭据时按协议形状回 401；
+// 健康检查也另挂一条，不经鉴权也不经转发——探活只关心进程是否在线，让它依赖客户端凭据
 // 会让编排系统在上游或凭据出问题时，重启一个本身健康的网关。
-func newDataPlane(forward http.Handler, cfg *config.Config, resolve transport.AdapterResolver) http.Handler {
+func newDataPlane(
+	forward http.Handler,
+	cfg *config.Config,
+	resolve transport.AdapterResolver,
+	models []ModelEntry,
+) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(healthzPath, healthz)
+	// 精确路径优先于 "/"：模型清单因此不会落到转发入口上被当成未注册路径。
+	mux.Handle(modelsPath, authorize(newModelsHandler(models), cfg.ClientKeys, resolve))
 	mux.Handle("/", authorize(forward, cfg.ClientKeys, resolve))
 	return mux
 }

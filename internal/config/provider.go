@@ -105,8 +105,9 @@ func (p *parser) applyProviderLine(
 	if !contains(providerDirectives, head.text) {
 		return p.unknownDirective(head, providerDirectives)
 	}
-	// model 可以写多次，其余指令在同一个作用域里只能出现一次。
-	if head.text != directiveModel {
+	// model 、allow / deny 与 expose 可以写多次，其余指令在同一个作用域里只能出现一次。
+	if head.text != directiveModel && head.text != directiveAllow &&
+		head.text != directiveDeny && head.text != directiveExpose {
 		if err := p.rejectRepeat(head); err != nil {
 			return err
 		}
@@ -174,7 +175,8 @@ func (p *parser) parseEndpointBlock(child childBlock) (Endpoint, error) {
 		if !contains(endpointDirectives, tk.text) {
 			return Endpoint{}, p.unknownDirective(tk, endpointDirectives)
 		}
-		if tk.text != directiveModel {
+		if tk.text != directiveModel && tk.text != directiveAllow &&
+			tk.text != directiveDeny && tk.text != directiveExpose {
 			if err := p.rejectRepeat(tk); err != nil {
 				return Endpoint{}, err
 			}
@@ -234,6 +236,18 @@ func (p *parser) applyEndpointLine(ln line, endpoint *Endpoint) error {
 	case directiveModel:
 		return p.appendModel(ln, endpoint)
 
+	case directiveDiscover:
+		return p.appendDiscover(ln, endpoint)
+
+	case directiveAllow:
+		return p.appendPattern(ln, endpoint, false)
+
+	case directiveDeny:
+		return p.appendPattern(ln, endpoint, true)
+
+	case directiveExpose:
+		return p.appendAlias(ln, endpoint)
+
 	default:
 		return p.unknownDirective(head, endpointDirectives)
 	}
@@ -277,7 +291,233 @@ func (p *parser) appendModel(ln line, endpoint *Endpoint) error {
 				"同一个端点里再写一次没有可区分的含义", name)
 	}
 	endpoint.Models = append(endpoint.Models, Model{Name: name, Upstream: upstream})
+	p.warnWildcardModel(ln, name, upstream)
 	return nil
+}
+
+// warnWildcardModel 在 model 的名字里出现通配符时记一条提醒。
+//
+// model 的两个记号都按字面量使用：`model sensenova/* *` 表示「对外名就叫 sensenova/*、
+// 发往上游时写 *」，不是模式匹配。想按模式筛上游清单的是 allow / deny，两者容易搞混，
+// 而混错的后果是一个永远不会被客户端请求到的对外名，加上一个上游看不懂的上游名。
+//
+// 只提醒不报错：含 * 或 ? 的名字仍是合法的对外名，拦截它会让「上游真有一个这种名字」
+// 这种罕见情形变得无法表达。
+func (p *parser) warnWildcardModel(ln line, name, upstream string) {
+	offending := ""
+	switch {
+	case strings.ContainsAny(name, "*?"):
+		offending = fmt.Sprintf("对外名 %q", name)
+	case strings.ContainsAny(upstream, "*?"):
+		offending = fmt.Sprintf("上游名 %q", upstream)
+	default:
+		return
+	}
+	p.cfg.Warnings = append(p.cfg.Warnings, Warning{
+		File: ln.file,
+		Line: ln.no,
+		Msg: fmt.Sprintf("%s 含通配符，但 model 的两个记号都按字面量使用、不做通配匹配；"+
+			"要按模式筛选上游清单请用 discover 下的 allow / deny", offending),
+	})
+}
+
+// appendDiscover 解析 discover 指令。
+//
+// 它接受 0 或 1 个取值：省略地址时清单地址由端点 url 推导（见 deriveListingURL），
+// 写了地址则用它。两种形态表达的是同一件事——「这条端点的模型来自上游清单」——
+// 差异只在地址从哪来，因此收在同一条指令里而不是拆成两条。
+func (p *parser) appendDiscover(ln line, endpoint *Endpoint) error {
+	head := ln.tokens[0]
+	if len(ln.tokens) > 2 {
+		extra := ln.tokens[2]
+		return errorf(ln.file, extra.line, extra.col,
+			"%s 至多接受一个取值（清单接口地址），多出来的是 %q",
+			directiveDiscover, extra.text)
+	}
+
+	spec := discoverOf(endpoint, head)
+	spec.Declared = true
+	spec.File = ln.file
+	spec.Line = ln.no
+	spec.Col = head.col
+	if len(ln.tokens) == 1 {
+		return nil
+	}
+
+	value, err := p.expand(ln.tokens[1], ln)
+	if err != nil {
+		return err
+	}
+	if err := checkHTTPURL(value); err != nil {
+		return errorf(ln.file, ln.tokens[1].line, ln.tokens[1].col,
+			"清单地址 %q %s", value, err)
+	}
+	spec.URL = value
+	return nil
+}
+
+// appendPattern 追加一条过滤模式。
+//
+// allow 与 deny 共用本函数：两者的语法与校验完全一致，差异只在写进哪一张列表，
+// 因此不需要为「本来就能给同一张列表加一项」写两遍。
+func (p *parser) appendPattern(ln line, endpoint *Endpoint, deny bool) error {
+	spec := discoverOf(endpoint, ln.tokens[0])
+	return p.setValue(ln, func(v token) error {
+		value, err := p.expand(v, ln)
+		if err != nil {
+			return err
+		}
+		if err := checkPattern(value); err != nil {
+			return errorf(ln.file, v.line, v.col, "%s", err)
+		}
+		if deny {
+			spec.Deny = append(spec.Deny, value)
+		} else {
+			spec.Allow = append(spec.Allow, value)
+		}
+		return nil
+	})
+}
+
+// appendAlias 解析 expose 指令：`expose <上游模式> <对外名模式>`。
+//
+// 两个取值缺一不可：只写一个模式表达不出「改成什么」，而猜一个（例如把捕获值原样保留）
+// 会让一个只想写过滤规则的人得到一条静默的改名规则。
+func (p *parser) appendAlias(ln line, endpoint *Endpoint) error {
+	head := ln.tokens[0]
+	switch {
+	case len(ln.tokens) < 3:
+		return errorf(ln.file, head.line, valueColumn(head),
+			"%s 需要两个取值（形如 expose * sensenova/*）", directiveExpose)
+	case len(ln.tokens) > 3:
+		extra := ln.tokens[3]
+		return errorf(ln.file, extra.line, extra.col,
+			"%s 至多接受两个取值（上游模式与对外名模式），多出来的是 %q",
+			directiveExpose, extra.text)
+	}
+
+	from, err := p.expand(ln.tokens[1], ln)
+	if err != nil {
+		return err
+	}
+	to, err := p.expand(ln.tokens[2], ln)
+	if err != nil {
+		return err
+	}
+	if err := checkExposeFrom(from); err != nil {
+		return errorf(ln.file, ln.tokens[1].line, ln.tokens[1].col, "%s", err)
+	}
+	if err := checkExposeTo(to); err != nil {
+		return errorf(ln.file, ln.tokens[2].line, ln.tokens[2].col, "%s", err)
+	}
+
+	spec := discoverOf(endpoint, head)
+	spec.Expose = append(spec.Expose, Alias{
+		From: from,
+		To:   to,
+		File: ln.file,
+		Line: ln.no,
+		Col:  ln.tokens[1].col,
+	})
+	return nil
+}
+
+// checkExposeFrom 校验上游模式：恰一个 `*` 作捕获，不收 `?`。
+func checkExposeFrom(pattern string) error {
+	if err := checkPattern(pattern); err != nil {
+		return err
+	}
+	if strings.Contains(pattern, "?") {
+		return fmt.Errorf("上游模式 %q 不收 ?：改名要捕获一段原文，与「匹配一个字符」混用时"+
+			"「捕获得哪一段」没有确定答案", pattern)
+	}
+	if strings.Count(pattern, "*") != 1 {
+		return fmt.Errorf("上游模式 %q 必须含恰好一个 *（它决定捕获哪一段）", pattern)
+	}
+	return nil
+}
+
+// checkExposeTo 校验对外名模式：至多一个 `*`，不收 `?`。
+func checkExposeTo(pattern string) error {
+	if err := checkPattern(pattern); err != nil {
+		return err
+	}
+	if strings.Contains(pattern, "?") {
+		return fmt.Errorf("对外名模式 %q 不收 ?：捕获值只由 * 填充", pattern)
+	}
+	if strings.Count(pattern, "*") > 1 {
+		return fmt.Errorf("对外名模式 %q 至多含一个 *", pattern)
+	}
+	return nil
+}
+
+// discoverOf 取端点的发现描述，没有就建一个占位。
+//
+// allow / deny 可能先于 discover 出现，因此占位记录的是当前第一条相关指令的位置；
+// discover 后来出现时会把位置改成它自己那一行。占位只在「一直没有 discover」时
+// 被当成错误对象，那时第一个位置就是报错该指的地方。
+func discoverOf(endpoint *Endpoint, head token) *Discover {
+	if endpoint.Discover == nil {
+		endpoint.Discover = &Discover{File: head.file, Line: head.line, Col: head.col}
+	}
+	return endpoint.Discover
+}
+
+// checkPattern 校验一条过滤模式。
+//
+// 只拒空模式与含空白的模式：模型 id 里既不会有空串也不会有空白，这两种模式匹配不到
+// 任何东西，写下来只会在「为什么这个模型不在清单里」上耗掉一轮排查。
+func checkPattern(value string) error {
+	switch {
+	case value == "":
+		return fmt.Errorf("过滤模式不能为空")
+	case strings.ContainsAny(value, " \t"):
+		return fmt.Errorf("过滤模式 %q 不能含空白", value)
+	}
+	return nil
+}
+
+// checkHTTPURL 报告一个地址是不是带主机名的 http(s) 地址。
+func checkHTTPURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return fmt.Errorf("不是带主机名的 http(s) 地址")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("只支持 http 与 https")
+	}
+	return nil
+}
+
+// listingSegment 是清单接口路径的末段。
+//
+// 三种线协议的清单接口都用它，因此推导规则只有一条：裁掉协议端点段，拼上这个末段。
+const listingSegment = "/models"
+
+// deriveListingURL 从端点地址推导清单地址：按协议端点段裁掉尾段，再拼 /models。
+//
+// 版本根原样保留，因此 /v1、/api/coding/paas/v4、/api/v3 走的是同一条规则；
+// query 与 fragment 丢弃，清单接口不接受端点级参数。裁的判据与协议推导共用
+// domain.Protocol.EndpointSegment，两处不会各认一套。
+//
+// 拿不准时返回 false，由调用方报「请显式写 discover <地址>」，不猜一个地址。
+func deriveListingURL(endpointURL string, protocol domain.Protocol) (string, bool) {
+	segment := protocol.EndpointSegment()
+	if segment == "" {
+		return "", false
+	}
+	parsed, err := url.Parse(endpointURL)
+	if err != nil || parsed.Host == "" || parsed.Scheme == "" {
+		return "", false
+	}
+	trimmed := strings.TrimSuffix(parsed.Path, "/")
+	if !strings.HasSuffix(trimmed, segment) {
+		return "", false
+	}
+	parsed.Path = strings.TrimSuffix(trimmed, segment) + listingSegment
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), true
 }
 
 // finishProvider 校验一条渠道，并在协议省略时从地址把它推出来。
@@ -335,12 +575,52 @@ func (p *parser) finishEndpoint(provider *Provider, endpoint *Endpoint) error {
 			where, endpoint.Protocol, endpoint.URL, derived)
 	}
 
-	if len(endpoint.Models) == 0 {
-		return fail("%s 没有声明任何 model；端点没有对外模型名就没有选路依据", where)
+	if err := p.finishDiscovery(provider, endpoint); err != nil {
+		return err
+	}
+	if len(endpoint.Models) == 0 && endpoint.Discover == nil {
+		return fail("%s 没有声明任何 model；端点没有对外模型名就没有选路依据；"+
+			"模型由上游清单决定时写一行 discover", where)
 	}
 	if endpoint.Timeout <= 0 {
 		endpoint.Timeout = defaultTimeout
 	}
+	return nil
+}
+
+// finishDiscovery 校验端点的模型发现描述，并在省略地址时把清单地址推导出来。
+func (p *parser) finishDiscovery(provider *Provider, endpoint *Endpoint) error {
+	spec := endpoint.Discover
+	if spec == nil {
+		return nil
+	}
+	where := endpointWhere(provider, endpoint)
+	if !spec.Declared {
+		return errorf(spec.File, spec.Line, spec.Col,
+			"%s 写了 allow / deny / expose 却没有 discover：这些规则要有一条 discover 才有作用对象",
+			where)
+	}
+	// 一条过滤规则都不写的端点会把上游清单里的模型全数暴露给客户端。
+	// 这不是错误（“上游有什么就用什么”是合理用法），但它是“准入集合完全由上游决定”，
+	// 值得在启动时说一句。
+	if len(spec.Allow) == 0 && len(spec.Deny) == 0 {
+		p.cfg.Warnings = append(p.cfg.Warnings, Warning{
+			File: spec.File,
+			Line: spec.Line,
+			Msg: fmt.Sprintf("%s 声明了 discover 但没有 allow / deny：清单里的模型会全部暴露给客户端",
+				where),
+		})
+	}
+	if spec.URL != "" {
+		return nil
+	}
+	derived, ok := deriveListingURL(endpoint.URL, endpoint.Protocol)
+	if !ok {
+		return errorf(endpoint.File, endpoint.Line, endpoint.Col,
+			"%s 的地址 %q 推不出清单地址；请显式写 discover <清单地址>", where, endpoint.URL)
+	}
+	spec.URL = derived
+	spec.Derived = true
 	return nil
 }
 

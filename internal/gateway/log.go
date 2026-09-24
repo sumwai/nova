@@ -209,11 +209,43 @@ func (l *logger) now() time.Time {
 }
 
 // startup 打出这份配置生效的事实，reloaded 只影响措辞。
-func (l *logger) startup(cfg *config.Config, reloaded bool) {
+//
+// stats 是本次装配的目录事实：发现结果属于「这个进程在用哪份配置跑」这一回答，
+// 与渠道数、对外模型数一起出现在横幅里。
+func (l *logger) startup(cfg *config.Config, stats catalogStats, reloaded bool) {
 	if l == nil {
 		return
 	}
-	l.writeAlways(slog.LevelInfo, renderStartup(cfg, reloaded), startupPayload(cfg, reloaded))
+	l.writeAlways(slog.LevelInfo,
+		renderStartup(cfg, stats, reloaded),
+		startupPayload(cfg, stats, reloaded))
+}
+
+// discovery 记一条端点的发现结果。
+//
+// 成功记 info，失败记 error：发现失败的后果是这条端点少了（或完全没有）可路由的模型，
+// 不属于提示级别的事。清单自述还有下一页时另加一句，因为缺失的模型在客户端看来就是不存在。
+func (l *logger) discovery(rec DiscoveryReport) {
+	if l == nil {
+		return
+	}
+	l.write(discoveryLevel(rec), renderDiscovery(clockAt(l.now()), rec, l.color), discoveryPayload(rec))
+}
+
+// discoveryLevel 是发现记录的级别。
+//
+// 失败记 error：后果是这条端点少了（或完全没有）可路由的模型。
+// 成功但清单自述还有下一页时记 warn：缺失的模型在客户端看来就是不存在，
+// 而成功本身的结论不需要占一个 warn，两者因此分得开。
+func discoveryLevel(rec DiscoveryReport) slog.Level {
+	switch {
+	case rec.Err != nil:
+		return slog.LevelError
+	case rec.HasMore:
+		return slog.LevelWarn
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // warning 打出一条配置提醒。

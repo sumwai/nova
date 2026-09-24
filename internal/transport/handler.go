@@ -90,9 +90,12 @@ type AccessLogger interface {
 	LogAccess(record AccessRecord)
 }
 
-// AdapterResolver 按请求路径返回客户端适配器。装配层把路径到适配器的映射注入这里，
+// AdapterResolver 按请求返回客户端适配器。装配层把请求到适配器的映射注入这里，
 // 使本包不出现任何协议字面量。
-type AdapterResolver func(path string) (domain.Adapter, bool)
+//
+// 入参是请求而不是路径：三个转发路径的协议只由路径决定，但模型清单（GET /v1/models）
+// 在 OpenAI 与 Anthropic 下是同一条路径、两种响应形状，判据在请求头上。
+type AdapterResolver func(r *http.Request) (domain.Adapter, bool)
 
 // Options 是构造 Handler 的依赖与默认值。
 type Options struct {
@@ -160,7 +163,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.observeRequest(rec, start, state)
 	}()
 
-	adapter, ok := h.adapters(r.URL.Path)
+	adapter, ok := h.adapters(r)
 	if !ok || adapter == nil {
 		// 未注册路径没有可归的协议，适配器无法编码错误体，只能回标准库的纯文本 404；
 		// 已注册路径的其它错误一律经适配器编码。
