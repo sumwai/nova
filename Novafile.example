@@ -80,9 +80,11 @@ provider openai {
     api_key {env.OPENAI_API_KEY}
 
     # 上游线协议。省略时从 url 末段推导：
-    #   /chat/completions → openai_chat
-    #   /responses        → openai_responses
-    #   /messages         → anthropic_messages
+    #   /chat/completions      → openai_chat
+    #   /responses             → openai_responses
+    #   /messages              → anthropic_messages
+    #   :generateContent       → gemini
+    #   :streamGenerateContent → gemini
     # 写了就必须与推导结果一致，不一致会指回这一行报错——地址与协议各说各话时，
     # 网关按哪种格式与上游通信就成了一个没有正确答案的问题。
     protocol openai_chat
@@ -117,6 +119,31 @@ provider relay {
         model claude-sonnet-4 claude-sonnet-4-20250514
     }
 }
+
+# Gemini 渠道。
+# Gemini 把模型名与动作（是否流式）都写在请求路径上：
+#   /v1beta/models/{model}:generateContent
+#   /v1beta/models/{model}:streamGenerateContent?alt=sse
+# 请求体里没有这两项，因此 url 用 {model} 指代本次请求的模型名，并且必须加引号——
+# 不加引号时 { 会被词法器当成块开启，取值被切成多段。
+# 网关按本次请求是否流式改写地址末段（generateContent 与 streamGenerateContent 互换，
+# 流式另加 alt=sse），凭据以 x-goog-api-key 注入。
+#
+# 本版不支持在 Gemini 端点上写 discover：清单响应的形状与 OpenAI / Anthropic 不同，
+# 且地址里带占位符、推不出清单地址；模型用 model 逐条声明。
+#
+# provider gemini {
+#     api_key {env.GEMINI_API_KEY}
+#
+#     url "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+#     model gemini-2.5-flash
+#     model gemini-2.5-pro
+# }
+#
+# Gemini 也可以作为客户端协议：
+#   POST /v1beta/models/<模型>:generateContent
+#   POST /v1beta/models/<模型>:streamGenerateContent
+# 模型名取 models/ 前缀之后的部分，与其它协议一样按对外名选路。
 
 # 只想要具名端点、不想要默认端点时，provider 一级什么端点指令都不写：
 #

@@ -6,6 +6,24 @@
 
 ## Unreleased
 
+**Gemini 协议**
+
+- 新增线协议 `gemini`（Google Generative Language `generateContent`）：可作为上游渠道，
+  也可作为客户端协议。端点地址用 `{model}` 指代模型名（要加引号，否则 `{` 会被当成块开启），
+  网关按本次请求是否流式把末段在 `:generateContent` 与 `:streamGenerateContent?alt=sse`
+  之间互换，凭据以 `x-goog-api-key` 注入。客户端路径为
+  `/v1beta/models/<模型>:generateContent` 与 `:streamGenerateContent`，`models/` 前缀之后作为对外名。
+- 协议转换覆盖 system 提示上提（`systemInstruction`）、`model` 角色、`functionCall` /
+  `functionResponse` 片段、`inlineData` / `fileData` 图片、`toolConfig.functionCallingConfig`
+  的 AUTO / ANY / NONE 映射，以及 `thought` 推理片段与 `usageMetadata` 的两侧口径换算；
+  函数参数的 JSON Schema 按 Gemini 的 OpenAPI 子集裁剪（丢掉 `additionalProperties`、`$schema`
+  一类上游会拒的字段），流式工具调用的 `partialArgs` 按 JSONPath 拼回完整参数。
+- 上游地址可由适配器按本次请求构造：新增可选能力 `domain.UpstreamURLBuilder`，
+  模型名与动作不在请求体里的协议（Gemini）因此不必把地址写成动态模板。
+- 入口层新增可选能力 `domain.RequestBinder`：路径携带模型名与流式标记的协议在解码前
+  把路径事实绑定到请求级副本上，单例适配器不被写入。
+- Gemini 端点不支持 `discover`：清单响应形状不同，且带占位符的地址推不出清单地址。
+
 **跨渠道分摊与回退**
 
 - 新增顶层 `route <对外名模式> { ... }` 块与块内的 `provider` / `fallback`：

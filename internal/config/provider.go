@@ -550,7 +550,7 @@ func checkHTTPURL(raw string) error {
 
 // listingSegment 是清单接口路径的末段。
 //
-// 三种线协议的清单接口都用它，因此推导规则只有一条：裁掉协议端点段，拼上这个末段。
+// 清单接口的末段都是它，因此推导规则只有一条：裁掉协议端点段，拼上这个末段。
 const listingSegment = "/models"
 
 // deriveListingURL 从端点地址推导清单地址：按协议端点段裁掉尾段，再拼 /models。
@@ -563,6 +563,11 @@ const listingSegment = "/models"
 func deriveListingURL(endpointURL string, protocol domain.Protocol) (string, bool) {
 	segment := protocol.EndpointSegment()
 	if segment == "" {
+		return "", false
+	}
+	// 带模型名占位符的地址是模板，不是一条确定的端点地址：按它推导出的清单地址里
+	// 会留着占位符，直接请求必然 404。这类端点必须显式写 discover <地址>。
+	if strings.Contains(endpointURL, modelPlaceholder) {
 		return "", false
 	}
 	parsed, err := url.Parse(endpointURL)
@@ -668,6 +673,12 @@ func (p *parser) finishEndpoint(provider *Provider, endpoint *Endpoint) error {
 			where, endpoint.Protocol, endpoint.URL, derived)
 	}
 
+	if endpoint.Protocol == domain.ProtocolGemini {
+		if err := p.finishGeminiEndpoint(provider, endpoint); err != nil {
+			return err
+		}
+	}
+
 	if err := p.finishDiscovery(provider, endpoint); err != nil {
 		return err
 	}
@@ -714,6 +725,34 @@ func (p *parser) finishDiscovery(provider *Provider, endpoint *Endpoint) error {
 	}
 	spec.URL = derived
 	spec.Derived = true
+	return nil
+}
+
+// modelPlaceholder 是 Gemini 端点地址里必须出现的模型名占位符。
+//
+// 写成取值位置上的字面记号而不是另加一条配置指令：模型名是选路的产物（一条端点下
+// 可以有多个 model），地址是端点级事实，两者只能靠一处占位符在发送前合到一起。
+const modelPlaceholder = "{model}"
+
+// finishGeminiEndpoint 校验 Gemini 端点地址的两项特殊要求。
+//
+// 它拦的两件事都会在运行期变成「发出去的地址不对」：没有占位符时所有模型都打到同一个
+// 模型上；断言清单形状又推不出清单地址时，端点要么装配失败要么拿回一份看不懂的清单。
+// 在这里报出比让上游回一个 404 更容易定位。
+func (p *parser) finishGeminiEndpoint(provider *Provider, endpoint *Endpoint) error {
+	where := endpointWhere(provider, endpoint)
+	if endpoint.Discover != nil {
+		return errorf(endpoint.File, endpoint.Line, endpoint.Col,
+			"%s 是 gemini 端点，本版不支持 discover：Gemini 的清单响应形状（models 数组）"+
+				"与 OpenAI / Anthropic 不同，且端点地址带模型名占位符、推不出清单地址；"+
+				"请用 model 逐条声明（需要过滤时先列举可用 id）", where)
+	}
+	if !strings.Contains(endpoint.URL, modelPlaceholder) {
+		return errorf(endpoint.File, endpoint.Line, endpoint.Col,
+			"%s 是 gemini 端点，地址里必须用 %s 指代本次请求的模型名："+
+				"Gemini 把模型名与动作都写在路径上，请求体里没有这两项，缺失时会把所有模型都发到同一个模型上",
+			where, modelPlaceholder)
+	}
 	return nil
 }
 
@@ -791,9 +830,10 @@ func endpointWhere(provider *Provider, endpoint *Endpoint) string {
 func protocolForURLPath(path string) (domain.Protocol, bool) {
 	trimmed := strings.TrimSuffix(path, "/")
 	for _, protocol := range allProtocols() {
-		segment := protocol.EndpointSegment()
-		if segment != "" && strings.HasSuffix(trimmed, segment) {
-			return protocol, true
+		for _, segment := range protocol.EndpointSegments() {
+			if segment != "" && strings.HasSuffix(trimmed, segment) {
+				return protocol, true
+			}
 		}
 	}
 	return "", false
@@ -801,9 +841,9 @@ func protocolForURLPath(path string) (domain.Protocol, bool) {
 
 // protocolSegments 列出能被识别成协议的地址末段，用于报错文案。
 func protocolSegments() []string {
-	out := make([]string, 0, len(allProtocols()))
+	var out []string
 	for _, protocol := range allProtocols() {
-		out = append(out, protocol.EndpointSegment())
+		out = append(out, protocol.EndpointSegments()...)
 	}
 	return out
 }
@@ -826,6 +866,7 @@ func allProtocols() []domain.Protocol {
 		domain.ProtocolOpenAIChat,
 		domain.ProtocolOpenAIResponses,
 		domain.ProtocolAnthropicMessages,
+		domain.ProtocolGemini,
 	}
 }
 

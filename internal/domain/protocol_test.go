@@ -14,6 +14,8 @@ func TestProtocolEndpointPath(t *testing.T) {
 		ProtocolOpenAIChat:        "/v1/chat/completions",
 		ProtocolOpenAIResponses:   "/v1/responses",
 		ProtocolAnthropicMessages: "/v1/messages",
+		// Gemini 的端点路径带模型名占位符，是模板而不是可直接比较的字面量。
+		ProtocolGemini: "/v1beta/models/{model}:generateContent",
 		// 未登记协议没有端点：调用方据此判定该协议不可路由。
 		Protocol("unknown_protocol"): "",
 	}
@@ -30,6 +32,9 @@ func TestProtocolEndpointPath(t *testing.T) {
 // （各供应商把版本写在路径的哪一段并不一致）。两条事实分别写在一处 switch 里，
 // 只改其中一处会让比对与对外端点悄悄分叉：装配期据此校验配置，分叉后会误拒合法地址
 // 或放过漏写端点路径的地址。这里用拼接关系把两者钉在一起，改一处漏改另一处即失败。
+//
+// Gemini 不在这条关系里：它的版本根是 /v1beta、端点路径里还带模型名占位符，
+// 只对它的两个端点段单独断言。
 func TestProtocolEndpointSegmentMatchesEndpointPath(t *testing.T) {
 	for _, protocol := range []Protocol{
 		ProtocolOpenAIChat,
@@ -41,6 +46,13 @@ func TestProtocolEndpointSegmentMatchesEndpointPath(t *testing.T) {
 			t.Errorf("%q.EndpointPath() = %q，期望 \"/v1\" 与端点段 %q 的拼接 %q",
 				string(protocol), got, protocol.EndpointSegment(), want)
 		}
+	}
+	segments := ProtocolGemini.EndpointSegments()
+	if len(segments) != 2 || segments[0] != ":generateContent" || segments[1] != ":streamGenerateContent" {
+		t.Errorf("Gemini 端点段 = %v，期望两个动作段", segments)
+	}
+	if got := ProtocolGemini.EndpointSegment(); got != segments[0] {
+		t.Errorf("EndpointSegment 应取首项，实际 %q", got)
 	}
 }
 
@@ -71,6 +83,17 @@ func TestProtocolForEndpointPath(t *testing.T) {
 			name: "anthropic_messages 的端点段",
 			path: "/v1/messages",
 			want: ProtocolAnthropicMessages, ok: true,
+		},
+		{
+			// Gemini 的地址里带着模型名，因此判据是动作段而不是整段。
+			name: "gemini 非流式动作段",
+			path: "/v1beta/models/gemini-2.5-flash:generateContent",
+			want: ProtocolGemini, ok: true,
+		},
+		{
+			name: "gemini 流式动作段",
+			path: "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+			want: ProtocolGemini, ok: true,
 		},
 		{
 			// 版本根写在路径的哪一段由供应商自定，智谱的 OpenAI 兼容端点就是 /api/coding/paas/v4。
@@ -114,21 +137,25 @@ func TestProtocolEndpointSegmentsArePairwiseNotSuffix(t *testing.T) {
 		ProtocolOpenAIChat,
 		ProtocolOpenAIResponses,
 		ProtocolAnthropicMessages,
+		ProtocolGemini,
 	}
 	for _, outer := range protocols {
 		for _, inner := range protocols {
 			if outer == inner {
 				continue
 			}
-			segment, other := outer.EndpointSegment(), inner.EndpointSegment()
-			// 空的端点段对任何路径都是后缀，它是「协议没登记」的形态，同样不该在这里出现。
-			if segment == "" {
-				t.Errorf("%q 没有端点段，无法参与唯一命中的推导", string(outer))
-				continue
-			}
-			if strings.HasSuffix(segment, other) {
-				t.Errorf("端点段 %q 以 %q 结尾：%q 的地址会同时命中两个协议，唯一的协议推导不再成立",
-					segment, other, string(outer))
+			for _, segment := range outer.EndpointSegments() {
+				// 空的端点段对任何路径都是后缀，它是「协议没登记」的形态，同样不该在这里出现。
+				if segment == "" {
+					t.Errorf("%q 没有端点段，无法参与唯一命中的推导", string(outer))
+					continue
+				}
+				for _, other := range inner.EndpointSegments() {
+					if strings.HasSuffix(segment, other) {
+						t.Errorf("端点段 %q 以 %q 结尾：%q 的地址会同时命中两个协议，唯一的协议推导不再成立",
+							segment, other, string(outer))
+					}
+				}
 			}
 		}
 	}

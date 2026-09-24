@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/sumwai/nova/internal/adapters/anthropic"
+	"github.com/sumwai/nova/internal/adapters/gemini"
 	"github.com/sumwai/nova/internal/adapters/openaichat"
 	"github.com/sumwai/nova/internal/adapters/openairesponses"
 	"github.com/sumwai/nova/internal/catalog"
@@ -20,20 +21,22 @@ import (
 )
 
 // 本文件是 config 包与各转发包之间唯一的接缝：provider / endpoint / model 在这里被
-// 翻译成 domain.Route，凭据在这里建表，三个协议适配器在这里成单例。各转发包因此都
+// 翻译成 domain.Route，凭据在这里建表，各协议适配器在这里成单例。各转发包因此都
 // 不认识 config 包，配置里的指令名也不会渗进转发逻辑。
 
-// clientProtocols 是网关对外暴露的三种客户端协议，顺序即路径判定顺序。
+// clientProtocols 是网关对外暴露的客户端协议，顺序即路径判定顺序。
 //
 // 只保留这一份清单：客户端路径、客户端适配器与协议名都由它派生，
-// 多写一处就会在将来加协议时漏改一处。
+// 多写一处就会在将来加协议时漏改一处。Gemini 的优先级与其它协议无关，
+// 但它的路径不是定长字面量，识别方式不同（见 protocolForPath）。
 var clientProtocols = []domain.Protocol{
 	domain.ProtocolOpenAIChat,
 	domain.ProtocolOpenAIResponses,
 	domain.ProtocolAnthropicMessages,
+	domain.ProtocolGemini,
 }
 
-// newAdapters 为三种协议各建一个适配器单例。
+// newAdapters 为各协议各建一个适配器单例。
 //
 // 适配器内部不持有跨请求的业务状态（流式状态由 NewStream 派生），因此可按协议共享；
 // 每个请求重新构造一遍只是白花的分配。
@@ -42,6 +45,7 @@ func newAdapters() map[domain.Protocol]domain.Adapter {
 		domain.ProtocolOpenAIChat:        openaichat.New(),
 		domain.ProtocolOpenAIResponses:   openairesponses.New(),
 		domain.ProtocolAnthropicMessages: anthropic.New(),
+		domain.ProtocolGemini:            gemini.New(),
 	}
 }
 
@@ -49,11 +53,17 @@ func newAdapters() map[domain.Protocol]domain.Adapter {
 //
 // 第二个返回值报告这个路径是否受支持。未注册路径返回 false，由入口层按 404 处理，
 // 而不是当成某种缺省协议：猜错协议会给出一个格式对不上、原因却看不出来的错误体。
+//
+// Gemini 是唯一例外：它的端点路径把模型名与动作写在路径上，EndpointPath 是模板而不是
+// 字面量，等值比较对它恒不成立，因此改由适配器自己的路径解析识别。
 func protocolForPath(path string) (domain.Protocol, bool) {
 	for _, protocol := range clientProtocols {
 		if protocol.EndpointPath() == path {
 			return protocol, true
 		}
+	}
+	if _, _, ok := gemini.MatchRequestPath(path); ok {
+		return domain.ProtocolGemini, true
 	}
 	return "", false
 }
@@ -62,6 +72,9 @@ func protocolForPath(path string) (domain.Protocol, bool) {
 //
 // 协议在转发路径上由路径决定，在模型清单上由请求头决定，两者都在这里回答；
 // 清单路径因此不需要在入口层另挂一个只为了编码错误的适配器查找。
+//
+// 路径本身携带协议参数的协议（Gemini）在这里把模型名与流式标记绑定到请求级副本上：
+// 绑定后的副本只服务本次请求，单例不被修改。
 func adapterResolver(adapters map[domain.Protocol]domain.Adapter) transport.AdapterResolver {
 	return func(r *http.Request) (domain.Adapter, bool) {
 		protocol, ok := protocolForRequest(r)
@@ -69,7 +82,13 @@ func adapterResolver(adapters map[domain.Protocol]domain.Adapter) transport.Adap
 			return nil, false
 		}
 		adapter, exists := adapters[protocol]
-		return adapter, exists
+		if !exists || adapter == nil {
+			return nil, false
+		}
+		if binder, ok := adapter.(domain.RequestBinder); ok {
+			adapter = binder.BindRequest(r.URL.Path, r.URL.Query())
+		}
+		return adapter, true
 	}
 }
 

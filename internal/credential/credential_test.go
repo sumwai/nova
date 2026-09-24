@@ -116,6 +116,12 @@ func TestUpstreamHeadersProtocolDrivesHeaderStyle(t *testing.T) {
 			wantVal:  apiKey,
 		},
 		{
+			name:     "gemini 走 x-goog-api-key",
+			protocol: domain.ProtocolGemini,
+			wantName: "x-goog-api-key",
+			wantVal:  apiKey,
+		},
+		{
 			name:       "未识别协议不注入任何头",
 			protocol:   domain.Protocol("gemini_generate"),
 			wantNoHead: true,
@@ -294,7 +300,7 @@ func TestUpstreamHeadersCredentialWinsOnConflict(t *testing.T) {
 func TestUpstreamHeadersUnsupportedProtocol(t *testing.T) {
 	provider := singleRef("ref", Credential{APIKey: "sk"})
 	headers, err := provider.UpstreamHeaders(context.Background(),
-		domain.Route{CredentialRef: "ref", Protocol: domain.Protocol("gemini")})
+		domain.Route{CredentialRef: "ref", Protocol: domain.Protocol("unsupported_protocol")})
 	if err == nil {
 		t.Fatal("不支持的协议应返回错误")
 	}

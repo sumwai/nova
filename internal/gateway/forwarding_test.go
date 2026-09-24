@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -19,11 +20,16 @@ func TestProtocolForPathMapsOnlyRegisteredPaths(t *testing.T) {
 		{path: "/v1/chat/completions", want: domain.ProtocolOpenAIChat, ok: true},
 		{path: "/v1/responses", want: domain.ProtocolOpenAIResponses, ok: true},
 		{path: "/v1/messages", want: domain.ProtocolAnthropicMessages, ok: true},
-		// 尾斜杠、子路径与「差不多的别的路径」都不算命中：网关只暴露约定的三个端点，
+		// Gemini 的路径带模型名与动作，由适配器的路径解析识别。
+		{path: "/v1beta/models/gemini-2.5-flash:generateContent", want: domain.ProtocolGemini, ok: true},
+		{path: "/v1beta/models/gemini-2.5-pro:streamGenerateContent", want: domain.ProtocolGemini, ok: true},
+		// 尾斜杠、子路径与「差不多的别的路径」都不算命中：网关只暴露约定的端点，
 		// 对「看起来像」的路径放行，会让一个拼错的 URL 直到转发那一步才暴露。
 		{path: "/v1/messages/"},
 		{path: "/v1/messages/extra"},
 		{path: "/v1/completions"},
+		{path: "/v1beta/models/gemini-2.5-flash:countTokens"},
+		{path: "/v1beta/models"},
 		{path: "/healthz"},
 	}
 	for _, tt := range tests {
@@ -33,6 +39,49 @@ func TestProtocolForPathMapsOnlyRegisteredPaths(t *testing.T) {
 				t.Errorf("protocolForPath(%q) = %q, %v；期望 %q, %v", tt.path, got, ok, tt.want, tt.ok)
 			}
 		})
+	}
+}
+
+// TestAdapterResolverBindsGeminiPathFacts 守护 Gemini 的模型名与流式标记从路径进入请求。
+//
+// 这两个事实不在请求体里，只能在入口层按路径绑定；绑定必须产出请求级副本，
+// 单例适配器不得被写入。
+func TestAdapterResolverBindsGeminiPathFacts(t *testing.T) {
+	resolve := adapterResolver(newAdapters())
+	req, err := http.NewRequest(http.MethodPost,
+		"http://gateway/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse", nil)
+	if err != nil {
+		t.Fatalf("构造请求失败：%v", err)
+	}
+	adapter, ok := resolve(req)
+	if !ok {
+		t.Fatal("Gemini 路径应能取到适配器")
+	}
+	if adapter.Protocol() != domain.ProtocolGemini {
+		t.Fatalf("协议 = %q", string(adapter.Protocol()))
+	}
+	decoded, err := adapter.DecodeRequest([]byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+	if err != nil {
+		t.Fatalf("解码请求失败：%v", err)
+	}
+	if decoded.Model != "gemini-2.5-flash" {
+		t.Errorf("模型 = %q，期望来自路径的 gemini-2.5-flash", decoded.Model)
+	}
+	if !decoded.Stream {
+		t.Error("流式动作应判为流式请求")
+	}
+
+	// 同一条路径再解析一次不受上一次绑定影响：单例没有被改写。
+	second, ok := resolve(req)
+	if !ok {
+		t.Fatal("第二次解析应仍然命中")
+	}
+	again, err := second.DecodeRequest([]byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+	if err != nil {
+		t.Fatalf("第二次解码失败：%v", err)
+	}
+	if again.Model != "gemini-2.5-flash" {
+		t.Errorf("第二次模型 = %q", again.Model)
 	}
 }
 

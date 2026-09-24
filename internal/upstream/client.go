@@ -190,6 +190,9 @@ func responseTooLargeError() *domain.Error {
 
 // newRequest 按渠道、适配器与定稿后的请求体构造上游请求。
 //
+// 请求地址默认取 route.BaseURL；适配器实现 domain.UpstreamURLBuilder 时改由它按本次
+// 是否流式与上游模型名构造（Gemini 的模型名与动作都在路径上，地址因此到发送前才定下）。
+//
 // 请求头合并顺序：
 //
 //  1. 先渠道级请求头（含凭据）
@@ -197,7 +200,15 @@ func responseTooLargeError() *domain.Error {
 //
 // Content-Type 与 Accept 由本包按响应形态设定，保证与 body 的实际形态一致。
 func (c *Client) newRequest(ctx context.Context, route domain.Route, adapter domain.Adapter, body []byte, stream bool) (*http.Request, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, route.BaseURL, bytes.NewReader(body))
+	target := route.BaseURL
+	if builder, ok := adapter.(domain.UpstreamURLBuilder); ok {
+		built, err := builder.UpstreamURL(route, stream)
+		if err != nil {
+			return nil, domain.NewError(domain.CodeInternal, "构造上游地址失败").WithCause(err)
+		}
+		target = built
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, domain.NewError(domain.CodeInternal, "构造上游请求失败").WithCause(err)
 	}

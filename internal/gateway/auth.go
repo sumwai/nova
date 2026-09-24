@@ -19,6 +19,12 @@ const bearerScheme = "Bearer "
 // 网关」之间做选择，而这两件事都不该由 nova 决定。
 const apiKeyHeader = "x-api-key"
 
+// googleAPIKeyHeader 是 Gemini 客户端提交凭据的请求头。
+//
+// 它的取值是裸密钥（没有 Bearer 方案名），与 x-api-key 同形；单列一个常量是因为
+// Gemini 的 SDK 只会发这一个头，不认它就是「Gemini 客户端连不进网关」。
+const googleAPIKeyHeader = "x-goog-api-key"
+
 // authorize 按配置里的 client_key 给数据面加上客户端鉴权。
 //
 // keys 为空时原样返回 next：不写 client_key 就是不鉴权。配置层已经为此在「绑到非回环
@@ -39,15 +45,18 @@ func authorize(next http.Handler, keys []string, resolve transport.AdapterResolv
 
 // presentedKey 取客户端提交的凭据，第二个返回值报告有没有提交。
 //
-// 两个头都看，Authorization 优先：它带着方案名，语义比裸的 x-api-key 明确。一个同时
-// 写了两个头、却只把其中一个写对的客户端，两种取法都会放行它；差异只出现在「两个都写
-// 且写的是不同 key」这种本就自相矛盾的请求上，此时无论选哪个都不比另一个更正确。
+// 三个头都看，Authorization 优先：它带着方案名，语义比裸密钥头明确。一个同时
+// 写了多个头、却只把其中一个写对的客户端，任一种取法都会放行它；差异只出现在
+// 「都写且写的是不同 key」这种本就自相矛盾的请求上，此时无论选哪个都不比另一个更正确。
 func presentedKey(r *http.Request) (string, bool) {
 	if value := r.Header.Get("Authorization"); len(value) > len(bearerScheme) &&
 		strings.EqualFold(value[:len(bearerScheme)], bearerScheme) {
 		return value[len(bearerScheme):], true
 	}
 	if value := r.Header.Get(apiKeyHeader); value != "" {
+		return value, true
+	}
+	if value := r.Header.Get(googleAPIKeyHeader); value != "" {
 		return value, true
 	}
 	return "", false
