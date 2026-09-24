@@ -44,8 +44,8 @@ func testConfig() *config.Config {
 	return &config.Config{
 		Providers: []config.Provider{
 			{
-				Name:   "primary",
-				APIKey: "primary-key",
+				Name:     "primary",
+				Accounts: []config.Account{{APIKey: "primary-key", Weight: 1, Index: 1}},
 				Endpoints: []config.Endpoint{{
 					URL:      "https://primary.example.com/v1/chat/completions",
 					Protocol: domain.ProtocolOpenAIChat,
@@ -54,8 +54,8 @@ func testConfig() *config.Config {
 				}},
 			},
 			{
-				Name:   "backup",
-				APIKey: "backup-key",
+				Name:     "backup",
+				Accounts: []config.Account{{APIKey: "backup-key", Weight: 1, Index: 1}},
 				Endpoints: []config.Endpoint{{
 					URL:      "https://backup.example.com/v1/messages",
 					Protocol: domain.ProtocolAnthropicMessages,
@@ -98,7 +98,8 @@ func TestRoutesByModelKeepsCandidateOrder(t *testing.T) {
 }
 
 func TestModelRouteResolverPrefersSameProtocol(t *testing.T) {
-	resolver := modelRouteResolver{routes: routesByModel(testEndpoints(testConfig()))}
+	cfg := testConfig()
+	resolver, _ := newModelRouteResolver(testEndpoints(cfg), cfg)
 
 	got, err := resolver.Candidates(context.Background(), &domain.Request{
 		Model:    "shared",
@@ -121,7 +122,8 @@ func TestModelRouteResolverPrefersSameProtocol(t *testing.T) {
 }
 
 func TestModelRouteResolverMissReturnsNoCandidates(t *testing.T) {
-	resolver := modelRouteResolver{routes: routesByModel(testEndpoints(testConfig()))}
+	cfg := testConfig()
+	resolver, _ := newModelRouteResolver(testEndpoints(cfg), cfg)
 	for _, req := range []*domain.Request{
 		nil,
 		{Model: "unknown", Protocol: domain.ProtocolOpenAIChat},
@@ -184,22 +186,34 @@ func TestUpstreamIDUsesProviderAndHost(t *testing.T) {
 
 func TestMaxUpstreamAttemptsCoversLongestChain(t *testing.T) {
 	tests := []struct {
-		name   string
-		routes map[string][]domain.Route
-		want   int
+		name     string
+		routes   map[string][]endpointRoute
+		accounts map[string]*accountPool
+		want     int
 	}{
 		{name: "空表退到 1", routes: nil, want: 1},
-		{name: "单候选", routes: map[string][]domain.Route{"a": {{}}}, want: 1},
+		{name: "单候选", routes: map[string][]endpointRoute{"a": {{}}}, want: 1},
 		{
 			name:   "取最长的那条链",
-			routes: map[string][]domain.Route{"a": {{}, {}}, "b": {{}, {}, {}}},
+			routes: map[string][]endpointRoute{"a": {{}, {}}, "b": {{}, {}, {}}},
 			want:   3,
+		},
+		{
+			name: "候选项各自展开账号",
+			routes: map[string][]endpointRoute{
+				"a": {{provider: "p"}},
+			},
+			accounts: map[string]*accountPool{
+				"p": {refs: []string{"#1", "#2", "#3"}, weights: []int{1, 1, 1}, total: 3},
+			},
+			want: 3,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := maxUpstreamAttempts(tt.routes); got != tt.want {
-				t.Errorf("maxUpstreamAttempts = %d，期望 %d", got, tt.want)
+			resolver := &modelRouteResolver{routes: tt.routes, accounts: tt.accounts}
+			if got := resolver.maxCandidates(); got != tt.want {
+				t.Errorf("maxCandidates = %d，期望 %d", got, tt.want)
 			}
 		})
 	}
@@ -211,10 +225,14 @@ func TestCredentialsByRefUsesProviderName(t *testing.T) {
 		t.Fatalf("凭据表条目数 = %d，期望 2", len(table))
 	}
 	// 引用名必须与 Route.CredentialRef 同源，否则运行期取不到凭据。
-	if table["primary"].APIKey != "primary-key" {
-		t.Errorf("primary 的凭据 = %q，期望 primary-key", table["primary"].APIKey)
+	if table["primary"][0].APIKey != "primary-key" {
+		t.Errorf("primary 的凭据 = %q，期望 primary-key", table["primary"][0].APIKey)
 	}
-	if table["backup"].APIKey != "backup-key" {
-		t.Errorf("backup 的凭据 = %q，期望 backup-key", table["backup"].APIKey)
+	if table["backup"][0].APIKey != "backup-key" {
+		t.Errorf("backup 的凭据 = %q，期望 backup-key", table["backup"][0].APIKey)
+	}
+	// 账号引用是装配层与凭据表之间的约定：序号从 #1 起。
+	if got := table["primary"][0].Ref; got != "#1" {
+		t.Errorf("账号引用 = %q，期望 #1", got)
 	}
 }

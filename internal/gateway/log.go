@@ -98,11 +98,13 @@ func (s *suppression) view(moment time.Time) suppressionView {
 // suppressionKey 是折叠的归并键：同一条渠道上的同一个错误码算同一类失败。
 //
 // 成功的尝试不参与折叠，没有错误码的失败也无法判断是否同类。
+// 账号引用一并入键：多账号下同一个渠道的各个账号各有自己的限流窗口，
+// 合在一起折叠会把「哪个账号在限流」这个信号抹掉。
 func suppressionKey(rec domain.AttemptRecord) string {
 	if rec.Outcome == domain.AttemptOK || rec.ErrorCode == "" {
 		return ""
 	}
-	return rec.UpstreamID + "\x00" + rec.ErrorCode
+	return rec.UpstreamID + "\x00" + rec.AccountRef + "\x00" + rec.ErrorCode
 }
 
 // pendingLimit 是同时暂存的请求数上限。
@@ -353,7 +355,7 @@ func accessExtrasFor(pending *pendingAttempts, visible []domain.AttemptRecord, f
 	if usage := visible[0].Usage; usage.Known() {
 		extras.usage = &usage
 	}
-	extras.via = visible[0].UpstreamID
+	extras.via = upstreamLabel(visible[0])
 	return extras
 }
 

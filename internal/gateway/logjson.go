@@ -96,9 +96,12 @@ type jsonDiscovery struct {
 	Found    int    `json:"found"`
 	Kept     int    `json:"kept"`
 	Filtered int    `json:"filtered"`
-	// Models 是客户端可用的对外名（`expose` 改名后的结果），不截断：
+	// Models 是清单里保留的对外名（`expose` 改名后的结果），不截断：
 	// 这边是给机器读的，采集侧要能用它做「模型集合变了」这类判断。
-	Models     []string `json:"models,omitempty"`
+	Models []string `json:"models,omitempty"`
+	// Declared 是这条端点显式声明的对外名。它与 Models 合起来才是客户端实际
+	// 可用的集合：只列清单那一侧会让配下的 model 行看起来没生效。
+	Declared   []string `json:"declared,omitempty"`
 	HasMore    bool     `json:"has_more"`
 	Degraded   bool     `json:"degraded"`
 	DurationMS int64    `json:"duration_ms"`
@@ -124,6 +127,9 @@ func discoveryPayload(rec DiscoveryReport) any {
 	}
 	for _, model := range rec.Kept {
 		payload.Models = append(payload.Models, model.Name)
+	}
+	for _, model := range rec.Declared {
+		payload.Declared = append(payload.Declared, model.Name)
 	}
 	return payload
 }
@@ -227,6 +233,7 @@ type jsonAttempt struct {
 	ProtocolSwitched bool       `json:"protocol_switched"`
 	Model            string     `json:"model"`
 	UpstreamModel    string     `json:"upstream_model"`
+	Account          string     `json:"account,omitempty"`
 	Outcome          string     `json:"outcome"`
 	DurationMS       int64      `json:"duration_ms"`
 	ErrorCode        string     `json:"error_code,omitempty"`
@@ -246,6 +253,7 @@ func attemptPayload(rec domain.AttemptRecord) any {
 		ProtocolSwitched: rec.ClientProtocol != rec.UpstreamProtocol,
 		Model:            rec.RequestedModel,
 		UpstreamModel:    rec.UpstreamModel,
+		Account:          rec.AccountRef,
 		Outcome:          string(rec.Outcome),
 		DurationMS:       rec.EndedAt.Sub(rec.StartedAt).Milliseconds(),
 		ErrorCode:        rec.ErrorCode,

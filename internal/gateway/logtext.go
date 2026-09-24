@@ -289,6 +289,12 @@ func renderStartup(cfg *config.Config, stats catalogStats, reloaded bool) string
 		{"日志格式", cfg.LogFormat},
 		{"渠道", fmt.Sprintf("%d 条，对外模型 %d 个", len(cfg.Providers), stats.Models)},
 	}
+	// 账号池单独占一行，只在真的声明了多账号时出现：它回答「同一个渠道里的凭据
+	// 是怎么选的」，而单账号配置没有这个问题需要回答。
+	if pools, accounts := cfg.AccountPoolStats(); pools > 0 {
+		rows = append(rows, [2]string{"账号池", fmt.Sprintf(
+			"%d 个渠道共 %d 个账号，%s", pools, accounts, cfg.AccountPoolPolicyText())})
+	}
 	// 发现相关的两行只在真的发生时才出现：不声明发现的配置与以前一字不差，
 	// 而声明了发现的配置需要一眼看出「清单给了多少、留下多少、有没有退回去」。
 	if stats.DiscoveryEndpoints > 0 {
@@ -343,7 +349,10 @@ func renderDiscovery(clock string, rec DiscoveryReport, color bool) string {
 	if rec.Err != nil {
 		fields = append(fields, oneLineText(rec.Err.Error()))
 	} else {
-		fields = append(fields, keptNamesText(rec.Kept))
+		// 显式声明的模型不在清单视角里，但同样是客户端可用的名字。少了这一段，
+		// 日志会看起来像「配的 model 行没生效」——一个只有清单的世界。
+		fields = append(fields, namesText("显式：", rec.Declared))
+		fields = append(fields, namesText("保留：", rec.Kept))
 	}
 	return clock + " " + paintLevel(discoveryLevel(rec), color) +
 		kindColumn(kindCatalog) + joinFields(fields...)
@@ -355,21 +364,24 @@ func renderDiscovery(clock string, rec DiscoveryReport, color bool) string {
 // 并给出总数，全量名单由 `nova models` 回答；json 模式下不截断，那边是给机器读的。
 const discoveryNameLimit = 20
 
-// keptNamesText 把客户端可用的对外名排成一段，超限时截断并给出总数。
-func keptNamesText(kept []config.Model) string {
-	if len(kept) == 0 {
+// namesText 把一组对外名排成一段，超限时截断并给出总数。
+//
+// 显式声明的模型与清单保留项各成一段：它们的来源不同，混在一起会丢掉
+// 「这个名字是配下的还是上游给的」这一事实，而那正是排查选路时要看的。
+func namesText(label string, models []config.Model) string {
+	if len(models) == 0 {
 		return ""
 	}
-	names := make([]string, 0, len(kept))
-	for i, model := range kept {
+	names := make([]string, 0, len(models))
+	for i, model := range models {
 		if i >= discoveryNameLimit {
 			break
 		}
 		names = append(names, model.Name)
 	}
-	text := "保留：" + strings.Join(names, " ")
-	if len(kept) > discoveryNameLimit {
-		text += fmt.Sprintf(" …（共 %d 个）", len(kept))
+	text := label + strings.Join(names, " ")
+	if len(models) > discoveryNameLimit {
+		text += fmt.Sprintf(" …（共 %d 个）", len(models))
 	}
 	return text
 }
@@ -443,6 +455,17 @@ func renderAccess(clock string, record transport.AccessRecord, extras accessExtr
 	return clock + " " + paintLevel(level, color) + kindColumn(kindAccess) + joinFields(fields...)
 }
 
+// upstreamLabel 把渠道标识与账号引用排成一段人读的定位文本。
+//
+// 单账号渠道不加账号：那时账号引用是空串，标签与账号池引入之前逐字一致。
+// 主行的 via 与上游明细行共用它，两处因此不会各长出一种写账号的方式。
+func upstreamLabel(rec domain.AttemptRecord) string {
+	if rec.AccountRef == "" {
+		return rec.UpstreamID
+	}
+	return rec.UpstreamID + " acct " + rec.AccountRef
+}
+
 // renderAttemptDetail 渲染一条上游明细。
 //
 // 它只写主行没有的事实：上游 id、两侧协议与模型的改写、上游用量、上游报文。
@@ -453,7 +476,7 @@ func renderAccess(clock string, record transport.AccessRecord, extras accessExtr
 // 只有两侧不一致（上游成功而客户端侧失败，或反过来）与取消才写出来。
 func renderAttemptDetail(clock string, rec domain.AttemptRecord, multiple bool, status int, color bool) string {
 	level := attemptLineLevel(rec, status)
-	fields := []string{shortRequestID(rec.RequestID), "#" + strconv.Itoa(rec.Attempt), rec.UpstreamID}
+	fields := []string{shortRequestID(rec.RequestID), "#" + strconv.Itoa(rec.Attempt), upstreamLabel(rec)}
 	if rec.UpstreamProtocol != rec.ClientProtocol {
 		fields = append(fields, fmt.Sprintf("%s→%s", rec.ClientProtocol, rec.UpstreamProtocol))
 	}

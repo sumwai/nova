@@ -63,13 +63,25 @@ func (c Credential) LogValue() slog.Value {
 	return slog.StringValue(redactedSecret)
 }
 
-// Provider 是凭据表的请求头提供者：按 route.CredentialRef 取出本次调用该用的那一份凭据。
+// Provider 是凭据表的请求头提供者：按 route.CredentialRef 取出渠道，
+// 再按 route.AccountRef 取出本次调用该用的那一份凭据。
 //
 // 表在装配期一次性建好，运行期只读，因此可并发使用。
 // 引用名在表里查不到时返回错误，不退化成空密钥：
 // 空密钥会把「装配漏了一个渠道的凭据」推迟成上游的 401，让使用者从一个与配置无关的症状出发排查。
 type Provider struct {
-	credentials map[string]Credential
+	credentials map[string][]Account
+}
+
+// Account 是某个渠道内的一份凭据及其引用。
+//
+// 引用由配置层的账号序号给出，渠道内唯一；切片按声明顺序保存，
+// 因此「该渠道的默认账号」有一个确定答案（第一项），不必依赖 map 的遍历顺序。
+type Account struct {
+	// Ref 是账号在渠道内的引用，即 domain.Route.AccountRef 的取值。
+	Ref string
+	// APIKey 是明文密钥，由配置层展开 {env.NAME} 后给出。
+	APIKey string
 }
 
 // String 实现 fmt.Stringer：凭据表经 %v 或 %+v 打印时只出现占位符。
@@ -87,15 +99,19 @@ func (p Provider) LogValue() slog.Value {
 	return slog.StringValue(redactedSecret)
 }
 
-// New 用「引用名 → 凭据」的表构造请求头提供者，引用名即 domain.Route.CredentialRef。
+// New 用「渠道 → 账号列表」的表构造请求头提供者。
 //
-// 入参整表拷贝：调用方之后继续持有并修改自己的表，不会改变已生效的凭据表。
-// 允许空表与空密钥：空表使任何引用都取不到凭据并在请求上游前报错；
-// 空密钥照原样注入空值头，让「渠道配了但密钥为空」以 401 暴露，而不是在装配期让网关起不来。
-func New(credentials map[string]Credential) *Provider {
-	table := make(map[string]Credential, len(credentials))
-	for ref, cred := range credentials {
-		table[ref] = cred
+// 渠道名即 domain.Route.CredentialRef，账号引用即 domain.Route.AccountRef，
+// 两张表因此天然对齐。每个渠道至少要有一项：空列表表示这个渠道没有任何可用凭据，
+// 取它时会报错而不是退化成空密钥。
+//
+// 入参整表拷贝（含每个渠道的账号切片）：调用方之后继续改自己的表，
+// 不会改变已生效的凭据表。空密钥照原样注入空值头，让「渠道配了但密钥为空」
+// 以 401 暴露，而不是在装配期让网关起不来。
+func New(credentials map[string][]Account) *Provider {
+	table := make(map[string][]Account, len(credentials))
+	for ref, accounts := range credentials {
+		table[ref] = append([]Account(nil), accounts...)
 	}
 	return &Provider{credentials: table}
 }
@@ -107,10 +123,9 @@ func New(credentials map[string]Credential) *Provider {
 // 凭据只回答用哪份密钥；合并规则里凭据头是被上游用来鉴权的唯一来源，
 // 因此与 route.Headers 同名冲突时以凭据头为准，配置里的静态头不能把它覆盖掉。
 func (p *Provider) UpstreamHeaders(_ context.Context, route domain.Route) (http.Header, error) {
-	cred, ok := p.credentials[route.CredentialRef]
-	if !ok {
-		return nil, domain.NewError(domain.CodeInternal,
-			fmt.Sprintf("路由的凭据引用 %q 不在凭据表里", route.CredentialRef))
+	cred, err := p.credentialFor(route.CredentialRef, route.AccountRef)
+	if err != nil {
+		return nil, err
 	}
 	headers, credentialHeader, err := credentialHeaders(route.Protocol, cred.APIKey)
 	if err != nil {
@@ -118,6 +133,33 @@ func (p *Provider) UpstreamHeaders(_ context.Context, route domain.Route) (http.
 	}
 	mergeRouteHeaders(headers, credentialHeader, route.Headers)
 	return headers, nil
+}
+
+// credentialFor 按渠道与账号取出凭据。
+//
+// 两种失败分开报：渠道不存在说明装配时漏了整个渠道，账号不存在说明装配时少了一个账号，
+// 它们指向配置里的不同地方，合成一句「凭据取不到」会让排查从错的方向开始。
+// 空账号引用取该渠道的默认账号（声明顺序第一项），单账号配置因此不必在路由里写引用。
+func (p *Provider) credentialFor(channel, accountRef string) (Credential, error) {
+	accounts, ok := p.credentials[channel]
+	if !ok {
+		return Credential{}, domain.NewError(domain.CodeInternal,
+			fmt.Sprintf("路由的凭据引用 %q 不在凭据表里", channel))
+	}
+	if len(accounts) == 0 {
+		return Credential{}, domain.NewError(domain.CodeInternal,
+			fmt.Sprintf("渠道 %q 没有任何凭据", channel))
+	}
+	if accountRef == "" {
+		return Credential{APIKey: accounts[0].APIKey}, nil
+	}
+	for _, account := range accounts {
+		if account.Ref == accountRef {
+			return Credential{APIKey: account.APIKey}, nil
+		}
+	}
+	return Credential{}, domain.NewError(domain.CodeInternal,
+		fmt.Sprintf("渠道 %q 里没有账号 %q", channel, accountRef))
 }
 
 // credentialHeaders 按本次路由的协议产出一份全新的凭据头，并返回凭据头的标准名。

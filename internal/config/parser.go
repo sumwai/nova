@@ -18,6 +18,7 @@ const (
 	directiveClientKey = "client_key"
 	directiveProvider  = "provider"
 	directiveImport    = "import"
+	directiveRoute     = "route"
 )
 
 // provider 与 endpoint 两级的指令名。
@@ -32,6 +33,8 @@ const (
 	directiveAllow    = "allow"
 	directiveDeny     = "deny"
 	directiveExpose   = "expose"
+	directiveBalance  = "balance"
+	directiveFallback = "fallback"
 )
 
 // 下面四张表分别是三层作用域的合法指令名，外加一份「能开启块的名字」。
@@ -42,11 +45,11 @@ const (
 var (
 	globalDirectives = []string{
 		directiveVersion, directiveLogLevel, directiveLogFormat, directiveListen,
-		directiveAdmin, directiveClientKey, directiveProvider, directiveImport,
+		directiveAdmin, directiveClientKey, directiveProvider, directiveImport, directiveRoute,
 	}
 
 	providerDirectives = []string{
-		directiveAPIKey, directiveURL, directiveProtocol, directiveTimeout,
+		directiveAPIKey, directiveBalance, directiveURL, directiveProtocol, directiveTimeout,
 		directiveModel, directiveEndpoint, directiveDiscover, directiveAllow, directiveDeny,
 		directiveExpose,
 	}
@@ -61,8 +64,14 @@ var (
 		directiveDiscover, directiveAllow, directiveDeny, directiveExpose,
 	}
 
+	// routeDirectives 是 route 块的合法指令名。
+	//
+	// provider 在这个作用域里是「引用一条已有渠道」，与顶层的「声明一条渠道」
+	// 不是同一件事：块头带花括号的是声明（顶层），不带花括号的是引用。
+	routeDirectives = []string{directiveBalance, directiveProvider, directiveFallback}
+
 	// blockDirectives 是能开启一个块的指令名，只为对外声明能力清单而存在。
-	blockDirectives = []string{directiveProvider, directiveEndpoint}
+	blockDirectives = []string{directiveProvider, directiveEndpoint, directiveRoute}
 )
 
 // line 是一行里的全部记号。
@@ -128,6 +137,10 @@ func (p *parser) run() error {
 			p.pos++
 		case directiveProvider:
 			if err := p.parseProvider(ln); err != nil {
+				return err
+			}
+		case directiveRoute:
+			if err := p.parseModelRoute(ln); err != nil {
 				return err
 			}
 		case directiveImport:
@@ -310,6 +323,9 @@ func (p *parser) warnUnsafeAdmin(ln line) {
 // 它排在逐行解析之后：这些结论要看完整份配置才知道，而在解析中途报出来
 // 会打断使用者「先把语法错误改完」的节奏。
 func (p *parser) validate() error {
+	if err := p.validateModelRoutes(); err != nil {
+		return err
+	}
 	if len(p.cfg.Providers) == 0 {
 		p.cfg.Warnings = append(p.cfg.Warnings, Warning{
 			File: p.cfg.Path,
