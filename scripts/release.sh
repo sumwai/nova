@@ -94,13 +94,30 @@ schema_at_tag() {
 
 # breaking_since 判断某个 tag 之后有没有破坏性变更。
 #
+# 题注读 `type(scope)!:`；正文只认行首的 `BREAKING CHANGE: x` / `BREAKING-CHANGE: x`
+# 两个约定标记，不整段子串匹配：一句「规则要求正文写 BREAKING CHANGE」这样的描述性文字
+# 会把判定凭空升一位，而版本号升上去没有撤销的余地——这个误判已经真实发生过一次。
+#
 # 读提交题注与正文，不读 PR 正文：仓库用 squash 合并，进入历史的是分支上的提交信息，
 # PR 正文不在其中——照 PR 正文判定会永远判不出破坏性变更。
 breaking_since() {
 	if git log --format='%s' "$1..HEAD" | grep -qE '^[A-Za-z]+(\([^)]*\))?!:'; then
 		return 0
 	fi
-	git log --format='%b' "$1..HEAD" | grep -q 'BREAKING CHANGE'
+	git log --format='%b' "$1..HEAD" | grep -qE '^BREAKING[ -]CHANGE(:|$)'
+}
+
+# note_breaking_near_miss 把「写在行首但写法不合约定」的标记报出来。
+#
+# 这种漏判方向是静默的：`Breaking-Change: x` 不会被上面的严格匹配认下，
+# 于是不兼容变更被发成 z 位而无人知晓。宽泛匹配则相反，会把描述性文字当成标记
+# （升错一位的实例已经真实发生过一次）。两种代价不对称，因此把疑点报出来由人定，
+# 而不让脚本替人猜。
+note_breaking_near_miss() {
+	suspect=$(git log --format='%b' "$1..HEAD" | grep -iE '^breaking[ -]change' | grep -vE '^BREAKING[ -]CHANGE(:|$)' | head -n 3)
+	[ -n "$suspect" ] || return 0
+	say "提示：以下行写在行首但不是约定形态（需要 BREAKING CHANGE: 或 BREAKING-CHANGE:），本次不据此升 y 位："
+	printf '%s\n' "$suspect"
 }
 
 # parse_version 把 vX.Y.Z 拆成三段。别的形态不猜：基数错了，推出来的下一个版本号也是错的。
@@ -219,6 +236,7 @@ if [ "$bump" = auto ]; then
 	else
 		bump=z
 		why="自 $last 起没有破坏性变更"
+		note_breaking_near_miss "$last"
 	fi
 else
 	why="由 --bump $bump 指定"
