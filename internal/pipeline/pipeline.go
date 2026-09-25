@@ -360,6 +360,7 @@ func (p *Pipeline) recordAttempt(
 		UpstreamProtocol: route.Protocol,
 		RequestedModel:   req.Model,
 		UpstreamID:       route.UpstreamID,
+		Provider:         route.Provider,
 		UpstreamModel:    route.UpstreamModel,
 		AccountRef:       route.AccountRef,
 		Outcome:          outcome,

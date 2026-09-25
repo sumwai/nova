@@ -223,11 +223,16 @@ type jsonUsage struct {
 	ServerToolUses   int    `json:"server_tool_uses,omitempty"`
 }
 
+// jsonAttempt 是一条上游尝试记录。
+//
+// provider 与 upstream 并存：后者是「渠道名 + 主机名」的展示串，不保证单射，
+// 不得由它反推渠道；前者未经拼接，可按值分组。
 type jsonAttempt struct {
 	jsonBase
 	RequestID        string     `json:"request_id,omitempty"`
 	Attempt          int        `json:"attempt"`
 	Upstream         string     `json:"upstream"`
+	Provider         string     `json:"provider"`
 	ClientProtocol   string     `json:"client_protocol"`
 	UpstreamProtocol string     `json:"upstream_protocol"`
 	ProtocolSwitched bool       `json:"protocol_switched"`
@@ -248,6 +253,7 @@ func attemptPayload(rec domain.AttemptRecord) any {
 		RequestID:        rec.RequestID,
 		Attempt:          rec.Attempt,
 		Upstream:         rec.UpstreamID,
+		Provider:         rec.Provider,
 		ClientProtocol:   string(rec.ClientProtocol),
 		UpstreamProtocol: string(rec.UpstreamProtocol),
 		ProtocolSwitched: rec.ClientProtocol != rec.UpstreamProtocol,

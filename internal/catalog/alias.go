@@ -1,6 +1,10 @@
 package catalog
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/sumwai/nova/internal/pattern"
+)
 
 // Alias 是一条改名规则：把匹配 From 的上游 id 以 To 暴露给客户端。
 //
@@ -68,12 +72,12 @@ func splitCapture(pattern string) (before, after string, ok bool) {
 // 比较不区分大小写（与 allow / deny 同一口径），返回的捕获值取自 id 原文：
 // 拼出来的是要发给客户端的名字，不该被过滤语法的宽松改写。
 //
-// 按 rune 比较与切分（foldRunes 逐 rune 折叠，长度不变），因此非 ASCII 的模型名
+// 按 rune 比较与切分（pattern.FoldRunes 逐 rune 折叠，长度不变），因此非 ASCII 的模型名
 // 不会在下标上错位。
 func captureBetween(before, after, id string) (string, bool) {
-	foldedID := foldRunes(id)
-	foldedBefore := foldRunes(before)
-	foldedAfter := foldRunes(after)
+	foldedID := pattern.FoldRunes(id)
+	foldedBefore := pattern.FoldRunes(before)
+	foldedAfter := pattern.FoldRunes(after)
 	if len(foldedID) < len(foldedBefore)+len(foldedAfter) {
 		return "", false
 	}

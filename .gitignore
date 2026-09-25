@@ -21,7 +21,11 @@ coverage.txt
 
 # 设计提案与草稿：思路可以留在树里讨论，但不进版本历史
 # （成文的对外说明在 README 与 CHANGELOG，不另开一份会漂移的副本）
-/docs/
+#
+# 例外：docs/openapi.yaml 是接口契约本身（机器可读），不是 README 的副本，
+# 必须随代码进版本历史；因此这里排掉的是目录内容、而不是目录本身。
+/docs/*
+!/docs/openapi.yaml
 
 # 编辑器与系统
 .idea/

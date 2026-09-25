@@ -43,7 +43,7 @@ func newModelsCmd() *cobra.Command {
 			}
 			// 发现过程的日志不另写 stderr：结果全部在下面这份报告里，
 			// 两处各说一遍只会让同一件事在屏幕上出现两次。
-			assembled, err := gateway.Assemble(cmd.Context(), cfg, io.Discard)
+			assembled, err := gateway.Assemble(cmd.Context(), cfg, gateway.AssembleOptions{LogOutput: io.Discard})
 			if err != nil {
 				return err
 			}

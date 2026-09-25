@@ -307,7 +307,7 @@ func (p *parser) applyGlobal(ln line) error {
 // 管理端点没有鉴权，能连上它的人就能改写这份运行中的配置。这里只提醒而不报错：
 // 在内网里绑一个固定地址是合理用法，拦下来会让它变成做不到的事。
 func (p *parser) warnUnsafeAdmin(ln line) {
-	if isLoopbackAddress(p.cfg.Admin) {
+	if IsLoopbackAddress(p.cfg.Admin) {
 		return
 	}
 	p.cfg.Warnings = append(p.cfg.Warnings, Warning{
@@ -332,7 +332,7 @@ func (p *parser) validate() error {
 			Msg:  "没有声明任何 provider：网关能起来，但没有任何上游可以转发",
 		})
 	}
-	if len(p.cfg.ClientKeys) == 0 && !isLoopbackAddress(p.cfg.Listen) {
+	if len(p.cfg.ClientKeys) == 0 && !IsLoopbackAddress(p.cfg.Listen) {
 		p.cfg.Warnings = append(p.cfg.Warnings, Warning{
 			File: p.cfg.Path,
 			Msg: fmt.Sprintf(
@@ -459,11 +459,14 @@ func contains(table []string, name string) bool {
 	return false
 }
 
-// isLoopbackAddress 判断一个 host:port 地址是否只绑回环接口。
+// IsLoopbackAddress 判断一个 host:port 地址是否只绑回环接口。
 //
 // 空 host 视为「绑所有接口」而不是回环：`:8080` 在 net.Listen 里等价于
 // 0.0.0.0:8080，把它算成回环会让一条本该出现的警告消失。
-func isLoopbackAddress(addr string) bool {
+//
+// 导出是因为装配层要用同一条判定决定统计端点是否套客户端鉴权：同一件事
+// 有两份实现时，两份迟早会不一致。
+func IsLoopbackAddress(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return false

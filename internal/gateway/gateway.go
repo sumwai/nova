@@ -16,6 +16,7 @@ import (
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/credential"
 	"github.com/sumwai/nova/internal/pipeline"
+	"github.com/sumwai/nova/internal/stats"
 	"github.com/sumwai/nova/internal/transport"
 	"github.com/sumwai/nova/internal/upstream"
 )
@@ -109,6 +110,15 @@ func (h *Holder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Current().Handler.ServeHTTP(w, r)
 }
 
+// AssembleOptions 是 Assemble 的依赖与进程级状态。
+type AssembleOptions struct {
+	// LogOutput 是横幅、日志与提醒的落点。
+	LogOutput io.Writer
+	// Stats 是进程级统计存储；nil 表示不采集（只做装配检查的调用方传 nil）。
+	// 它由进程持有而不是随装配创建：reload 换掉的是配置与日志句柄，统计必须连续。
+	Stats *stats.Store
+}
+
 // Assemble 按配置装配出一套运行时对象。
 //
 // 所有装配缺陷都在这里报出，而不是等第一个请求打进来：配置错误应该在启动与
@@ -117,11 +127,14 @@ func (h *Holder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // ctx 用于装配期的模型发现：启动路径传进程 context，reload 路径传管理端点请求的
 // context（客户端断开即取消这次发现）。为 nil 时按无上限处理，供只做装配检查的调用方使用。
-func Assemble(ctx context.Context, cfg *config.Config, logOutput io.Writer) (*Assembly, error) {
-	logger, err := newLogger(cfg, logOutput)
+func Assemble(ctx context.Context, cfg *config.Config, opts AssembleOptions) (*Assembly, error) {
+	logger, err := newLogger(cfg, opts.LogOutput)
 	if err != nil {
 		return nil, err
 	}
+
+	// 日志与统计共用同一个扇出对象：两类观测消费同一对接口，转发路径不必知道有几个消费者。
+	recorders := &recorders{log: logger, stats: opts.Stats}
 
 	// 各协议的适配器做成单例：客户端侧按请求路径取，上游侧按路由协议取，
 	// 两处用同一张表，因此「客户端能进来的协议」与「上游能解码的协议」不会漂移。
@@ -187,7 +200,7 @@ func Assemble(ctx context.Context, cfg *config.Config, logOutput io.Writer) (*As
 	for _, warning := range routeWarnings {
 		logger.warning(warning)
 	}
-	forwarder, err := pipeline.New(forwarderOptions(resolver, lookup, upstreamClient, logger))
+	forwarder, err := pipeline.New(forwarderOptions(resolver, lookup, upstreamClient, recorders))
 	if err != nil {
 		return nil, fmt.Errorf("构造转发流水线失败：%w", err)
 	}
@@ -198,7 +211,7 @@ func Assemble(ctx context.Context, cfg *config.Config, logOutput io.Writer) (*As
 		Adapters:  resolve,
 		// 访问日志与上游尝试日志用同一个输出口：两类记录靠 request_id 关联，
 		// 格式与时间基准因此天然一致，不必在排查时对两条不同风格的日志。
-		Logger: logger,
+		Logger: recorders,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("构造 HTTP 入口失败：%w", err)
@@ -207,7 +220,7 @@ func Assemble(ctx context.Context, cfg *config.Config, logOutput io.Writer) (*As
 	return &Assembly{
 		Config:      cfg,
 		Logger:      logger,
-		Handler:     newDataPlane(forward, cfg, resolve, models),
+		Handler:     newDataPlane(forward, cfg, resolve, models, opts.Stats),
 		Models:      models,
 		Discoveries: reports,
 		Stats:       stats,
@@ -218,24 +231,48 @@ func Assemble(ctx context.Context, cfg *config.Config, logOutput io.Writer) (*As
 // healthzPath 是存活探针的路径。
 const healthzPath = "/healthz"
 
+// statsPath 是统计查询端点的路径。
+//
+// 放在 /debug/ 前缀下：它表达「这是运维用途、不属对外 API 契约」，与 /v1/models
+// 那种对客户端承诺形状的接口区分开。名字不叫 /metrics：那个名字在约定上指向
+// Prometheus 文本格式，而这里的输出是 JSON。
+const statsPath = "/debug/stats"
+
 // newDataPlane 造数据面的 HTTP 处理器。
 //
 // 转发入口挂在根路径上，由它自己按固定映射判定路径是否受支持，并给出协议化的 404；
 // 模型清单另挂一条精确路径，同样过鉴权，不带凭据时按协议形状回 401；
 // 健康检查也另挂一条，不经鉴权也不经转发——探活只关心进程是否在线，让它依赖客户端凭据
 // 会让编排系统在上游或凭据出问题时，重启一个本身健康的网关。
+// 统计端点同样是精确路径且不走转发入口：它不是客户端接口，也不产生访问记录。
 func newDataPlane(
 	forward http.Handler,
 	cfg *config.Config,
 	resolve transport.AdapterResolver,
 	models []ModelEntry,
+	store *stats.Store,
 ) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(healthzPath, healthz)
-	// 精确路径优先于 "/"：模型清单因此不会落到转发入口上被当成未注册路径。
+	// 精确路径优先于 "/"：模型清单与统计端点因此不会落到转发入口上被当成未注册路径。
 	mux.Handle(modelsPath, authorize(newModelsHandler(models), cfg.ClientKeys, resolve))
+	if store != nil {
+		mux.Handle(statsPath, statsAuthorize(stats.NewHandler(store), cfg, resolve))
+	}
 	mux.Handle("/", authorize(forward, cfg.ClientKeys, resolve))
 	return mux
+}
+
+// statsAuthorize 给统计端点套上鉴权，但只在监听地址不是回环时。
+//
+// 统计端点包含模型名、渠道名、客户端与用量，缺省监听在 127.0.0.1 上时只有本机能读，
+// 再套一层客户端凭据没有意义。绑到非回环地址后它就和数据面一样需要凭据，
+// 判定与配置层那条非回环警告同源（config.IsLoopbackAddress），不另立一套口径。
+func statsAuthorize(next http.Handler, cfg *config.Config, resolve transport.AdapterResolver) http.Handler {
+	if config.IsLoopbackAddress(cfg.Listen) {
+		return next
+	}
+	return authorize(next, cfg.ClientKeys, resolve)
 }
 
 // healthz 是存活探针：任何方法都回 200 与纯文本 ok。

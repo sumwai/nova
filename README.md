@@ -8,6 +8,7 @@
 前一条候选失败时按配置里的声明顺序回退，流式与非流式都支持。
 
 尚未实现的是可观测性的**采集侧**：上游尝试记录与访问日志已经接上（见「日志」一节），
+用量与请求统计落进 SQLite 并可经 `GET /debug/stats` 查询（见「统计」一节），
 但还没有导出为指标或追踪。`log_level` 与 `log_format` 共同决定这些记录怎么输出。
 
 ## 安装
@@ -18,7 +19,25 @@ sudo make install                    # 安装到 /usr/local/bin/nova
 PREFIX=$HOME/.local make install     # 或装到用户目录
 ```
 
-构建产物只有两个出口：`bin/nova` 与 `$(PREFIX)/bin/nova`。
+构建产物只有两个出口：`bin/nova` 与 `$(PREFIX)/bin/nova`。运行期另有一个状态文件
+（统计库，见「统计」一节），其落点是状态目录而不是构建产物。
+
+## 接口
+
+全部 HTTP 接口写在 [`docs/openapi.yaml`](docs/openapi.yaml)（OpenAPI 3.1）：数据面的四条
+转发路径、模型清单、统计与探活，以及管理端点的热重载。每个接口的方法、鉴权、请求头、
+参数、错误形状与响应示例都在那里，不必翻源码。
+
+```sh
+npx @redocly/cli lint docs/openapi.yaml                       # 校验
+npx @redocly/cli build-docs docs/openapi.yaml -o /tmp/nova-api.html   # 生成单文件 HTML
+```
+
+任何 OpenAPI 3.1 工具都能打开它（Swagger UI、Scalar、IDE 插件等）。
+`redocly preview-docs` 是 v1 的命令名，v2 已移除，因此上面用 `build-docs`。
+
+转发类接口的请求体与成功响应体沿用对应供应商的线协议，规范里只规定 nova 自己读写的部分
+（路径、鉴权、`model` 选路字段、流式开关、错误形状与网关自加的响应头）。
 
 ## 配置
 
@@ -357,6 +376,63 @@ text 模式的排版单位是**一次请求一个块**：`access` 主行在前�
 
 能不能显示颜色**不是配置项**：它是环境事实，不是使用者的意图。输出落在终端上、
 未设 `NO_COLOR`、且 `TERM` 不是 `dumb` 时才给级别与错误码着色。
+
+### 统计
+
+`GET /debug/stats` 回一份 JSON，回答「用量与请求都花在哪了」。事实存在 SQLite 里，
+库文件缺省是 `$XDG_STATE_HOME/nova/stats.db`（未设该变量时为 `~/.local/state/nova/stats.db`）。
+库打开失败时网关照常服务，只是不记录统计，并会记一条日志。
+
+状态目录与配置目录分开：配置回答「希望怎么跑」，状态记录「实际跑过什么」，
+前者通常纳入版本控制或由运维下发，后者是本机数据。
+
+请求明细按保留期裁剪（缺省 30 天），**累计用量不裁剪**：`lifetime` 是「一直以来的
+合计」，不会因为保留期而变小。
+
+库是标准 SQLite 文件（WAL 模式），可以直接用外部工具只读查询：
+
+```sh
+sqlite3 -readonly ~/.local/state/nova/stats.db \
+  "select model, count(*), sum(input_tokens), sum(output_tokens) from requests group by model"
+```
+
+```sh
+curl 'http://127.0.0.1:8080/debug/stats?pretty=true'
+curl 'http://127.0.0.1:8080/debug/stats?client=claude-*&since=-1h&group_by=model,provider'
+curl 'http://127.0.0.1:8080/debug/stats?agent=*external*&detail=true&limit=20'
+```
+
+响应分四块，界限是**范围**而不是类别：`process` 是本次进程的事实（启动时刻、已运行秒数、
+重启次数）；`accounting` 是跨重启的记账事实（累计从哪算起、是否落盘、保留天数、落库失败数）；
+`lifetime` 是跨重启的标量累计，不受查询条件影响；`window` 是保留期内的明细聚合，
+受查询条件影响，并由 `oldest` / `newest` / `retained` / `scan_limited` 自述覆盖范围。
+聚合结果里的 `usage` 与 json 日志里的 `usage` 同名同形。
+
+`retained` 是本次读入的记录条数：它同时受保留期、查询时间窗与扫描上限限制，
+触到扫描上限时 `scan_limited` 为真。
+
+可选查询参数：
+
+| 参数 | 说明 |
+|---|---|
+| `client` | 归一化后的客户端产品名（User-Agent 的第一段，如 `claude-cli`） |
+| `agent` | 原始 User-Agent |
+| `model` / `provider` / `upstream` / `error_code` | 模型名、渠道名、上游 id、错误码 |
+| `status` | `2xx` 这类状态类，或 `200` 这类具体码 |
+| `stream` | `true` / `false` |
+| `since` / `until` | RFC3339 时刻，或 `-10m` / `-24h` 这类相对时长 |
+| `group_by` | `model,provider,upstream,client,status,protocol,error_code` 的逗号列表，缺省全部 |
+| `detail` / `limit` | 是否附带逐请求明细及其条数上限（缺省 100，上限 1000） |
+| `pretty` | 缩进输出，供人眼查看 |
+
+含 `*` / `?` 的取值按通配匹配，与 `allow` / `deny` / `route` 同一套语义。`provider`
+与 `upstream` 是**请求级**谓词（保留尝试集合里命中过的请求），所以按渠道过滤时
+`by_provider` 仍会列出这些请求用过的其它渠道；`by_provider` 与 `by_upstream` 本身
+是**尝试级**分组：`requests` 是「在该渠道上至少有一次尝试的不同请求数」，
+`attempts` 是尝试总数，回退时两者之和都会体现。
+
+`/debug/stats` 缺省不鉴权，因为它随 `listen` 缺省只绑在回环上；`listen` 绑到非回环
+地址后，它与数据面一样要求 `client_key`。它不接受任何写操作，也不产生访问记录。
 
 ### 环境变量与拆分文件
 

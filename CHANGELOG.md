@@ -119,10 +119,55 @@
 - 上游标识从 `provider 名 + 完整地址` 改为 `provider 名 + 主机名`：scheme、版本根与
   端点路径对「分辨是哪条渠道」没帮助，却占了日志行很大一截。同主机不同协议的端点
   由同一条记录里的协议字段区分。
+- json 模式的上游记录新增 `provider` 字段：`upstream` 是「渠道名 + 主机名」的展示串、
+  不保证单射，按渠道分组只能靠新增的这个未经拼接的字段。
+
+**统计**
+
+- 新增数据面 `GET /debug/stats`：回一份 JSON，给出用量与请求统计。事实存在 SQLite 里
+（新增依赖 `modernc.org/sqlite`，纯 Go 实现，不引入 CGO），库文件缺省是
+`$XDG_STATE_HOME/nova/stats.db`，未设该变量时为 `~/.local/state/nova/stats.db`。
+库打开失败时只降级：转发照常，统计不记录，并记一条日志。
+- 状态目录与配置目录分开：配置回答「希望怎么跑」，状态记录「实际跑过什么」。
+- 请求明细按保留期裁剪（缺省 30 天），**累计用量不裁剪**：`lifetime` 存在单行表里，
+不随裁剪变小。库是标准 SQLite（WAL 模式），可用外部工具只读查询。
+- 响应分 `process`（本次进程）、`accounting`（跨重启的记账事实，含累计起点、是否落盘、
+保留天数、落库失败计数）、`lifetime`（跨重启的标量累计）与 `window`（保留期内的明细聚合，
+自述 `oldest` / `newest` / `retained` / `scan_limited`）四块。聚合结果里的 `usage`
+与 json 日志里的 `usage` 同名同形。
+- 请求级与尝试级事实按 `request_id` 在写入侧合并成一条完整记录，读取侧只从它派生，
+因此数字只有一个来源。用量未取得的请求单独计数，不与「用量为零」混同。
+- 读侧只把时间范围下推给 SQL，其余过滤与分组在 Go 侧完成：过滤语义是 `pattern.Match`
+（`*` 跨 `/`、大小写按 rune 折叠），SQL 的 LIKE / GLOB 与它不等价，两处各写一份会让
+同一份查询条件在不同后端上给出不同结果。
+- 落库失败不改变累计镜像，失败次数与最后一条消息随查询结果返回（`accounting.write_errors` /
+`last_write_error`），使统计缺失在端点上可见，而不只是往日志里写一行。
+- 支持按 `client`（User-Agent 归一化后的产品名）、`agent`（原始 User-Agent）、`model`、
+  `provider`、`upstream`、`status`、`stream`、`error_code`、`since` / `until` 过滤，
+  按 `model` / `provider` / `upstream` / `client` / `status` / `protocol` / `error_code`
+  分组，可附逐请求明细。含 `*` / `?` 的取值按通配匹配，与 `allow` / `deny` / `route`
+  同一套语义。
+- `by_provider` 与 `by_upstream` 是尝试级分组（一次请求可以进多个桶），
+  `by_model` 等是请求级分组；两者分别满足「各渠道尝试数之和等于窗口尝试数」与
+  「各模型请求数之和等于窗口请求数」。
+- `/debug/stats` 随 `listen` 缺省只绑回环，因此缺省不鉴权；绑到非回环地址后与数据面
+  一样要求 `client_key`。它不接受写操作，也不产生访问记录。
+- 通配匹配从 `internal/catalog` 抽到 `internal/pattern`：统计过滤不应为了一个字符串
+  匹配去依赖模型目录。语义与不变量保持不变。
+- 上游尝试记录新增渠道名（`domain.AttemptRecord.Provider`、`domain.Route.Provider`）：
+  渠道名原先只以拼接形式存在于 `UpstreamID` 里，而那个字段明确不可反推。
+
+**文档**
+
+- 新增 `docs/openapi.yaml`：数据面与管理端点的全部 HTTP 接口写成一份 OpenAPI 3.1 规范
+  （转发、模型清单、统计、探活、热重载）。转发类接口只规定 nova 自己读写的部分
+  （路径、鉴权、`model` 选路字段、流式开关、错误形状与自加的响应头），
+  报文其余字段以各供应商文档为准。
 
 **仍未实现**
 
-- 可观测性的采集侧：没有指标（metrics）与追踪（traces）导出。
+- 可观测性的采集侧：统计已落 SQLite，但没有指标（metrics）与追踪（traces）导出，
+  保留期与扫描上限也还没有配置指令。
 - 清单的定时刷新（`discover_interval`）：目录只在启动与 reload 时更新。
 - 清单分页：`has_more` 为真只记一条提醒，可能漏掉上游后续页里的模型。
 
