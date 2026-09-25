@@ -508,6 +508,16 @@ nova version --json          # 给脚本消费：程序版本 + 支持的配置�
 未提交改动时带 `-dirty`）> `0.0.0`。二进制内嵌的 VCS 信息会单独报出「构建自哪个提交」，
 两件事不合并成一个字段：合并后的 `v0.0.0-2-g4700f09` 既不能当版本号比较，也不是提交号。
 
+因此**打 tag 就是发版**，而这个动作是自动的：合并到 `main` 时，`.github/workflows/release.yml`
+按 `CHANGELOG.md` 的 `## Unreleased` 段升一位版本号、把该段标题改成 `## vX.Y.Z`、打上 tag，
+并产出 `linux/amd64` 与 `linux/arm64` 的 tar.gz 与 `SHA256SUMS` 到 GitHub Release。
+`## Unreleased` 段为空时不发版。版本位的判定见 `scripts/release.sh`，本地预演：
+
+```sh
+make release-dry-run          # 打印这次合并会发成哪个版本
+make release-dry-run BUMP=y   # 指定版本位再看结果
+```
+
 ## 开发
 
 ```sh

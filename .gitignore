@@ -4,6 +4,9 @@
 /bin/
 /nova
 
+# 发版产物：发布工作流把 tar.gz 与 SHA256SUMS 落在 dist/，它属于某一次构建，不属于源
+/dist/
+
 # 测试与覆盖率产物
 *.test
 *.out

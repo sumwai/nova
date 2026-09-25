@@ -157,6 +157,29 @@
 - 上游尝试记录新增渠道名（`domain.AttemptRecord.Provider`、`domain.Route.Provider`）：
   渠道名原先只以拼接形式存在于 `UpstreamID` 里，而那个字段明确不可反推。
 
+**发布**
+
+- 合并到 main 即发版：`.github/workflows/release.yml` 先在 main 上跑一遍 `make check`，
+  再按 CHANGELOG 的 `## Unreleased` 段定出下一个版本号、把该段标题改成 `## vX.Y.Z`、
+  提交并打 tag，最后编译 `linux/amd64` 与 `linux/arm64` 两个产物并建 GitHub Release
+  （附 `SHA256SUMS`）。`## Unreleased` 段为空时不发版，因此没有对外变更的合并
+  不会产出空版本。
+- 版本位由 `scripts/release.sh` 判定：自上个 tag 起有破坏性变更（题注带 `!`，或正文带
+  `BREAKING CHANGE`）或配置语法代数 `CurrentSchema` 变了就升 `y` 位并把 `z` 清零，
+  否则升 `z` 位；`x` 位只由显式指定（`--bump x`）触发，不从提交推断——「大功能」是人的判断，
+  不是能从提交信息里读出来的事实。代数变了而判定成 `z` 位时直接中断发版，
+  而不是发出一个与「不兼容变更 `y+1`」规则不符的版本号。
+- 破坏性变更的判据读提交题注与正文，不读 PR 正文：squash 合并进入历史的只有分支提交信息，
+  照 PR 正文判定会永远判不出破坏性变更。
+- tag 推送单独触发一轮（`--tag` 形态）：tag 由手工推送、或 main 那轮在打 tag 之后失败时，
+  靠它按 CHANGELOG 里已有的段落补出 Release。这一轮不重新算版本号；同一版本重复触发是
+  幂等的，已存在的 Release 只补传产物与说明。
+- 发布说明就是 CHANGELOG 里那一段的原文，不另写一份：两处各写一份文案，
+  迟早会在某一处先漂移。
+- 本地预演用 `make release-dry-run`（可加 `BUMP=y`），与 CI 走同一段判定，只打印不改仓库。
+- 版本号仍由 tag 决定（`make build-binary` 的注入规则不变），因此「打 tag 就是发版」
+  这条事实没有被自动化改掉，只是不再需要手工做：手工推 `vX.Y.Z` tag 仍然有效。
+
 **文档**
 
 - 新增 `docs/openapi.yaml`：数据面与管理端点的全部 HTTP 接口写成一份 OpenAPI 3.1 规范
