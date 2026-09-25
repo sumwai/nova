@@ -90,7 +90,9 @@ jobs:
             GOOS=${os} GOARCH=${arch} make build-binary VERSION="${TAG}"
             tar -czf "dist/nova_${TAG}_${os}_${arch}.tar.gz" -C bin nova
           done
-          sha256sum dist/nova_*.tar.gz > dist/SHA256SUMS
+          # 在 dist 内计算校验和，路径不带 dist/ 前缀：校验和文件的意义是「拿到这几个文件后
+          # 能自证」，而带前缀的路径只在构建机上成立，下载者执行 sha256sum -c 会直接报找不到文件。
+          (cd dist && sha256sum nova_*.tar.gz > SHA256SUMS)
           cat dist/SHA256SUMS
       - name: 建或补 Release
         if: steps.version.outputs.released == 'true'
