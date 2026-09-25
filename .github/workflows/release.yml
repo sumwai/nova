@@ -1,0 +1,107 @@
+name: release
+
+# 合并到 main 即发版：main 上每出现一段非空的 ## Unreleased，就按版本号规则升一位、
+# 把该段落的标题改成 ## vX.Y.Z、提交、打 tag，并把这段文字做成 GitHub Release 说明。
+# 没有对外变更的合并（## Unreleased 段为空）不发版，因此不会产出空版本。
+#
+# v* tag 的推送单独触发一轮：tag 由手工推送、或 main 那轮在打 tag 之后失败时，
+# 靠它按 CHANGELOG 里已有的段落补出 Release。这一轮不重新算版本号。
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 版本位；auto 按提交与配置代数判定
+        type: choice
+        options: [auto, z, y, x]
+        default: auto
+      dry_run:
+        description: 只预演，不提交、不打 tag、不建 Release
+        type: boolean
+        default: false
+
+# 两轮并发会各自算出同一个版本号并争同一个 tag，因此串行排队，不取消在跑的那轮。
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 门禁
+        run: make check
+
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 提交发版记录、推 tag、建 Release 都要写权限
+    outputs:
+      released: ${{ steps.version.outputs.released }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 版本号来自最近的 tag，浅克隆里没有 tag
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 提交身份
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: 定版本
+        id: version
+        env:
+          BUMP: ${{ inputs.bump || 'auto' }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args="--notes ${RUNNER_TEMP}/nova-notes.md"
+          if [ "${DRY_RUN}" = 'true' ]; then
+            args="${args} --dry-run"
+          fi
+          if [ "${GITHUB_REF_TYPE}" = 'tag' ]; then
+            # tag 触发时版本号已定，只校验 CHANGELOG 里有对应段落并抽说明。
+            scripts/release.sh --tag "${GITHUB_REF_NAME}" ${args}
+          else
+            scripts/release.sh --bump "${BUMP:-auto}" ${args}
+          fi
+      - name: 编译发布产物
+        if: steps.version.outputs.released == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64; do
+            os=${target%%/*}
+            arch=${target##*/}
+            GOOS=${os} GOARCH=${arch} make build-binary VERSION="${TAG}"
+            tar -czf "dist/nova_${TAG}_${os}_${arch}.tar.gz" -C bin nova
+          done
+          sha256sum dist/nova_*.tar.gz > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+      - name: 建或补 Release
+        if: steps.version.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/nova_"${TAG}"_*.tar.gz dist/SHA256SUMS --clobber
+            gh release edit "${TAG}" --title "${TAG}" --notes-file "${RUNNER_TEMP}/nova-notes.md"
+          else
+            gh release create "${TAG}" dist/nova_"${TAG}"_*.tar.gz dist/SHA256SUMS \
+              --title "${TAG}" --notes-file "${RUNNER_TEMP}/nova-notes.md"
+          fi

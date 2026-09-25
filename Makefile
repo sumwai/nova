@@ -22,7 +22,7 @@ VERSION_PKG := github.com/sumwai/nova/internal/version
 unexport VERSION
 export VERSION_RAW := $(value VERSION)
 
-.PHONY: all build build-binary install uninstall test vet fmt fmt-check check clean help
+.PHONY: all build build-binary install uninstall test vet fmt fmt-check check release-dry-run clean help
 
 all: build
 
@@ -92,6 +92,15 @@ fmt-check:
 
 ## check: 本地门禁 = build + vet + test + fmt-check
 check: build vet test fmt-check
+
+## release-dry-run: 预演一次发版，算出下一个版本号与发布说明，不改仓库、不打 tag
+#
+# 正式发版在合并到 main 时由 .github/workflows/release.yml 触发，两边调的是同一个
+# scripts/release.sh。这个目标把同一段判定搬到手边，用来回答「这次合并会发成哪个版本」：
+# 预演与真发用两份判定逻辑，是版本号规则最容易开始漂移的地方。
+# 指定版本位：make release-dry-run BUMP=y
+release-dry-run:
+	@scripts/release.sh --dry-run $(if $(BUMP),--bump $(BUMP),)
 
 ## clean: 删除构建产物
 clean:
