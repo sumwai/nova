@@ -1,0 +1,1581 @@
+openapi: 3.1.0
+
+info:
+  title: nova
+  version: "0.1.0"
+  summary: 大模型 API 转发网关
+  description: |
+    nova 是一个大模型 API 转发网关：客户端请求经鉴权后按对外模型名选路，需要时在四种线协议
+    之间转换，前一条候选失败时按配置里的声明顺序回退，流式与非流式都支持。
+
+    本文件描述 nova 二进制实际暴露的全部 HTTP 接口。转发类接口的请求体与成功响应体沿用
+    对应供应商的线协议（nova 在其中不改字段名），因此这里只规定 nova 自己读写的部分：
+    路径、方法、鉴权、`model` 选路字段、流式开关、错误形状，以及网关自己增加的响应头。
+    各协议的完整字段表以供应商文档为准。
+
+    ## 两个监听器
+
+    | 监听器 | 配置项 | 缺省地址 | 用途 |
+    |---|---|---|---|
+    | 数据面 | `listen` | `127.0.0.1:8080` | 转发、模型清单、统计、探活 |
+    | 管理端点 | `admin` | `localhost:2026` | 热重载 |
+
+    两者都缺省只绑回环。数据面在配置了 `client_key` 时要求客户端凭据；管理端点没有鉴权，
+    因此更不应绑到非回环地址。
+
+    ## 鉴权
+
+    配置了 `client_key`（可多条）时，数据面上的转发路径与 `GET /v1/models` 要求客户端凭据。
+    以下三种头部任一匹配即放行：
+
+    - `Authorization: Bearer <key>`
+    - `x-api-key: <key>`
+    - `x-goog-api-key: <key>`（Gemini 客户端）
+
+    未配置 `client_key` 时不鉴权。鉴权发生在方法校验之前，因此凭据缺失或错误时返回 401，
+    而不是 405。`GET /healthz` 永不经鉴权；`GET /debug/stats` 仅在 `listen` 绑到非回环地址时
+    要求凭据。
+
+    ## 选路与协议转换
+
+    - 请求体里的 `model` 只用于选路，**不会原样转发**：网关按配置把对外名映射为上游模型名。
+      Gemini 是例外，它的模型名写在路径上。
+    - 客户端协议由请求路径决定；端点协议与它不一致时由网关转换，配置里不需要声明。
+      成功响应的形状始终与客户端协议一致。
+    - 响应头 `x-tokenmp-routed-model` 给出本次实际履约的上游模型名。客户端请求的模型名是
+      对外别名，可能与它不同。
+
+    ## 通用限制
+
+    - 请求体上限 32 MiB，超限按客户端错误拒绝。
+    - 流式响应单次写出最多等待 10 秒；客户端超过该时长不读取时连接被切断。
+
+    ## 错误
+
+    错误响应体的形状随协议而定（见各接口的响应示例），但错误码取自同一张表：
+
+    `invalid_request` `unauthorized` `forbidden` `rate_limited` `gateway_overloaded`
+    `model_not_found` `not_found` `upstream_timeout` `upstream_unavailable`
+    `upstream_rate_limited` `upstream_rejected` `internal`
+
+    被过滤掉的模型与上游不存在的模型对客户端不可区分，两者都返回 `model_not_found`。
+    命中不了任何对外名时网关不会猜一条渠道转发。
+
+    ## 未注册的路径
+
+    数据面上未注册的路径一律回纯文本 404（不经适配器编码）。已注册路径上的错误才按协议
+    形状编码。
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: 数据面（配置项 `listen`）
+  - url: http://localhost:2026
+    description: 管理端点（配置项 `admin`）
+
+tags:
+  - name: Health
+    description: 探活。不经鉴权、不经转发。
+  - name: Models
+    description: 模型清单。列出客户端可以请求的对外模型名。
+  - name: Inference
+    description: 转发。四种客户端线协议。
+  - name: Observability
+    description: 进程内的请求与用量统计。
+  - name: Admin
+    description: 管理端点。只在 `admin` 监听器上提供。
+
+security:
+  - clientKey: []
+  - apiKeyHeader: []
+  - googleApiKey: []
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: 存活探针
+      operationId: getHealthz
+      description: |
+        恒回 200 与纯文本 `ok`。任何 HTTP 方法都回同样结果。
+
+        它不探活上游：那会让探活随上游抖动而失败，使编排系统反复重启一个本身健康的网关。
+      security: []
+      responses:
+        "200":
+          description: 进程在线
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: ok
+
+  /v1/models:
+    get:
+      tags: [Models]
+      summary: 列出可用的对外模型名
+      operationId: listModels
+      description: |
+        响应形状由请求头 `anthropic-version` 判定：带该头回答 Anthropic 形状，其余回答
+        OpenAI 形状。与其它路径一样要过 `client_key`。只接受 GET；不支持分页，恒回全量。
+
+        它只读当前目录快照，不触发上游模型发现。目录在启动与 reload 时确定。
+      parameters:
+        - $ref: "#/components/parameters/AnthropicVersion"
+      responses:
+        "200":
+          description: 模型清单（OpenAI 形状或 Anthropic 形状）
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OpenAIModelList"
+                  - $ref: "#/components/schemas/AnthropicModelList"
+              examples:
+                openai:
+                  summary: 不带 anthropic-version 时的形状
+                  value:
+                    object: list
+                    data:
+                      - id: gpt-5
+                        object: model
+                        created: 0
+                        owned_by: nova
+                anthropic:
+                  summary: 带 anthropic-version 时的形状
+                  value:
+                    data:
+                      - type: model
+                        id: claude-sonnet-4
+                        display_name: claude-sonnet-4
+                        created_at: "1970-01-01T00:00:00Z"
+                    has_more: false
+                    first_id: claude-sonnet-4
+                    last_id: claude-sonnet-4
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "405":
+          description: 非 GET 请求。响应体是纯文本，不是协议错误体。
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/chat/completions:
+    post:
+      tags: [Inference]
+      summary: OpenAI Chat Completions（转发）
+      operationId: createChatCompletion
+      description: |
+        请求体是 OpenAI Chat Completions 报文；网关从其中读取 `model` 用于选路，
+        并按 `stream` 决定是否流式。其余字段原样透传给命中协议一致的上游。
+
+        上游协议不一致时由网关重建请求与响应，此时仅内部统一格式能表达的字段会保留。
+      parameters:
+        - $ref: "#/components/parameters/ClientKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionRequest"
+      responses:
+        "200":
+          description: |
+            非流式响应；或 `stream: true` 时的 `text/event-stream` 帧流。
+          headers:
+            XRoutedModel:
+              $ref: "#/components/headers/XRoutedModel"
+            CacheControl:
+              $ref: "#/components/headers/SSECacheControl"
+            XAccelBuffering:
+              $ref: "#/components/headers/SSEXAccelBuffering"
+          content:
+            application/json:
+              schema:
+                type: object
+                description: OpenAI Chat Completions 响应对象，字段见供应商文档。
+                additionalProperties: true
+            text/event-stream:
+              schema:
+                type: string
+                description: "OpenAI Chat 的 SSE 帧流，以 `data: [DONE]` 收尾。"
+        "400":
+          $ref: "#/components/responses/OpenAIBadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/OpenAIModelNotFound"
+        "405":
+          $ref: "#/components/responses/OpenAIMethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/OpenAITooManyRequests"
+        "500":
+          $ref: "#/components/responses/OpenAIInternal"
+        "502":
+          $ref: "#/components/responses/OpenAIBadGateway"
+        "503":
+          $ref: "#/components/responses/OpenAIUnavailable"
+        "504":
+          $ref: "#/components/responses/OpenAITimeout"
+
+  /v1/responses:
+    post:
+      tags: [Inference]
+      summary: OpenAI Responses（转发）
+      operationId: createResponse
+      description: |
+        请求体是 OpenAI Responses 报文。必填 `model` 与 `input`；`stream` 决定是否流式。
+      parameters:
+        - $ref: "#/components/parameters/ClientKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResponsesRequest"
+      responses:
+        "200":
+          description: "非流式响应；或 `stream: true` 时的 `text/event-stream` 帧流。"
+          headers:
+            XRoutedModel:
+              $ref: "#/components/headers/XRoutedModel"
+            CacheControl:
+              $ref: "#/components/headers/SSECacheControl"
+            XAccelBuffering:
+              $ref: "#/components/headers/SSEXAccelBuffering"
+          content:
+            application/json:
+              schema:
+                type: object
+                description: OpenAI Responses 响应对象，字段见供应商文档。
+                additionalProperties: true
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/ResponsesBadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/ResponsesModelNotFound"
+        "405":
+          $ref: "#/components/responses/ResponsesMethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/ResponsesTooManyRequests"
+        "500":
+          $ref: "#/components/responses/ResponsesInternal"
+        "502":
+          $ref: "#/components/responses/ResponsesBadGateway"
+        "503":
+          $ref: "#/components/responses/ResponsesUnavailable"
+        "504":
+          $ref: "#/components/responses/ResponsesTimeout"
+
+  /v1/messages:
+    post:
+      tags: [Inference]
+      summary: Anthropic Messages（转发）
+      operationId: createMessage
+      description: |
+        请求体是 Anthropic Messages 报文。必填 `model`、`max_tokens`（正整数）与 `messages`；
+        `stream` 决定是否流式。
+      parameters:
+        - $ref: "#/components/parameters/ClientKey"
+        - $ref: "#/components/parameters/AnthropicVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnthropicMessagesRequest"
+      responses:
+        "200":
+          description: "非流式响应；或 `stream: true` 时的 `text/event-stream` 帧流。"
+          headers:
+            XRoutedModel:
+              $ref: "#/components/headers/XRoutedModel"
+            CacheControl:
+              $ref: "#/components/headers/SSECacheControl"
+            XAccelBuffering:
+              $ref: "#/components/headers/SSEXAccelBuffering"
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Anthropic Messages 响应对象，字段见供应商文档。
+                additionalProperties: true
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/AnthropicBadRequest"
+        "401":
+          $ref: "#/components/responses/AnthropicUnauthorized"
+        "404":
+          $ref: "#/components/responses/AnthropicModelNotFound"
+        "405":
+          $ref: "#/components/responses/AnthropicMethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/AnthropicTooManyRequests"
+        "500":
+          $ref: "#/components/responses/AnthropicInternal"
+        "502":
+          $ref: "#/components/responses/AnthropicBadGateway"
+        "503":
+          $ref: "#/components/responses/AnthropicUnavailable"
+        "504":
+          $ref: "#/components/responses/AnthropicTimeout"
+
+  "/v1beta/models/{model}:generateContent":
+    post:
+      tags: [Inference]
+      summary: Gemini generateContent（转发，非流式）
+      operationId: generateContent
+      description: |
+        Gemini 把模型名与动作都写在路径上，请求体里没有这两项。路径里的模型名（`models/`
+        前缀之后的部分）按对外名匹配选路，与另外三种协议一致。
+
+        非流式。要在同一条路径上请求流式，改用 `:streamGenerateContent`，或在路径后加
+        `?alt=sse`（两种写法等价）。
+
+        路径里的版本根按形状识别（`v1`、`v1beta` 等），不限于 `v1beta`。
+      parameters:
+        - $ref: "#/components/parameters/ClientKey"
+        - $ref: "#/components/parameters/GeminiModelPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GeminiGenerateContentRequest"
+      responses:
+        "200":
+          description: Gemini `GenerateContentResponse` 对象。
+          headers:
+            XRoutedModel:
+              $ref: "#/components/headers/XRoutedModel"
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/GeminiBadRequest"
+        "401":
+          $ref: "#/components/responses/GeminiUnauthorized"
+        "404":
+          $ref: "#/components/responses/GeminiModelNotFound"
+        "405":
+          $ref: "#/components/responses/GeminiMethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/GeminiTooManyRequests"
+        "500":
+          $ref: "#/components/responses/GeminiInternal"
+        "502":
+          $ref: "#/components/responses/GeminiBadGateway"
+        "503":
+          $ref: "#/components/responses/GeminiUnavailable"
+        "504":
+          $ref: "#/components/responses/GeminiTimeout"
+
+  "/v1beta/models/{model}:streamGenerateContent":
+    post:
+      tags: [Inference]
+      summary: Gemini streamGenerateContent（转发，流式）
+      operationId: streamGenerateContent
+      description: |
+        与 `:generateContent` 同一条端点的流式形态。响应是 `text/event-stream` 帧流。
+
+        带 `?alt=sse` 时同样是流式，且 `:generateContent` 路径也可以加它。
+      parameters:
+        - $ref: "#/components/parameters/ClientKey"
+        - $ref: "#/components/parameters/GeminiModelPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GeminiGenerateContentRequest"
+      responses:
+        "200":
+          description: Gemini 流式响应。
+          headers:
+            XRoutedModel:
+              $ref: "#/components/headers/XRoutedModel"
+            CacheControl:
+              $ref: "#/components/headers/SSECacheControl"
+            XAccelBuffering:
+              $ref: "#/components/headers/SSEXAccelBuffering"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/GeminiBadRequest"
+        "401":
+          $ref: "#/components/responses/GeminiUnauthorized"
+        "404":
+          $ref: "#/components/responses/GeminiModelNotFound"
+        "405":
+          $ref: "#/components/responses/GeminiMethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/GeminiTooManyRequests"
+        "500":
+          $ref: "#/components/responses/GeminiInternal"
+        "502":
+          $ref: "#/components/responses/GeminiBadGateway"
+        "503":
+          $ref: "#/components/responses/GeminiUnavailable"
+        "504":
+          $ref: "#/components/responses/GeminiTimeout"
+
+  /debug/stats:
+    get:
+      tags: [Observability]
+      summary: 查询用量与请求统计
+      operationId: getStats
+      description: |
+        回一份 JSON。事实存在 SQLite 里，库文件缺省是 `$XDG_STATE_HOME/nova/stats.db`
+        （未设该变量时为 `~/.local/state/nova/stats.db`）。库打开失败时网关照常服务，
+        只是不记录统计，此时本路径不被注册。
+
+        ## 响应分四块
+
+        | 块 | 范围 |
+        |---|---|
+        | `process` | 本次进程 |
+        | `accounting` | 跨重启的记账事实 |
+        | `lifetime` | 跨重启的标量累计，不受查询条件影响 |
+        | `window` | 保留期内的明细聚合，受查询条件影响 |
+
+        请求明细按保留期裁剪（缺省 30 天），`lifetime` 永不裁剪。
+
+        ## 过滤与分组
+
+        除 `group_by` 与 `detail` 相关项外，每个参数都是一个可选过滤条件，省略即不过滤。
+        取值含 `*` / `?` 时按通配匹配：匹配整个取值、两端隐式锚定、`*` 可跨 `/`、
+        `?` 匹配一个字符、不区分大小写。
+
+        `provider` 与 `upstream` 是**请求级**谓词（保留尝试集合里命中过的请求），
+        因此按渠道过滤时 `by_provider` 仍会列出这些请求用过的其它渠道。
+        `by_provider` 与 `by_upstream` 本身是**尝试级**分组：`requests` 是「在该渠道上至少
+        有一次尝试的不同请求数」，`attempts` 是尝试总数，回退时两者之和都会体现。
+
+        ## 鉴权
+
+        `listen` 绑到回环地址时不鉴权（这是缺省形态）；绑到非回环地址后与数据面一样要求
+        `client_key`。
+      parameters:
+        - $ref: "#/components/parameters/FilterClient"
+        - $ref: "#/components/parameters/FilterAgent"
+        - $ref: "#/components/parameters/FilterModel"
+        - $ref: "#/components/parameters/FilterProvider"
+        - $ref: "#/components/parameters/FilterUpstream"
+        - $ref: "#/components/parameters/FilterErrorCode"
+        - $ref: "#/components/parameters/FilterStatus"
+        - $ref: "#/components/parameters/FilterStream"
+        - $ref: "#/components/parameters/FilterSince"
+        - $ref: "#/components/parameters/FilterUntil"
+        - $ref: "#/components/parameters/GroupBy"
+        - $ref: "#/components/parameters/Detail"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Pretty"
+      responses:
+        "200":
+          description: 统计结果
+          headers:
+            CacheControl:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsReport"
+              examples:
+                minimal:
+                  summary: 一次失败转发的统计
+                  value:
+                    generated_at: "2026-09-26T04:47:41+08:00"
+                    process:
+                      started_at: "2026-09-26T04:47:41+08:00"
+                      uptime_seconds: 12
+                      restarts: 3
+                    accounting:
+                      since: "2026-09-01T10:00:00+08:00"
+                      persisted: true
+                      retention_days: 30
+                    lifetime:
+                      requests: 9000
+                      succeeded: 8904
+                      failed: 96
+                      retried_requests: 12
+                      usage_unknown_requests: 12
+                      usage:
+                        input_tokens: 120000
+                        output_tokens: 45000
+                    window:
+                      oldest: "2026-09-26T04:47:41+08:00"
+                      newest: "2026-09-26T04:47:41+08:00"
+                      retained: 1
+                      totals:
+                        requests: 1
+                        succeeded: 0
+                        failed: 1
+                        stream: 0
+                        attempts: 1
+                        retried_requests: 0
+                        usage_unknown_requests: 1
+                        written_bytes: 96
+                        duration_ms:
+                          p50: 0
+                          p90: 0
+                          p95: 0
+                          p99: 0
+                          max: 0
+                      usage:
+                        input_tokens: 0
+                        output_tokens: 0
+                      breakdowns:
+                        by_provider:
+                          - provider: smoke
+                            requests: 1
+                            attempts: 1
+                            failed: 1
+                            usage:
+                              input_tokens: 0
+                              output_tokens: 0
+                            duration_ms: { p50: 0, p90: 0, p95: 0, p99: 0, max: 0 }
+        "400":
+          description: 查询参数非法，例如不认识的参数、非法的状态类、`since` 晚于 `until`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsError"
+              example:
+                error: '不认识的查询参数 "modle"；可用的是 client, agent, model, provider, upstream, status, stream, error_code, since, until, group_by, detail, limit, pretty'
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "405":
+          description: 非 GET / HEAD 请求
+          headers:
+            Allow:
+              schema:
+                type: string
+                const: "GET, HEAD"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsError"
+        "500":
+          description: 读取统计库失败
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsError"
+    head:
+      tags: [Observability]
+      summary: 同 GET，响应体被框架丢弃
+      operationId: headStats
+      parameters:
+        - $ref: "#/components/parameters/Pretty"
+      responses:
+        "200":
+          description: 同 GET 的状态与响应头
+
+  /load:
+    post:
+      tags: [Admin]
+      summary: 热重载配置（管理端点）
+      operationId: reloadConfig
+      servers:
+        - url: http://localhost:2026
+          description: 管理端点（配置项 `admin`）
+      description: |
+        请求体是配置文件路径，成功即 200 空体。服务端按该路径走与启动期完全同一个加载流程。
+
+        管理端点**没有鉴权**，能连上它的人就能改写运行中的配置，因此缺省只绑回环。
+
+        改 `listen` 与 `admin` 本身需要重启，本接口会明确拒绝而不是静默沿用旧值。
+        配置写坏时旧配置原样继续服务，本接口以 500 与错误文本（含 `文件:行:列`）回应。
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              description: 配置文件路径
+              examples: ["/etc/nova/Novafile"]
+      responses:
+        "200":
+          description: 新配置已生效
+        "400":
+          description: 请求体为空或超过 4096 字节
+        "404":
+          description: 未知管理路径
+        "405":
+          description: 非 POST 请求
+          headers:
+            Allow:
+              schema:
+                type: string
+                const: POST
+        "500":
+          description: 加载或装配失败；响应体是错误文本
+
+components:
+  securitySchemes:
+    clientKey:
+      type: http
+      scheme: bearer
+      description: "`Authorization: Bearer <client_key>`"
+    apiKeyHeader:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Anthropic 系客户端的常用形态
+    googleApiKey:
+      type: apiKey
+      in: header
+      name: x-goog-api-key
+      description: Gemini 客户端的唯一形态；取值是裸密钥，没有方案名
+
+  parameters:
+    ClientKey:
+      name: Authorization
+      in: header
+      required: false
+      description: |
+        配置了 `client_key` 时必填。三种形态任一即可：`Authorization: Bearer <key>`、
+        `x-api-key: <key>`、`x-goog-api-key: <key>`。
+      schema:
+        type: string
+    AnthropicVersion:
+      name: anthropic-version
+      in: header
+      required: false
+      description: |
+        Anthropic 客户端的内置头。在 `/v1/models` 上它决定响应形状；带上即回答 Anthropic
+        形状，否则回答 OpenAI 形状。
+      schema:
+        type: string
+        examples: ["2023-06-01"]
+    GeminiModelPath:
+      name: model
+      in: path
+      required: true
+      description: 对外模型名，可含 `/`。`models/` 前缀之后的部分作为对外名匹配选路。
+      schema:
+        type: string
+        examples: ["gemini-2.5-flash", "publishers/google/models/gemini-2.5-pro"]
+    FilterClient:
+      name: client
+      in: query
+      description: 归一化后的客户端产品名（User-Agent 的第一个 `/`、空格或 `(` 之前的部分，小写）。
+      schema:
+        type: string
+        examples: ["claude-cli", "claude-*", "curl"]
+    FilterAgent:
+      name: agent
+      in: query
+      description: 原始 User-Agent（写进记录时按 512 个字符截断）。
+      schema:
+        type: string
+        examples: ["*external*", "python-requests/*"]
+    FilterModel:
+      name: model
+      in: query
+      description: 客户端请求的对外模型名。
+      schema:
+        type: string
+        examples: ["gpt-5", "gpt-*"]
+    FilterProvider:
+      name: provider
+      in: query
+      description: 上游渠道名（配置里 `provider` 块的块头）。请求级谓词。
+      schema:
+        type: string
+        examples: ["relay-a", "relay-*"]
+    FilterUpstream:
+      name: upstream
+      in: query
+      description: 上游标识，形如 `渠道名 主机名`。请求级谓词。
+      schema:
+        type: string
+        examples: ["relay-a api.example.com", "relay-a*"]
+    FilterErrorCode:
+      name: error_code
+      in: query
+      description: 网关错误码。成功请求的错误码为空串，因此按它过滤只剩失败请求。
+      schema:
+        type: string
+        examples: ["upstream_unavailable", "upstream_*"]
+    FilterStatus:
+      name: status
+      in: query
+      description: HTTP 状态。取值是 `2xx` 这类状态类，或 `100` 到 `599` 的具体码。
+      schema:
+        type: string
+        examples: ["2xx", "5xx", "502"]
+    FilterStream:
+      name: stream
+      in: query
+      description: 是否流式请求。
+      schema:
+        type: boolean
+    FilterSince:
+      name: since
+      in: query
+      description: |
+        时间窗下界，RFC3339 时刻或 `-10m` / `-24h` 这类相对时长。缺省为保留期起点。
+        早于保留期的记录已被裁剪，写更早的下界不会查到更多。
+      schema:
+        type: string
+        examples: ["-1h", "2026-09-26T00:00:00Z"]
+    FilterUntil:
+      name: until
+      in: query
+      description: 时间窗上界，取值同 `since`。缺省为当前时刻。
+      schema:
+        type: string
+    GroupBy:
+      name: group_by
+      in: query
+      description: |
+        要计算的分组维度，逗号分隔。缺省为全部七个。每个轴独立聚合；`provider` 与
+        `upstream` 是尝试级，其余是请求级。
+      schema:
+        type: string
+        default: "model,provider,upstream,client,status,protocol,error_code"
+        examples: ["model", "model,provider"]
+    Detail:
+      name: detail
+      in: query
+      description: 为真时附带逐请求明细，最新的排在最前。
+      schema:
+        type: boolean
+        default: false
+    Limit:
+      name: limit
+      in: query
+      description: 明细条数上限，仅在 `detail` 为真时生效。
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    Pretty:
+      name: pretty
+      in: query
+      description: 为真时缩进输出，供人眼查看。只影响排版。
+      schema:
+        type: boolean
+        default: false
+
+  headers:
+    XRoutedModel:
+      description: 本次实际履约的上游模型名。客户端请求的是对外别名，可能与它不同。
+      schema:
+        type: string
+    SSECacheControl:
+      description: 流式响应固定携带，禁止缓存与中间层改写。
+      schema:
+        type: string
+        const: "no-cache, no-transform"
+    SSEXAccelBuffering:
+      description: 流式响应固定携带，关闭 nginx 一类反向代理的响应缓冲。
+      schema:
+        type: string
+        const: "no"
+
+  schemas:
+    OpenAIModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object, created, owned_by]
+            properties:
+              id:
+                type: string
+              object:
+                type: string
+                const: model
+              created:
+                type: integer
+                description: Unix 秒；上游没给创建时间时为 0。
+              owned_by:
+                type: string
+                const: nova
+
+    AnthropicModelList:
+      type: object
+      required: [data, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            required: [type, id, display_name, created_at]
+            properties:
+              type:
+                type: string
+                const: model
+              id:
+                type: string
+              display_name:
+                type: string
+              created_at:
+                type: string
+                description: RFC3339；上游没给创建时间时为 1970-01-01T00:00:00Z。
+        has_more:
+          type: boolean
+          const: false
+          description: 网关一次给出全量，不翻页。
+        first_id:
+          type: string
+        last_id:
+          type: string
+
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: 对外模型名，用于选路，不会原样转发给上游。
+        messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        stream:
+          type: boolean
+          default: false
+        tools:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        tool_choice:
+          description: 字符串形态（`auto` / `none` / `required`）或指定具体工具的对象形态。
+        max_tokens:
+          type: integer
+          minimum: 0
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+      additionalProperties: true
+
+    ResponsesRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model:
+          type: string
+          description: 对外模型名，用于选路。
+        input:
+          description: 字符串或输入条目数组。
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+                additionalProperties: true
+        stream:
+          type: boolean
+          default: false
+        max_output_tokens:
+          type: integer
+      additionalProperties: true
+
+    AnthropicMessagesRequest:
+      type: object
+      required: [model, max_tokens, messages]
+      properties:
+        model:
+          type: string
+          description: 对外模型名，用于选路。
+        max_tokens:
+          type: integer
+          minimum: 1
+          description: 必填且必须为正整数。
+        messages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        system:
+          description: 系统提示；字符串或内容块数组。
+        stream:
+          type: boolean
+          default: false
+        tools:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        tool_choice:
+          description: "`auto` / `any` / `tool` 等 Anthropic 形态。"
+        temperature:
+          type: number
+      additionalProperties: true
+
+    GeminiGenerateContentRequest:
+      type: object
+      required: [contents]
+      properties:
+        contents:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: 会话内容。注意模型名不在这里，它写在请求路径上。
+        systemInstruction:
+          type: object
+          additionalProperties: true
+        tools:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        toolConfig:
+          type: object
+          additionalProperties: true
+        generationConfig:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+
+    GatewayErrorCode:
+      type: string
+      enum:
+        - invalid_request
+        - unauthorized
+        - forbidden
+        - rate_limited
+        - gateway_overloaded
+        - model_not_found
+        - not_found
+        - upstream_timeout
+        - upstream_unavailable
+        - upstream_rate_limited
+        - upstream_rejected
+        - internal
+
+    OpenAIError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type, code]
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+              enum: [invalid_request_error, upstream_error, api_error]
+            code:
+              $ref: "#/components/schemas/GatewayErrorCode"
+
+    AnthropicError:
+      type: object
+      required: [type, error]
+      properties:
+        type:
+          type: string
+          const: error
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              enum: [invalid_request_error, authentication_error, permission_error, rate_limit_error, api_error]
+            message:
+              type: string
+
+    GeminiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, status]
+          properties:
+            code:
+              type: integer
+              description: 与 HTTP 状态码一致。
+            message:
+              type: string
+            status:
+              type: string
+              description: Google 的规范状态名，例如 `INVALID_ARGUMENT`、`UNAVAILABLE`。
+
+    StatsError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    StatsReport:
+      type: object
+      required: [generated_at, process, accounting, lifetime, window]
+      properties:
+        generated_at:
+          type: string
+        process:
+          $ref: "#/components/schemas/StatsProcess"
+        accounting:
+          $ref: "#/components/schemas/StatsAccounting"
+        lifetime:
+          $ref: "#/components/schemas/StatsLifetime"
+        window:
+          $ref: "#/components/schemas/StatsWindow"
+
+    StatsProcess:
+      type: object
+      required: [started_at, uptime_seconds, restarts]
+      properties:
+        started_at:
+          type: string
+          description: 本次进程的启动时刻。
+        uptime_seconds:
+          type: integer
+        restarts:
+          type: integer
+          description: 本次启动之前已经启动过的次数；首次运行为 0。
+
+    StatsAccounting:
+      type: object
+      required: [since, persisted, retention_days]
+      properties:
+        since:
+          type: string
+          description: 累计的起点，即统计库第一次建立时的时刻，不是本次进程的启动时刻。
+        persisted:
+          type: boolean
+          description: 本次是否接上了持久化存储；为假时 `lifetime` 会随重启归零。
+        retention_days:
+          type: integer
+        write_errors:
+          type: integer
+          description: 落库失败的累计次数。失败不影响转发，但会让统计缺失。
+        last_write_error:
+          type: string
+
+    StatsLifetime:
+      type: object
+      required: [requests, succeeded, failed, retried_requests, usage_unknown_requests, usage]
+      properties:
+        requests:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+        retried_requests:
+          type: integer
+          description: 至少尝试过两条候选的请求数。
+        usage_unknown_requests:
+          type: integer
+          description: 有尝试但一次都没取得用量的请求数。
+        usage:
+          $ref: "#/components/schemas/UsageView"
+
+    StatsWindow:
+      type: object
+      required: [retained, totals, usage, breakdowns]
+      properties:
+        oldest:
+          type: string
+        newest:
+          type: string
+        retained:
+          type: integer
+          description: 本次读入的记录条数，受保留期、时间窗与扫描上限共同限制。
+        scan_limited:
+          type: boolean
+          description: 为真表示触到扫描上限，还有更早的记录没被读入。
+        dropped_pending:
+          type: integer
+          description: 关联暂存超限被丢弃的尝试数。正常路径恒为 0。
+        orphan_attempts:
+          type: integer
+          description: 没有关联键、无法并入任何请求的尝试数。正常路径恒为 0。
+        truncated_axes:
+          type: array
+          items:
+            type: string
+          description: 因桶数超过上限而被截断的分组轴，例如 `by_model`。
+        totals:
+          $ref: "#/components/schemas/Totals"
+        usage:
+          $ref: "#/components/schemas/UsageView"
+        breakdowns:
+          $ref: "#/components/schemas/Breakdowns"
+        requests:
+          type: array
+          items:
+            $ref: "#/components/schemas/RequestView"
+
+    Totals:
+      type: object
+      required: [requests, succeeded, failed, stream, attempts, retried_requests, usage_unknown_requests, written_bytes, duration_ms]
+      properties:
+        requests:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+        stream:
+          type: integer
+        attempts:
+          type: integer
+          description: 上游尝试总数，含回退的每一条候选。
+        retried_requests:
+          type: integer
+        usage_unknown_requests:
+          type: integer
+        written_bytes:
+          type: integer
+        duration_ms:
+          $ref: "#/components/schemas/LatencyView"
+
+    LatencyView:
+      type: object
+      required: [p50, p90, p95, p99, max]
+      properties:
+        p50: { type: integer }
+        p90: { type: integer }
+        p95: { type: integer }
+        p99: { type: integer }
+        max: { type: integer }
+      description: |
+        毫秒。取值来自定长桶直方图，因此是近似：每个分位给出它所在桶的上界，
+        且不会超过 `max`。
+
+    UsageView:
+      type: object
+      required: [input_tokens, output_tokens]
+      properties:
+        source:
+          type: string
+          enum: [upstream, estimated]
+          description: 只在单条请求或单条尝试上有意义，聚合结果里省略。
+        input_tokens:
+          type: integer
+          description: 输入 token 总数，含缓存读与缓存写。
+        output_tokens:
+          type: integer
+          description: 输出 token 总数，含推理。
+        cache_read_tokens:
+          type: integer
+        cache_write_tokens:
+          type: integer
+        reasoning_tokens:
+          type: integer
+        server_tool_uses:
+          type: integer
+          description: 服务端工具的执行次数，按次计费而非按 token。
+
+    Breakdowns:
+      type: object
+      properties:
+        by_model:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/ModelBucket"
+              - $ref: "#/components/schemas/BucketStats"
+        by_provider:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/ProviderBucket"
+              - $ref: "#/components/schemas/BucketStats"
+        by_upstream:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/UpstreamBucket"
+              - $ref: "#/components/schemas/BucketStats"
+        by_client:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/ClientBucket"
+              - $ref: "#/components/schemas/BucketStats"
+        by_status:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/StatusBucket"
+              - $ref: "#/components/schemas/BucketStats"
+        by_protocol:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/ProtocolBucket"
+              - $ref: "#/components/schemas/BucketStats"
+        by_error_code:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/ErrorCodeBucket"
+              - $ref: "#/components/schemas/BucketStats"
+
+    BucketStats:
+      type: object
+      required: [requests, failed, usage, duration_ms]
+      properties:
+        requests:
+          type: integer
+          description: |
+            请求级轴上是一次请求进一个桶。尝试级轴（`by_provider` / `by_upstream`）上取
+            「在该键上至少有一次尝试的不同请求数」，因此回退跨渠道时各桶之和会大于
+            窗口请求数。
+        attempts:
+          type: integer
+          description: 仅出现在尝试级轴上；各桶之和等于窗口尝试数。
+        failed:
+          type: integer
+        usage:
+          $ref: "#/components/schemas/UsageView"
+        duration_ms:
+          $ref: "#/components/schemas/LatencyView"
+
+    ModelBucket:
+      type: object
+      required: [model]
+      properties:
+        model:
+          type: string
+          description: 请求里未解析出模型名时为空串。
+    ProviderBucket:
+      type: object
+      required: [provider]
+      properties:
+        provider: { type: string }
+    UpstreamBucket:
+      type: object
+      required: [upstream]
+      properties:
+        upstream: { type: string }
+    ClientBucket:
+      type: object
+      required: [client]
+      properties:
+        client: { type: string }
+    StatusBucket:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+    ProtocolBucket:
+      type: object
+      required: [protocol]
+      properties:
+        protocol:
+          type: string
+    ErrorCodeBucket:
+      type: object
+      required: [error_code]
+      properties:
+        error_code:
+          type: string
+
+    RequestView:
+      type: object
+      required: [time, client, protocol, model, stream, http_status, duration_ms, written_bytes]
+      properties:
+        time:
+          type: string
+        request_id:
+          type: string
+        client:
+          type: string
+        user_agent:
+          type: string
+        protocol:
+          type: string
+        model:
+          type: string
+        stream:
+          type: boolean
+        http_status:
+          type: integer
+        duration_ms:
+          type: integer
+        written_bytes:
+          type: integer
+        error_code:
+          type: string
+        remote_addr:
+          type: string
+        usage_unknown:
+          type: integer
+          description: 本次请求里未取得用量的尝试数。
+        usage:
+          $ref: "#/components/schemas/UsageView"
+        attempts:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttemptView"
+
+    AttemptView:
+      type: object
+      required: [provider, upstream, outcome, duration_ms]
+      properties:
+        provider:
+          type: string
+        upstream:
+          type: string
+        account:
+          type: string
+          description: 渠道内账号引用，形如 `#2`；单账号渠道省略。
+        outcome:
+          type: string
+          enum: [ok, failed, cancelled]
+        error_code:
+          type: string
+        duration_ms:
+          type: integer
+        usage:
+          $ref: "#/components/schemas/UsageView"
+
+  responses:
+    Unauthorized:
+      description: |
+        缺少或无效的客户端凭据。响应体按请求路径的协议形状编码：
+        OpenAI 系是 `{"error":{"message","type","code"}}`，Anthropic 系是
+        `{"type":"error","error":{"type","message"}}`，Gemini 是
+        `{"error":{"code","message","status"}}`；路径不受支持时为纯文本。
+      content:
+        application/json:
+          schema:
+            type: object
+            description: 上列三种协议错误体之一。
+            additionalProperties: true
+        text/plain:
+          schema:
+            type: string
+
+    OpenAIBadRequest:
+      description: 请求体不合法（`invalid_request`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    OpenAIModelNotFound:
+      description: 没有命中任何对外模型名（`model_not_found`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    OpenAIMethodNotAllowed:
+      description: 非 POST 请求
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    OpenAITooManyRequests:
+      description: "`gateway_overloaded` 或 `rate_limited`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    OpenAIInternal:
+      description: 网关内部错误（`internal`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    OpenAIBadGateway:
+      description: "`upstream_unavailable` 或 `upstream_rejected`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    OpenAIUnavailable:
+      description: 全部上游候选都被限流（`upstream_rate_limited`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    OpenAITimeout:
+      description: 上游超时（`upstream_timeout`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+
+    ResponsesBadRequest:
+      description: 请求体不合法（`invalid_request`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    ResponsesModelNotFound:
+      description: 没有命中任何对外模型名（`model_not_found`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    ResponsesMethodNotAllowed:
+      description: 非 POST 请求
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    ResponsesTooManyRequests:
+      description: "`gateway_overloaded` 或 `rate_limited`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    ResponsesInternal:
+      description: 网关内部错误（`internal`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    ResponsesBadGateway:
+      description: "`upstream_unavailable` 或 `upstream_rejected`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    ResponsesUnavailable:
+      description: 全部上游候选都被限流（`upstream_rate_limited`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+    ResponsesTimeout:
+      description: 上游超时（`upstream_timeout`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OpenAIError"
+
+    AnthropicBadRequest:
+      description: 请求体不合法（`invalid_request`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+    AnthropicUnauthorized:
+      description: 缺少或无效的客户端凭据（`unauthorized`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+    AnthropicModelNotFound:
+      description: 没有命中任何对外模型名（`model_not_found`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+    AnthropicMethodNotAllowed:
+      description: 非 POST 请求
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+    AnthropicTooManyRequests:
+      description: "`gateway_overloaded`、`rate_limited` 或 `upstream_rate_limited`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+    AnthropicInternal:
+      description: 网关内部错误（`internal`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+    AnthropicBadGateway:
+      description: "`upstream_unavailable` 或 `upstream_rejected`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+    AnthropicUnavailable:
+      description: 全部上游候选都被限流（`upstream_rate_limited`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+    AnthropicTimeout:
+      description: 上游超时（`upstream_timeout`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AnthropicError"
+
+    GeminiBadRequest:
+      description: 请求体不合法（`invalid_request`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"
+    GeminiUnauthorized:
+      description: 缺少或无效的客户端凭据（`unauthorized`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"
+    GeminiModelNotFound:
+      description: 没有命中任何对外模型名（`model_not_found`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"
+    GeminiMethodNotAllowed:
+      description: 非 POST 请求
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"
+    GeminiTooManyRequests:
+      description: "`gateway_overloaded` 或 `rate_limited`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"
+    GeminiInternal:
+      description: 网关内部错误（`internal`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"
+    GeminiBadGateway:
+      description: "`upstream_unavailable` 或 `upstream_rejected`"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"
+    GeminiUnavailable:
+      description: 全部上游候选都被限流（`upstream_rate_limited`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"
+    GeminiTimeout:
+      description: 上游超时（`upstream_timeout`）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/GeminiError"

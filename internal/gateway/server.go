@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sumwai/nova/internal/config"
+	"github.com/sumwai/nova/internal/stats"
 )
 
 // 两个监听器的读头超时，与优雅退出的等待上限。
@@ -29,6 +30,10 @@ type Options struct {
 	// reload 请求会带来它自己的路径，因此这个字段只决定启动读哪一份。
 	ConfigPath string
 
+	// StatePath 是统计库（SQLite）的文件路径；空表示不落盘。
+	// 它与配置文件分开：配置描述「该怎么跑」，状态是「跑过什么」，两者生命周期不同。
+	StatePath string
+
 	// LogOutput 是横幅、日志与提醒的落点。
 	// 它与命令行结果输出分开：日志走 stderr 时，`nova version --json | jq`
 	// 才不会被日志行污染。
@@ -45,15 +50,25 @@ func Run(ctx context.Context, opt Options) error {
 	if err != nil {
 		return err
 	}
-	first, err := Assemble(ctx, cfg, opt.LogOutput)
+	// 统计库在此打开并交给装配：它跨 reload 存活，因此属于进程而不是某一装配。
+	// 打开失败只降级不退出——观测能力不可用不该拦下一个本身健康的网关。
+	store, storeErr := stats.New(stats.Options{Path: opt.StatePath})
+	first, err := Assemble(ctx, cfg, AssembleOptions{LogOutput: opt.LogOutput, Stats: store})
 	if err != nil {
+		_ = store.Close()
 		return err
 	}
+	if storeErr != nil {
+		first.Logger.failure("统计库不可用，本次运行不记录统计", storeErr)
+	}
 
-	s := &server{holder: NewHolder(first), out: opt.LogOutput}
+	s := &server{holder: NewHolder(first), out: opt.LogOutput, stats: store}
 	reportWarnings(first.Logger, cfg)
 	first.Logger.startup(cfg, first.Stats, false)
-	return s.serve(ctx)
+	serveErr := s.serve(ctx)
+	// 退出前关库：不关会把 WAL 与 shm 留在磁盘上，留给下一次启动去恢复。
+	_ = store.Close()
+	return serveErr
 }
 
 // server 是一次 Run 的进程级状态。
@@ -63,6 +78,8 @@ func Run(ctx context.Context, opt Options) error {
 type server struct {
 	holder *Holder
 	out    io.Writer
+	// stats 是进程级统计存储，跨 reload 复用；每次装配共用它，因此累计不会因换配置归零。
+	stats *stats.Store
 }
 
 // serve 建立两个监听器并等它们结束。
@@ -169,7 +186,7 @@ func (s *server) reload(ctx context.Context, path string) error {
 	if err := checkReloadable(s.holder.Current().Config, next); err != nil {
 		return err
 	}
-	assembled, err := Assemble(ctx, next, s.out)
+	assembled, err := Assemble(ctx, next, AssembleOptions{LogOutput: s.out, Stats: s.stats})
 	if err != nil {
 		return err
 	}

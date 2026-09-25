@@ -155,10 +155,15 @@ func (s CredentialHeaderStyle) Valid() bool {
 
 // Route 是一次选路的结果，描述一个可用的上游渠道。
 //
-// UpstreamID / Protocol / UpstreamModel / BaseURL / Timeout / OutputLimit 是路由必需事实；
+// UpstreamID / Provider / Protocol / UpstreamModel / BaseURL / Timeout / OutputLimit 是路由必需事实；
 // CredentialRef 是不透明引用，明文凭据由装配层的请求头提供者按它解析后注入，Route 不得携带明文。
 type Route struct {
 	UpstreamID string
+	// Provider 是这条渠道的名字，即配置里 provider 块的块头。
+	//
+	// 它不参与选路，只供观测归因：UpstreamID 是被拼接出的展示串（渠道名 + 主机名），
+	// 且不保证单射，因此「按渠道分组统计」这类判断不能由它反推，只能由本字段直传。
+	Provider string
 	// Protocol 是上游渠道使用的线协议。调用方据此判定客户端协议与上游协议是否一致，
 	// 从而决定走同协议透传还是按内部统一格式重建。
 	Protocol      Protocol
@@ -421,7 +426,9 @@ type AttemptRecord struct {
 	// 两者不同即表示网关改写过模型名。
 	RequestedModel string
 	UpstreamID     string
-	UpstreamModel  string
+	// Provider 是本次尝试打到的渠道名，与 UpstreamID 的区别是本字段未经拼接，可直接按值分组。
+	Provider      string
+	UpstreamModel string
 	// AccountRef 是本次尝试使用的渠道内账号引用，空串表示单账号渠道。
 	// 它与 UpstreamID 一起回答「这一条打到哪个账号上」：多账号排障时
 	// 光看渠道名看不出是哪个账号在限流。

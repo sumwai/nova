@@ -41,7 +41,7 @@ provider gemini-up {
 // assembleDataPlane 装配配置并返回数据面处理器。
 func assembleDataPlane(t *testing.T, cfg *config.Config) http.Handler {
 	t.Helper()
-	assembled, err := Assemble(context.Background(), cfg, io.Discard)
+	assembled, err := Assemble(context.Background(), cfg, AssembleOptions{LogOutput: io.Discard})
 	if err != nil {
 		t.Fatalf("装配失败：%v", err)
 	}

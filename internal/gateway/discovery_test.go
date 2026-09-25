@@ -60,7 +60,7 @@ func TestAssembleMergesDiscoveredAndDeclaredModels(t *testing.T) {
 	cfg.Providers[0].Endpoints[0].Discover.Allow = []string{"gpt-5*", "claude-*"}
 	cfg.Providers[0].Endpoints[0].Discover.Deny = []string{"*-preview"}
 
-	assembled, err := Assemble(context.Background(), cfg, io.Discard)
+	assembled, err := Assemble(context.Background(), cfg, AssembleOptions{LogOutput: io.Discard})
 	if err != nil {
 		t.Fatalf("Assemble 意外失败：%v", err)
 	}
@@ -105,7 +105,7 @@ func TestAssembleDegradesToDeclaredModelsWhenDiscoveryFails(t *testing.T) {
 	defer listing.Close()
 
 	cfg := discoveryConfig(listing.URL+"/v1/models", config.Model{Name: "gpt-5"})
-	assembled, err := Assemble(context.Background(), cfg, io.Discard)
+	assembled, err := Assemble(context.Background(), cfg, AssembleOptions{LogOutput: io.Discard})
 	if err != nil {
 		t.Fatalf("有显式模型可退回时不该装配失败，实际：%v", err)
 	}
@@ -131,7 +131,7 @@ func TestAssembleFailsWhenDiscoveryFailsWithoutDeclaredModels(t *testing.T) {
 	defer listing.Close()
 
 	cfg := discoveryConfig(listing.URL + "/v1/models")
-	_, err := Assemble(context.Background(), cfg, io.Discard)
+	_, err := Assemble(context.Background(), cfg, AssembleOptions{LogOutput: io.Discard})
 	if err == nil {
 		t.Fatal("没有显式模型可退回时应当装配失败")
 	}
@@ -166,7 +166,7 @@ func TestDiscoveryReusesProtocolHeaders(t *testing.T) {
 			}},
 		}},
 	}
-	assembled, err := Assemble(context.Background(), cfg, io.Discard)
+	assembled, err := Assemble(context.Background(), cfg, AssembleOptions{LogOutput: io.Discard})
 	if err != nil {
 		t.Fatalf("Assemble 意外失败：%v", err)
 	}
@@ -229,7 +229,7 @@ func TestAssembleExposesRenamedModels(t *testing.T) {
 		{From: "sensenova/*", To: "*"},
 	}
 
-	assembled, err := Assemble(context.Background(), cfg, io.Discard)
+	assembled, err := Assemble(context.Background(), cfg, AssembleOptions{LogOutput: io.Discard})
 	if err != nil {
 		t.Fatalf("Assemble 意外失败：%v", err)
 	}
@@ -270,7 +270,7 @@ func TestAssemblePrefersDeclaredOverExposedName(t *testing.T) {
 		config.Model{Name: "kimi-k3", Upstream: "固定的上游名"})
 	cfg.Providers[0].Endpoints[0].Discover.Expose = []config.Alias{{From: "sensenova/*", To: "*"}}
 
-	assembled, err := Assemble(context.Background(), cfg, io.Discard)
+	assembled, err := Assemble(context.Background(), cfg, AssembleOptions{LogOutput: io.Discard})
 	if err != nil {
 		t.Fatalf("Assemble 意外失败：%v", err)
 	}

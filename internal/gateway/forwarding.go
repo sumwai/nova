@@ -164,9 +164,9 @@ func routesByModel(endpoints []effectiveEndpoint) map[string][]endpointRoute {
 		provider := item.provider.Name
 		for _, model := range item.models {
 			table[model.Name] = append(table[model.Name], endpointRoute{
-				provider: provider,
 				Route: domain.Route{
 					UpstreamID:    upstreamID(provider, item.endpoint),
+					Provider:      provider,
 					Protocol:      item.endpoint.Protocol,
 					UpstreamModel: model.Upstream,
 					BaseURL:       item.endpoint.URL,
@@ -310,11 +310,9 @@ type modelRouteResolver struct {
 //
 // 它嵌 domain.Route 而不另建一套字段，是为了让选路表在未展开账号时
 // 就已经是一条可直接交给流水线的路由；账号只差一个取值。
-// provider 单独存一份，供请求期按渠道取账号池：
-// UpstreamID 里虽然也有渠道名，但那是一个给人读的字符串，不得由它反推渠道。
+// 渠道名不再单独存一份，由嵌入的 Route.Provider 承载：存两份会随时间漂移。
 type endpointRoute struct {
 	domain.Route
-	provider string
 }
 
 // accountPool 是一个渠道的账号池及其轮转状态。
@@ -510,10 +508,10 @@ func groupByProvider(chain []endpointRoute) ([][]endpointRoute, map[string]int) 
 	at := make(map[string]int, len(chain))
 	var groups [][]endpointRoute
 	for _, candidate := range chain {
-		index, ok := at[candidate.provider]
+		index, ok := at[candidate.Provider]
 		if !ok {
 			index = len(groups)
-			at[candidate.provider] = index
+			at[candidate.Provider] = index
 			groups = append(groups, nil)
 		}
 		groups[index] = append(groups[index], candidate)
@@ -611,12 +609,12 @@ func (r *modelRouteResolver) Candidates(_ context.Context, req *domain.Request) 
 	orders := make(map[string][]string, len(r.accounts))
 	expanded := make([]domain.Route, 0, len(candidates))
 	for _, candidate := range candidates {
-		order, cached := orders[candidate.provider]
+		order, cached := orders[candidate.Provider]
 		if !cached {
-			if pool := r.accounts[candidate.provider]; pool != nil {
+			if pool := r.accounts[candidate.Provider]; pool != nil {
 				order = pool.order()
 			}
-			orders[candidate.provider] = order
+			orders[candidate.Provider] = order
 		}
 		if len(order) == 0 {
 			expanded = append(expanded, candidate.Route)
@@ -650,7 +648,7 @@ func (r *modelRouteResolver) maxCandidates() int {
 		total := 0
 		for _, candidate := range candidates {
 			total++
-			if pool := r.accounts[candidate.provider]; pool != nil {
+			if pool := r.accounts[candidate.Provider]; pool != nil {
 				total += len(pool.refs) - 1
 			}
 		}

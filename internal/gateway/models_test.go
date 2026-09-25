@@ -166,7 +166,7 @@ func TestModelsHandlerRejectsNonGet(t *testing.T) {
 func TestDataPlaneServesModelsPathWithCredentials(t *testing.T) {
 	var forward stubForwarder
 	cfg := &config.Config{ClientKeys: []string{"secret"}}
-	handler := newDataPlane(&forward, cfg, adapterResolver(newAdapters()), testModelEntries())
+	handler := newDataPlane(&forward, cfg, adapterResolver(newAdapters()), testModelEntries(), nil)
 
 	req := httptest.NewRequest(http.MethodGet, modelsPath, nil)
 	req.Header.Set("Authorization", "Bearer secret")
@@ -187,7 +187,7 @@ func TestDataPlaneServesModelsPathWithCredentials(t *testing.T) {
 // 模型清单与转发路径一样要过鉴权；401 的形状按请求头判定，与成功响应一致。
 func TestDataPlaneAuthorizesModelsPath(t *testing.T) {
 	cfg := &config.Config{ClientKeys: []string{"secret"}}
-	handler := newDataPlane(&stubForwarder{}, cfg, adapterResolver(newAdapters()), testModelEntries())
+	handler := newDataPlane(&stubForwarder{}, cfg, adapterResolver(newAdapters()), testModelEntries(), nil)
 
 	tests := []struct {
 		name       string

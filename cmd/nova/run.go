@@ -19,6 +19,11 @@ import (
 // 任何名字的配置，用文件名当变量名会暗示「它只认 Novafile 这个文件名」。
 const configEnvVar = "NOVA_CONFIG"
 
+// stateEnvVar 是 XDG 状态目录的环境变量名。
+//
+// Go 标准库只提供 UserConfigDir 与 UserCacheDir，没有 UserStateDir，因此这一项要自己读。
+const stateEnvVar = "XDG_STATE_HOME"
+
 func newRunCmd() *cobra.Command {
 	var configPath string
 	cmd := &cobra.Command{
@@ -33,11 +38,16 @@ func newRunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			statePath, err := defaultStatePath()
+			if err != nil {
+				return err
+			}
 			ctx, stop := notifyShutdown(cmd)
 			defer stop()
 
 			return gateway.Run(ctx, gateway.Options{
 				ConfigPath: path,
+				StatePath:  statePath,
 				LogOutput:  cmd.ErrOrStderr(),
 			})
 		},
@@ -95,6 +105,24 @@ func resolveConfigPath(flagValue string, getenv func(string) string) (string, er
 		return fromEnv, nil
 	}
 	return defaultConfigPath()
+}
+
+// defaultStatePath 返回统计库的缺省路径：状态目录下的 nova/stats.db。
+//
+// 状态目录与配置目录分开：配置回答「希望怎么跑」，状态记录「实际跑过什么」，
+// 前者通常纳入版本控制或由运维下发，后者是本机数据，混在一起会让两者互相牵连。
+//
+// 定位不到主目录时报错而不是退回当前目录：相对路径会让「上次的统计被写到哪了」
+// 随工作目录漂移，而那是重启后对不上账时最难查的一件事。
+func defaultStatePath() (string, error) {
+	if dir := os.Getenv(stateEnvVar); dir != "" {
+		return filepath.Join(dir, "nova", "stats.db"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("无法确定状态目录（%w）；统计库没有落点", err)
+	}
+	return filepath.Join(home, ".local", "state", "nova", "stats.db"), nil
 }
 
 // defaultConfigPath 返回 XDG 约定下的缺省配置路径。

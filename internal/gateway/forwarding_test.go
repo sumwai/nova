@@ -250,7 +250,7 @@ func TestMaxUpstreamAttemptsCoversLongestChain(t *testing.T) {
 		{
 			name: "候选项各自展开账号",
 			routes: map[string][]endpointRoute{
-				"a": {{provider: "p"}},
+				"a": {{Route: domain.Route{Provider: "p"}}},
 			},
 			accounts: map[string]*accountPool{
 				"p": {refs: []string{"#1", "#2", "#3"}, weights: []int{1, 1, 1}, total: 3},
