@@ -83,6 +83,11 @@ func (c *Client) Stream(ctx context.Context, route domain.Route, _ *domain.Reque
 		return classifyHTTPStatus(resp.StatusCode, resp.Header, respBody)
 	}
 
+	// 响应头在首帧之前到达，下沉目标拿到它才能做额度观测；分片解码器看不到响应头。
+	if headerSink, ok := sink.(domain.ResponseHeaderSink); ok {
+		headerSink.SetResponseHeaders(resp.Header)
+	}
+
 	frameSink, passthrough := sink.(domain.FrameSink)
 	// 看门狗按字节到达刷新：注释心跳被读取器内部跳过、不返回帧，
 	// 若只在读到完整帧时重置，只发心跳的长思考流会被空闲超时误杀。

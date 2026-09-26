@@ -516,7 +516,7 @@ func googleStatus(code domain.Code) string {
 		return "UNAUTHENTICATED"
 	case domain.CodeForbidden:
 		return "PERMISSION_DENIED"
-	case domain.CodeRateLimited, domain.CodeGatewayOverloaded, domain.CodeUpstreamRateLimited:
+	case domain.CodeRateLimited, domain.CodeGatewayOverloaded, domain.CodeUpstreamRateLimited, domain.CodeUpstreamQuotaExhausted:
 		return "RESOURCE_EXHAUSTED"
 	case domain.CodeModelNotFound, domain.CodeNotFound:
 		return "NOT_FOUND"

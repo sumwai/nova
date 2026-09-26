@@ -127,8 +127,8 @@ type Adapter interface {
 //
 // 零值 CredentialHeaderAuto 表示「渠道未配置」，此时按协议现状注入：
 // OpenAI Chat 与 OpenAI Responses 用 Authorization: Bearer、Anthropic Messages 用
-// x-api-key。取值域只有两个非零取值，「未配置」在数据里只能以「键缺失」表达，
-// 因此零值不是合法配置值（Valid 对它返回 false）。
+// x-api-key、Gemini 用 x-goog-api-key。非零取值与平台档案 auth.header 的三个取值一一
+// 对应，「未配置」在数据里只能以「键缺失」表达，因此零值不是合法配置值（Valid 对它返回 false）。
 type CredentialHeaderStyle string
 
 const (
@@ -138,15 +138,17 @@ const (
 	CredentialHeaderAuthorization CredentialHeaderStyle = "authorization"
 	// CredentialHeaderXAPIKey 注入 x-api-key: <凭据>。
 	CredentialHeaderXAPIKey CredentialHeaderStyle = "x-api-key"
+	// CredentialHeaderXGoogAPIKey 注入 x-goog-api-key: <凭据>。
+	CredentialHeaderXGoogAPIKey CredentialHeaderStyle = "x-goog-api-key"
 )
 
-// Valid 报告取值是否为两个受支持的非零取值之一。
+// Valid 报告取值是否为三个受支持的非零取值之一。
 //
 // 零值（未配置）返回 false：配置写入路径必须把「键缺失」与「键存在但取值非法」
 // 分开处理，不得把零值当成一个可写入的取值。
 func (s CredentialHeaderStyle) Valid() bool {
 	switch s {
-	case CredentialHeaderAuthorization, CredentialHeaderXAPIKey:
+	case CredentialHeaderAuthorization, CredentialHeaderXAPIKey, CredentialHeaderXGoogAPIKey:
 		return true
 	default:
 		return false
@@ -195,6 +197,10 @@ type Route struct {
 	// CredentialHeaderStyle 是调用本渠道上游时凭据请求头的注入形态，由渠道配置给出；
 	// 零值 CredentialHeaderAuto 表示未配置，按协议现状注入。
 	CredentialHeaderStyle CredentialHeaderStyle
+	// PriceKey 是这条候选在价格表里的键（形如 <档案 id>/<模型 id>），空表示未声明价格。
+	// 选路层按它做 prefer price 排序，额度层按它把 token 用量折算成 usd；它只是查表键，
+	// 不携带单价，选路之外的地方不得由它反推价格。
+	PriceKey string
 }
 
 // BreakerKey 返回一次尝试在熔断与折叠口径下的渠道键。
@@ -228,6 +234,9 @@ type RouteResolver interface {
 type UpstreamResult struct {
 	Raw      []byte
 	Response *Response
+	// Headers 是上游响应头。额度层从中解析限流观测（x-ratelimit-*、anthropic-ratelimit-*、
+	// retry-after）；它与 Raw 来自同一次读取，不单独再发请求。nil 表示上游未给出可读响应头。
+	Headers http.Header
 }
 
 // UpstreamCaller 调用一个具体上游渠道，并返回归一化结果。
@@ -368,6 +377,15 @@ type StreamErrorEncoder interface {
 // Send 返回错误表示下游已不可写（例如客户端断开）；调用方必须立即取消上游且不得继续读取。
 type ChunkSink interface {
 	Send(ctx context.Context, chunk Chunk) error
+}
+
+// ResponseHeaderSink 接收上游响应头。
+//
+// 流式路径上响应头在首帧之前到达，而分片解码器只看到帧载荷，拿不到响应头。额度层需要
+// 用响应头里的 x-ratelimit-* 做观测，因此下沉目标实现本接口时，上游客户端在状态码校验
+// 通过后立即注入响应头。实现方不得就地修改该 map。
+type ResponseHeaderSink interface {
+	SetResponseHeaders(header http.Header)
 }
 
 // FrameSink 接收上游一帧的原始字节与该帧解出的全部分片，用于响应侧按帧粒度原样透传。

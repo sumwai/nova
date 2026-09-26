@@ -910,7 +910,7 @@ func errorTypeForCode(code domain.Code) string {
 		return "authentication_error"
 	case domain.CodeForbidden:
 		return "permission_error"
-	case domain.CodeRateLimited, domain.CodeUpstreamRateLimited:
+	case domain.CodeRateLimited, domain.CodeUpstreamRateLimited, domain.CodeUpstreamQuotaExhausted:
 		return "rate_limit_error"
 	case domain.CodeModelNotFound:
 		return "not_found_error"

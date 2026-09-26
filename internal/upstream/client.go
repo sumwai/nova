@@ -106,7 +106,8 @@ func New(opts Options) (*Client, error) {
 // （连接、请求与响应体读取）。
 //
 // 上游返回非 2xx 时按状态码分级：
-//   - 429 记为可重试的上游限流
+//   - 402 与响应体命中额度语义的 403 记为可重试的上游额度耗尽
+//   - 429 记为可重试的上游限流；响应体命中额度语义时记为可重试的上游额度耗尽
 //   - 408 记为可重试的上游超时
 //   - 其余 4xx 记为不可重试的上游拒绝
 //   - 5xx 与其它非 2xx 记为可重试的上游不可用
@@ -157,7 +158,7 @@ func (c *Client) Complete(ctx context.Context, route domain.Route, _ *domain.Req
 			WithDetail(fmt.Sprintf("%s；上游响应前 %d 字节：%s", err.Error(), errorDetailLimit, errorSnippet(respBody))).
 			WithCause(err)
 	}
-	return &domain.UpstreamResult{Raw: respBody, Response: decoded}, nil
+	return &domain.UpstreamResult{Raw: respBody, Response: decoded, Headers: resp.Header}, nil
 }
 
 // errResponseTooLarge 表示上游非流式响应体超过 maxResponseBytes。
@@ -273,23 +274,69 @@ func mapTransportError(ctx context.Context, err error) *domain.Error {
 //
 // header 用于提取 Retry-After 提示：头缺失或取值非法时返回的错误不含该提示，
 // 调用方按自身退避策略处理。
+//
+// 额度耗尽与上游限流都回 503 且可重试。额度耗尽在连续失败达到阈值后由额度层
+// （internal/gateway 的 limitRuntime）写入「至 until 不可用」标记，选路会跳过它；
+// 本层只负责把状态码分级并附带 Retry-After 提示，不做抑制，避免重试口径与额度层分叉。
 func classifyHTTPStatus(status int, header http.Header, body []byte) error {
+	snippet := errorSnippet(body)
 	detail := fmt.Sprintf("上游 HTTP 状态码 %d", status)
-	if snippet := errorSnippet(body); snippet != "" {
+	if snippet != "" {
 		detail += "：" + snippet
 	}
 	var err *domain.Error
 	switch {
+	case status == http.StatusPaymentRequired:
+		// 402「需要付款」的语义就是额度或余额耗尽，无需再看响应体。
+		err = domain.NewError(domain.CodeUpstreamQuotaExhausted, "上游额度耗尽").WithDetail(detail)
+	case status == http.StatusTooManyRequests && snippetExhaustedQuota(snippet):
+		// 429 通常表示秒级限流，但部分平台用同一状态码表示本窗口额度耗尽。
+		// 两者对客户端都可重试，区别在退避时长与是否标记账号，故按响应体分流。
+		err = domain.NewError(domain.CodeUpstreamQuotaExhausted, "上游额度耗尽").WithDetail(detail)
 	case status == http.StatusTooManyRequests:
 		err = domain.NewError(domain.CodeUpstreamRateLimited, "上游限流").WithDetail(detail)
 	case status == http.StatusRequestTimeout:
 		err = domain.NewError(domain.CodeUpstreamTimeout, "上游超时").WithDetail(detail)
+	case status == http.StatusForbidden && snippetExhaustedQuota(snippet):
+		// 403 更常见的含义是模型无权、组织未实名、地区受限；只有响应体明确给出额度语义时
+		// 才按额度耗尽处理，否则维持不可重试的上游拒绝。
+		err = domain.NewError(domain.CodeUpstreamQuotaExhausted, "上游额度耗尽").WithDetail(detail)
 	case status >= http.StatusBadRequest && status < http.StatusInternalServerError:
 		err = domain.NewError(domain.CodeUpstreamRejected, "上游拒绝请求").WithDetail(detail)
 	default:
 		err = domain.NewError(domain.CodeUpstreamUnavailable, "上游不可用").WithDetail(detail)
 	}
 	return withRetryAfter(err, header, time.Now())
+}
+
+// upstreamQuotaKeywords 是判定「上游声明本窗口额度或余额耗尽」的响应体关键词表。
+//
+// 这是档案声明式映射（profile 的 limits_mapping）落地前的过渡启发式：真实的
+// 状态码与响应体对应关系由各平台档案声明，届时本表整体删除，判定改由档案提供。
+//
+// 只收「本身就是额度语义」的词，命中即可把 403 改判为可重试的额度耗尽。insufficient、
+// exceed、exhaust 一律不收：insufficient 会命中权限错误（Google 403
+// "insufficient authentication scopes"、OAuth insufficient_scope），exceed 会命中限流的
+// 标准文案（"Rate limit exceeded"、"rate_limit_exceeded"），单独出现的 exhaust 同样分不清
+// 限流与额度。收进来会把永久权限错误或秒级限流误判成可重试的额度耗尽，进而放大尝试。
+// 组合语义（insufficient quota、quota exceeded）由表中的 quota/credit/balance 等词覆盖，
+// 无需弱词参与。
+//
+// 匹配不区分大小写，且只在排障用的截断片段（errorSnippet）上匹配，不在完整响应体上搜索。
+var upstreamQuotaKeywords = [...]string{
+	"quota", "balance", "credit", "billing",
+	"额度", "配额", "余额", "欠费",
+}
+
+// snippetExhaustedQuota 报告排障片段是否命中额度关键词。
+func snippetExhaustedQuota(snippet string) bool {
+	folded := strings.ToLower(snippet)
+	for _, keyword := range upstreamQuotaKeywords {
+		if strings.Contains(folded, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 // retryAfterError 在统一错误之上附加上游通过 Retry-After 响应头给出的建议退避时长。

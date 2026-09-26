@@ -56,7 +56,7 @@ info:
 
     `invalid_request` `unauthorized` `forbidden` `rate_limited` `gateway_overloaded`
     `model_not_found` `not_found` `upstream_timeout` `upstream_unavailable`
-    `upstream_rate_limited` `upstream_rejected` `internal`
+    `upstream_rate_limited` `upstream_quota_exhausted` `upstream_rejected` `internal`
 
     被过滤掉的模型与上游不存在的模型对客户端不可区分，两者都返回 `model_not_found`。
     命中不了任何对外名时网关不会猜一条渠道转发。
@@ -967,6 +967,7 @@ components:
         - upstream_timeout
         - upstream_unavailable
         - upstream_rate_limited
+        - upstream_quota_exhausted
         - upstream_rejected
         - internal
 
@@ -1409,7 +1410,7 @@ components:
           schema:
             $ref: "#/components/schemas/OpenAIError"
     OpenAIUnavailable:
-      description: 全部上游候选都被限流（`upstream_rate_limited`）
+      description: 全部上游候选都被限流或额度耗尽（`upstream_rate_limited` / `upstream_quota_exhausted`）
       content:
         application/json:
           schema:
@@ -1458,7 +1459,7 @@ components:
           schema:
             $ref: "#/components/schemas/OpenAIError"
     ResponsesUnavailable:
-      description: 全部上游候选都被限流（`upstream_rate_limited`）
+      description: 全部上游候选都被限流或额度耗尽（`upstream_rate_limited` / `upstream_quota_exhausted`）
       content:
         application/json:
           schema:
@@ -1513,7 +1514,7 @@ components:
           schema:
             $ref: "#/components/schemas/AnthropicError"
     AnthropicUnavailable:
-      description: 全部上游候选都被限流（`upstream_rate_limited`）
+      description: 全部上游候选都被限流或额度耗尽（`upstream_rate_limited` / `upstream_quota_exhausted`）
       content:
         application/json:
           schema:
@@ -1568,7 +1569,7 @@ components:
           schema:
             $ref: "#/components/schemas/GeminiError"
     GeminiUnavailable:
-      description: 全部上游候选都被限流（`upstream_rate_limited`）
+      description: 全部上游候选都被限流或额度耗尽（`upstream_rate_limited` / `upstream_quota_exhausted`）
       content:
         application/json:
           schema:

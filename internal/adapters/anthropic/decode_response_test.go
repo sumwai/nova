@@ -62,3 +62,11 @@ func TestDecodeResponseRejectsMissingContent(t *testing.T) {
 		t.Errorf("错误信息应点名缺失的字段 content，实际为 %q", err.Error())
 	}
 }
+
+// TestErrorTypeForQuotaExhausted 守护上游额度耗尽映射为 rate_limit_error：
+// 它与上游限流同为 503、可重试，落到 api_error 会被 SDK 当成平台故障。
+func TestErrorTypeForQuotaExhausted(t *testing.T) {
+	if got := errorTypeForCode(domain.CodeUpstreamQuotaExhausted); got != "rate_limit_error" {
+		t.Errorf("errorTypeForCode(upstream_quota_exhausted) = %q，期望 rate_limit_error", got)
+	}
+}

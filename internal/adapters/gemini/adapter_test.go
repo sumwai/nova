@@ -666,6 +666,14 @@ func TestEncodeStreamErrorUnsupported(t *testing.T) {
 	}
 }
 
+// TestGoogleStatusCoversQuotaExhausted 守护上游额度耗尽映射为 RESOURCE_EXHAUSTED：
+// 它与上游限流同为 503、可重试，落到 INTERNAL 会被 Google SDK 当成平台故障。
+func TestGoogleStatusCoversQuotaExhausted(t *testing.T) {
+	if got := googleStatus(domain.CodeUpstreamQuotaExhausted); got != "RESOURCE_EXHAUSTED" {
+		t.Errorf("googleStatus(upstream_quota_exhausted) = %q，期望 RESOURCE_EXHAUSTED", got)
+	}
+}
+
 // TestCleanFunctionSchemaDropsUnsupportedFields 守护 Schema 裁剪只保留白名单字段。
 func TestCleanFunctionSchemaDropsUnsupportedFields(t *testing.T) {
 	cleaned, err := cleanFunctionSchema(`{

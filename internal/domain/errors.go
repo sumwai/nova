@@ -34,8 +34,11 @@ const (
 	CodeUpstreamTimeout     Code = "upstream_timeout"
 	CodeUpstreamUnavailable Code = "upstream_unavailable"
 	CodeUpstreamRateLimited Code = "upstream_rate_limited"
-	CodeUpstreamRejected    Code = "upstream_rejected"
-	CodeInternal            Code = "internal"
+	// CodeUpstreamQuotaExhausted 表示上游声明本窗口额度或余额耗尽。
+	// 它不同于上游限流：换一个渠道可能成功，因此可重试。
+	CodeUpstreamQuotaExhausted Code = "upstream_quota_exhausted"
+	CodeUpstreamRejected       Code = "upstream_rejected"
+	CodeInternal               Code = "internal"
 )
 
 // Error 是统一错误类型。
@@ -142,6 +145,11 @@ func classify(code Code) (ErrorClass, bool, int) {
 		return ClassUpstream, true, http.StatusBadGateway
 	case CodeUpstreamRateLimited:
 		// 上游限流：换一个渠道可能成功，故可重试。
+		return ClassUpstream, true, http.StatusServiceUnavailable
+	case CodeUpstreamQuotaExhausted:
+		// 上游额度耗尽：换一个渠道可能成功，故可重试。
+		// 状态码与上游限流同取 503「暂时不可用」：对客户端而言两者都是「稍后或换渠道重试可能成功」，
+		// 而 502 在本表里表示「上游返回了不可接受的响应」，与额度耗尽不是一回事。
 		return ClassUpstream, true, http.StatusServiceUnavailable
 	case CodeUpstreamRejected:
 		return ClassUpstream, false, http.StatusBadGateway
