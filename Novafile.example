@@ -201,6 +201,49 @@ provider relay {
 #     api_key {env.OPENAI_KEY_1}
 #     api_key {env.OPENAI_KEY_2}
 
+# ── 平台档案引用 ─────────────────────────────────────────────────────────────
+#
+# 一个平台的端点、协议、凭据头与模型集合可以由平台档案描述，配置里只写引用。
+# `provider <名>` 单独成行就是「引用同名的档案」：
+#
+# provider sensenova
+#
+# 名字同时充当档案 id。随二进制发布的内置档案有三份：deepseek-official
+# （DeepSeek 官方）、opencode-go（OpenCode Go）、sensenova（SenseNova 日日新）。
+# 渠道名与档案 id 不一致时用块内 profile 指定：
+#
+# provider my-glm {
+#     profile sensenova
+#     account work
+# }
+#
+# 块内写了 account 却没有写 profile 时，按渠道名引用同名档案：
+# `provider opencode-go { account work }` 与单行 `provider opencode-go` 等价，
+# 加一个块只是为了写账号。
+#
+# 块内仍可以写 api_key / url / timeout / model：手写的端点按协议与档案端点配对合并，
+# 同协议的地址以块内为准（并记一条提醒），档案里没有的协议作为配置独有端点保留。
+#
+# 凭据来源的优先级是「块内 api_key > 凭据库 > 档案 auth.env」：
+#   - 块内写了 api_key 就只用它，凭据库里同一档案的账号会被忽略（记一条提醒）；
+#   - 没写 api_key 时按 account 行从凭据库取密钥：
+#       account work               账号名 work，权重 1
+#       account personal weight 2  账号名 personal，权重 2
+#     一条 account 行都不写时，取该档案在凭据库里的全部账号；存在名为 default 的
+#     账号时只取 default，因此「只存一份凭据」有确定的取值；
+#   - 凭据库里没有账号、块内也没有 api_key 时，退回档案 auth.env 指的环境变量
+#     （内置档案分别是 DEEPSEEK_API_KEY / OPENCODE_API_KEY / SENSENOVA_API_KEY）。
+# account 只写账号名，不写密钥：密钥由 `nova login <档案 id> [<账号名>]` 存进凭据库。
+#
+# 档案里的 auth.header（authorization / x-api-key / x-goog-api-key）与静态 headers
+# 在展开时一并写进渠道。运行期注入凭据的形态因此是「渠道声明 > 协议现状」：档案写明
+# 用 Authorization 的平台，它的 Anthropic 兼容端点也照此注入，而不是按协议硬套
+# x-api-key。档案声明的取值映射不上时报错，不静默退回按协议猜。
+#
+# 展开发生在配置加载之后、装配之前，读内置档案、本地源、已装快照与凭据库，不联网。
+# 远端源里的档案要先跑 `nova profiles update` 同步；引用的档案找不到时报错会列出
+# 检查过的源，并指出该跑哪条命令。
+
 # ── 跨渠道分摊与回退 ──────────────────────────────────
 #
 # 同一个对外名落在多条渠道上时，缺省按渠道的声明顺序回退：前面那条失败且可重试，
@@ -208,6 +251,7 @@ provider relay {
 #
 # route <对外名模式> {
 #     balance                      # 可选：主用候选按权重轮询分摊
+#     prefer <order|price>         # 可选：每一段内部的排序口径，缺省 order
 #     provider <渠道名> [<权重>]…  # 主用候选，一行可列多个
 #     fallback <渠道名> [<权重>]…  # 回退候选，主用全部失败后才轮到
 # }
@@ -245,6 +289,39 @@ provider relay {
 # 命中规则的模型不再做「同协议候选优先」那条隐式排序：规则写下的顺序就是最终顺序。
 # 一条规则没有命中任何对外名、或规则里的某个渠道没有提供匹配该模式的模型时，
 # 加载会各记一条提醒。
+#
+# prefer 只决定每一段内部的顺序，不改段与段的先后：
+#   prefer order  按声明顺序（不写 prefer 时的缺省，与 prefer 引入前逐字一致）；
+#   prefer price  免费在前，其余按同币种单价升序；跨币种只分组、不互相换算。
+# 价格未知的渠道用同币种已知单价的中位数作名义价参与排序，加载时记一条提醒——
+# 「这个顺序不是按真实单价得出的」是使用者要看见的事实。
+# balance 是另一层：它在这份排序之上轮转主用段的起点，不改段内的相对顺序，
+# 也不把回退段提到前面。
+
+# ── 价格层 ───────────────────────────────────────────────────────────────
+#
+# `prices { … }` 声明价格层的缺省币种与本地价格表文件。价格数字不进 Novafile：
+# 一份来自模型所属的平台档案（档案里的 price / free / price_from），一份来自 file。
+#
+# prices {
+#     currency USD        # 条目未写币种时用它，缺省 USD
+#     file ./prices.yaml  # 相对路径相对于写下这一行的文件解析
+# }
+#
+# prices.yaml 是「条目键 → 单价」的 YAML，键形如 <档案 id>/<模型 id>，与档案里
+# price_from 的引用同一命名空间：
+#
+#   deepseek-official/deepseek-v4-flash:
+#     currency: USD
+#     input_mtok: 0.28
+#     output_mtok: 0.42
+#
+# 五个价格分量是 input_mtok / output_mtok / cache_read_mtok / cache_write_mtok /
+# reasoning_mtok，单位是「每百万 token」。没有写任何价格分量的条目会被跳过，
+# 不会被当成「免费」；全零单价同理按「查不到价格」处理。免费必须显式在档案里写 free。
+#
+# 文件在装配时读取（`nova run` 与 `nova reload`），路径写错即装配失败；
+# `nova config check` 只解析配置，不读这个文件。
 
 # ── 模型自动发现与过滤 ─────────────────────────────────────────────
 #
@@ -307,6 +384,25 @@ provider relay {
 #
 # 客户端协议由请求路径决定（/v1/chat/completions、/v1/responses、/v1/messages），
 # 与端点协议不一致时由网关转换，配置里不需要声明这件事。
+
+# ── 平台档案源 ───────────────────────────────────────────────────────────
+#
+# `profiles { … }` 声明平台档案的来源，供 `nova profiles update` / `nova profiles list` 使用。
+# source 有三种形态：
+#   - `source builtin`：随二进制发布的档案，不联网，是块整体省略时的唯一缺省源；
+#   - `source <https 地址> key <名> <base64公钥>`：远端源，必须验签索引后才按 serial 安装；
+#   - `source <本地路径>`：本地目录，免签；相对路径相对于写下这一行的文件解析。
+# 取值以 http:// 开头会被拒绝：明文传输会让公钥校验失去意义，需要免签请改用本地路径。
+# 同一个源写两种写法（大小写、显式默认端口 443）会被当成重复源拒绝。
+# `refresh <时长>` 只被解析、尚未被消费：本版不会到点自动同步，安装一律由
+# `nova profiles update` 触发。
+#
+# profiles {
+#     source builtin
+#     source https://example.com/nova/profiles key main <base64公钥>
+#     source ./profiles.local
+#     refresh 24h
+# }
 
 # ── 拆分文件 ─────────────────────────────────────────────────────────────────
 #

@@ -92,7 +92,7 @@ provider openai {
 
 顶层指令：`listen`（缺省 `127.0.0.1:8080`，只绑回环）、`admin`（缺省 `localhost:2026`）、
 `log_level`（缺省 `info`）、`log_format`（缺省 `text`）、`client_key`（可写多条；不写则不鉴权，
-并在绑非回环时告警）、`import`（把另一个文件拼进来）。
+并在绑非回环时告警）、`profiles`（平台档案源，见下）、`prices`（价格层，见下）、`import`（把另一个文件拼进来）。
 
 ### 上游渠道
 
@@ -217,6 +217,45 @@ api_key {env.OPENAI_KEY_2}
 
 `config check` 与启动横幅在多账号时多输出一行账号池摘要（账号数与调度口径）。
 
+### 平台档案引用
+
+一个平台的端点、协议、凭据头与模型集合可以由平台档案描述，配置里只写引用。
+`provider <名>` 单独成行就是「引用同名的档案」，名字同时充当档案 id。随二进制发布的
+内置档案有三份：`deepseek-official`（DeepSeek 官方）、`opencode-go`（OpenCode Go）、
+`sensenova`（SenseNova 日日新）。渠道名与档案 id 不一致时在块内写 `profile <id>`：
+
+```
+provider sensenova
+
+provider my-glm {
+    profile sensenova
+    account work
+}
+```
+
+块内写了 `account` 却没有写 `profile` 时，按渠道名引用同名档案：
+`provider opencode-go { account work }` 与单行 `provider opencode-go` 等价，加一个块只是
+为了写账号。
+
+块内仍可以写 `api_key` / `url` / `timeout` / `model`。手写的端点按协议与档案端点配对
+合并：同协议的地址以块内为准（并记一条提醒），档案里没有的协议作为配置独有端点保留。
+
+凭据来源的优先级是「块内 `api_key` > 凭据库 > 档案 `auth.env`」：
+
+- 块内写了 `api_key` 就只用它，凭据库里同一档案的账号被忽略（记一条提醒）；
+- 没写 `api_key` 时按 `account <名> [weight N]` 从凭据库取。一条 `account` 行都不写时
+  取该档案在凭据库里的全部账号；存在名为 `default` 的账号时只取 `default`，
+  因此「只存一份凭据」有确定的取值；
+- 凭据库里没有账号、块内也没有 `api_key` 时，退回档案 `auth.env` 指的环境变量。
+
+档案里的 `auth.header`（`authorization` / `x-api-key` / `x-goog-api-key`）与静态
+`headers` 在展开时写进渠道，因此运行期注入凭据的形态是「渠道声明 > 协议现状」：档案
+写明用 `Authorization` 的平台，它的 Anthropic 兼容端点也照此注入，而不是按协议硬套
+`x-api-key`。档案声明的取值映射不上时报错，不静默退回按协议猜。
+
+引用的档案在配置加载之后、装配之前展开：读内置档案、本地源、已装快照与凭据库，
+不联网。远端源里的档案要先跑 `nova profiles update` 同步。
+
 ### 跨渠道分摊与回退
 
 同一个对外名落在多条渠道上时，缺省按渠道的**声明顺序回退**（前面那条失败才换下一条）。
@@ -225,6 +264,7 @@ api_key {env.OPENAI_KEY_2}
 ```
 route deepseek* {
     balance                    # 可选：主用候选按权重轮询分摊
+    prefer price               # 可选：每段内部的排序口径，缺省 order
 
     provider relay-a 3         # 主用候选；渠道名后可跟权重，省略即 1
     provider relay-b 1
@@ -255,8 +295,62 @@ route deepseek* {
 命中规则的模型不再做「同协议候选优先」那条隐式排序：规则写下的顺序就是最终顺序。
 跨协议的候选同样是被明确列出的等价来源，把它推到链尾会让分摊失效。
 
+`prefer` 只决定每一段内部的顺序，不改段与段的先后：`order` 是按声明顺序（不写时的
+缺省）；`price` 把免费的排在最前，其余按同币种单价升序。跨币种只分组、不互相换算。
+价格未知的渠道用同币种已知单价的中位数作名义价参与排序，加载时记一条提醒——
+「这个顺序不是按真实单价得出的」是要被看见的事实。`balance` 是另一层：它在这份排序
+之上轮转主用段的起点，不改段内相对顺序。
+
 一条规则没有命中任何对外名、或规则里的某个渠道没有提供匹配该模式的模型，加载会各记
 一条提醒。这两件事只能在装配期回答，因为对外名集合包含 `discover` 来的那些。
+
+### 价格层
+
+`prices { … }` 声明价格层的缺省币种与本地价格表文件。价格数字不进 Novafile：一份来自
+模型所属的平台档案（档案里的 `price` / `free` / `price_from`），一份来自 `file`。
+
+```
+prices {
+    currency USD        # 条目未写币种时用它，缺省 USD
+    file ./prices.yaml  # 相对路径相对于写下这一行的文件解析
+}
+```
+
+`prices.yaml` 是「条目键 → 单价」的 YAML，键形如 `<档案 id>/<模型 id>`，与档案里
+`price_from` 的引用同一命名空间：
+
+```
+deepseek-official/deepseek-v4-flash:
+  currency: USD
+  input_mtok: 0.28
+  output_mtok: 0.42
+```
+
+单价单位是「每百万 token」，五个分量是 `input_mtok` / `output_mtok` / `cache_read_mtok` /
+`cache_write_mtok` / `reasoning_mtok`。没有写任何价格分量的条目会被跳过，不会被当成
+「免费」；全零单价同理按「查不到价格」处理。免费必须显式在档案里写 `free`。
+
+价格文件在装配时读取（`nova run` 与 `nova reload`），路径写错即装配失败并指回
+`prices` 块；`nova config check` 只解析配置，不读这个文件。
+
+### 额度
+
+账号可以带一份额度声明（来自平台档案的 `plans`），声明窗口、上界与剩余量；网关据此在
+选路时剔除已耗尽或此刻限流的账号，并在一次上游尝试上做原子预留。
+
+额度是账号级事实，同一个渠道里的多个账号各有一张表；没有声明额度的账号一律视为可用
+（「没有限制」不等于「限制为零」）。被剔除的账号不进候选链，账号池里全部账号都不可用时
+整条渠道跳过，客户端收到可重试的 `upstream_quota_exhausted`。
+
+一次尝试的准入与预留是同一把锁内的原子一步，按 metric 给成本上界：`requests` 恒 1、
+`tokens` 取本次请求的有效输出上限、`usd` 按价格层由 token 折算。上游返回的
+`x-ratelimit-*` / `anthropic-ratelimit-*` / `retry-after` 会被解析成 `rate <metric> 1m`
+的观测并合并进账号状态；声明里没有这个键时该观测被拒收并在日志里提醒一次。上游连续
+N 次（缺省 5）报额度耗尽且期间无成功，才把该账号在该模型上标记为窗口耗尽。
+
+额度快照落在状态目录的 `limits/` 子目录，跨重启保留。本版 `usd` 额度只在价格已知时
+才有本地累计，`credits` 类额度没有价格来源、本地累计恒为 0；`expires_at`、
+`nova limits` 恢复入口与内置档案的 `plans` 尚未实现，详见 CHANGELOG 的「仍未实现」。
 
 ### 模型自动发现与过滤
 
@@ -475,6 +569,54 @@ curl 'http://127.0.0.1:8080/debug/stats?agent=*external*&detail=true&limit=20'
 
 配置省略 `version` 时按本二进制实现的最高代数解析，并记一条提示。
 
+### 平台档案源
+
+`profiles { … }` 声明平台档案的来源。`source` 有三种形态：`source builtin` 是随二进制
+发布的档案（内置三份：`deepseek-official`、`opencode-go`、`sensenova`）；
+`source <https 地址> key <名> <base64公钥>` 是远端源，拉取时必须用配置里的
+ed25519 公钥验签索引 `index.yaml`，验签通过才按 `serial` 单调安装；`source <本地路径>` 是
+本地目录，免签。`refresh <时长>` 声明刷新周期，缺省 `24h`；本版只解析该取值，
+尚未据此自动刷新，安装一律由显式运行 `nova profiles update` 触发。
+
+```
+profiles {
+    source builtin
+    source https://example.com/nova/profiles key main <base64公钥>
+    source ./profiles.local
+    refresh 24h
+}
+```
+
+取值以 `https://` 开头是远端源，以 `http://` 开头会被拒绝（明文传输让验签失去意义），
+其余按本地路径处理；本地相对路径相对于写下这一行的文件解析。块整体省略时等价于只写
+`source builtin`。运行时会把同一份规范化的地址写成同一个状态键，因此同一个源的两种
+写法（大小写、显式默认端口）会被当成重复源拒绝。
+
+`nova profiles update` 逐个同步配置里的源；某个源失败不会中断后面的源，最后以非 0 退出。
+`nova profiles list` 只读本地状态与已装快照，不联网。
+
+被 `provider <名>` 引用的档案在配置加载之后、装配之前展开：读内置档案、本地源、
+已装快照与凭据库，不联网。
+
+### 凭据库
+
+`nova login <档案 id> [<账号名>]` 把一份 API Key 存进凭据库，缺省落在
+`${XDG_CONFIG_HOME:-$HOME/.config}/nova/credentials.json`：目录 `0700`、文件 `0600`，
+写入走临时文件加 rename。库里的键是「档案 id + 账号名」，与 Novafile 里的 provider 名
+无关——同一份配置可以给同一个档案起多个渠道名，凭据只存一份。省略档案 id 时
+`nova login` 列出内置档案的 id 供选择。
+
+密钥有三种取法：终端上无回显读入（缺省）、`--key-stdin` 从标准输入读、`--key-env VAR`
+读环境变量；标准输入不是终端、又没给来源标志时报错，而不是静默读到一个空值。
+`--no-store` 只把密钥写到 stdout（供导出），不落盘。
+
+**登录流程不联网，也不校验密钥是否有效**：一次接受的 401 会推迟到第一次请求。这一点
+是有意的——登录要在没有网络的机器上也能用，而密钥是否可用只有上游能回答。
+
+`nova account list` 列出库里的账号（缺省只给密钥尾四位，`--show` 才打印完整密钥）；
+`nova account remove <档案 id> [<账号名>]` 删除账号，省略账号名时删除该档案下的全部
+账号。两条命令都只读或只改凭据库，不读配置、不联网。
+
 ## 命令行
 
 ```
@@ -482,6 +624,11 @@ nova run [-c PATH]              启动网关
 nova reload [-c PATH]           让运行中的网关重新加载配置
 nova config check [-c PATH]     只校验配置，不启动
 nova models [-c PATH]           列出网关会认哪些模型（会连上游）
+nova login [<档案 id>] [<账号名>]  把一份 API Key 存进凭据库
+nova account list [--show]      列出凭据库里的账号
+nova account remove <档案 id> [<账号名>]  删除凭据库里的账号
+nova profiles update [-c PATH]  同步配置里的档案源（远端源验签后安装）
+nova profiles list [-c PATH]    列出各档案源与已装快照（不联网）
 nova version [--json]           打印版本信息
 nova help [COMMAND]             帮助
 ```
@@ -492,7 +639,8 @@ nova help [COMMAND]             帮助
 
 ### 配置校验
 
-`nova config check` 只读配置、不启动服务，适合放进 CI 或提交前钩子：
+`nova config check` 只读配置与本地状态（内置档案、已装快照、凭据库）、不启动服务、
+不连上游，适合放进 CI 或提交前钩子：
 
 ```sh
 nova config check -c Novafile || exit 1
