@@ -1,0 +1,51 @@
+# 协议转换矩阵：四条上游渠道各一种线协议，客户端用哪条路径进来都能到达它们。
+#
+# 上游是 examples/chatmock（缺省监听 127.0.0.1:18083）。
+#
+#   go run ./examples/chatmock -addr 127.0.0.1:18083
+#   XDG_STATE_HOME=$(mktemp -d) NOVA_CLIENT_KEY=example-client-key go run ./cmd/nova run -c examples/convert/Novafile
+#
+# 客户端协议由请求路径决定（/v1/chat/completions、/v1/responses、/v1/messages、
+# /v1beta/models/<模型>:generateContent 与 :streamGenerateContent），与端点协议不一致时
+# 由网关转换，配置里不需要声明这件事。因此这里的关键只有一条：**每个对外模型名唯一地
+# 指向一种上游协议**，客户端路径则决定进来的那一种。
+
+version 1
+
+listen 127.0.0.1:18084
+admin 127.0.0.1:18085
+
+log_level info
+log_format text
+
+client_key {env.NOVA_CLIENT_KEY}
+
+# OpenAI Chat Completions。
+provider up-chat {
+    api_key mock-key-ok
+    url http://127.0.0.1:18083/v1/chat/completions
+    model via-chat
+}
+
+# OpenAI Responses。
+provider up-responses {
+    api_key mock-key-ok
+    url http://127.0.0.1:18083/v1/responses
+    model via-responses
+}
+
+# Anthropic Messages。
+provider up-anthropic {
+    api_key mock-key-ok
+    url http://127.0.0.1:18083/v1/messages
+    model via-anthropic
+}
+
+# Gemini：模型名与动作都写在路径上，url 因此用 {model} 指代，并要加引号——
+# 不加引号时 `{` 会被词法器当成块开启，取值被切成多段。
+# 网关按本次请求是否流式把末段在 generateContent 与 streamGenerateContent 之间互换。
+provider up-gemini {
+    api_key mock-key-ok
+    url "http://127.0.0.1:18083/v1beta/models/{model}:generateContent"
+    model via-gemini
+}

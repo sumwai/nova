@@ -22,7 +22,7 @@ VERSION_PKG := github.com/sumwai/nova/internal/version
 unexport VERSION
 export VERSION_RAW := $(value VERSION)
 
-.PHONY: all build build-binary install uninstall test vet fmt fmt-check check release-dry-run clean help
+.PHONY: all build build-binary install uninstall test vet fmt fmt-check check example check-examples release-dry-run clean help
 
 all: build
 
@@ -92,6 +92,24 @@ fmt-check:
 
 ## check: 本地门禁 = build + vet + test + fmt-check
 check: build vet test fmt-check
+
+## example: 跑一个示例并打印每一步的期望与实际，用法：make example NAME=quickstart
+#
+# 不带 NAME 时列出可用示例。加 ARGS=-serve 则跑完不退出，保持服务并打印可粘贴的 curl。
+# 示例脚本与校验共用同一份 Step 列表，因此这里只是把它跑起来，不另写一套。
+example:
+	@if [ -n "$(NAME)" ]; then \
+		$(GO) run ./examples/run $(NAME) $(ARGS); \
+	else \
+		$(GO) run ./examples/run; \
+	fi
+
+## check-examples: 只跑示例的校验
+#
+# 示例的校验是普通测试，已经随 make test 的 ./... 一起跑；这个目标只是让改示例时
+# 不必跑全仓（-race 与其余包都不参与）。
+check-examples:
+	$(GO) test ./examples/...
 
 ## release-dry-run: 预演一次发版，算出下一个版本号与发布说明，不改仓库、不打 tag
 #

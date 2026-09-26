@@ -1,0 +1,38 @@
+# 最小可运行的 nova 配置：一条上游渠道、一个模型。
+#
+# 上游是 examples/chatmock（离线的模拟上游，缺省监听 127.0.0.1:18080）：
+#
+#   go run ./examples/chatmock
+#   XDG_STATE_HOME=$(mktemp -d) NOVA_CLIENT_KEY=example-client-key go run ./cmd/nova run -c examples/quickstart/Novafile
+#
+# 手工路径里的 XDG_STATE_HOME 指向一个临时目录：不隔离时统计会写进真实运行用的
+# ~/.local/state/nova/stats.db。`go run ./examples/run quickstart` 自己会隔离，不必写这个前缀。
+#
+# 端口刻意避开 nova 的缺省值 8080 与 2026：开发机上通常有一个真的 nova 在跑，
+# 抢端口得到的是「配置写错了」的错觉。
+#
+# 逐条指令的完整语义见仓库根目录的 Novafile.example，这里只留本例子用到的部分。
+
+version 1
+
+listen 127.0.0.1:18081
+admin 127.0.0.1:18082
+
+log_level info
+log_format text
+
+# 客户端凭据从环境变量读入：示例因此不在仓库里留明文，也顺带演示了 {env.NAME} 的用法。
+# 不写这一条就是不鉴权——那正是 examples 里刻意不演示的形态：默认配置应当安全。
+client_key {env.NOVA_CLIENT_KEY}
+
+provider mock {
+    # 上游凭据在这里不是秘密，而是模拟上游的故障开关（见 examples/README.md）：
+    # 真实渠道应当写成 {env.NAME}。
+    api_key mock-key-ok
+
+    # 地址写全，含协议端点段；协议（openai_chat）由末段 /chat/completions 推导。
+    url http://127.0.0.1:18080/v1/chat/completions
+
+    # 对外名与上游名相同。客户端请求里的 model 只用来选路，不会照转给上游。
+    model echo-1
+}

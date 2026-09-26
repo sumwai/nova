@@ -1,0 +1,59 @@
+# 接真实上游的配置骨架：四条渠道、四种上游协议、一份账号凭据全在环境变量里。
+#
+# 这份配置**不在示例校验里被跑通**——它连的是真实上游，需要真实凭据。
+# 它被校验的方式是只读的那一种：
+#
+#   nova config check -c examples/real-providers/Novafile
+#
+# 校验不连上游（连发现的清单地址也不请求），因此不需要真的填凭据，
+# 只需要对应变量非空。变量名清单见同目录的 .env.example。
+
+version 1
+
+# 对外服务时按实际情况改：绑非回环地址就一定要写 client_key，否则会记一条警告。
+# 这两个是 nova 的缺省端口，真实部署就用它们；本机若已有一个 nova 在跑，先改这两行。
+listen 127.0.0.1:8080
+admin 127.0.0.1:2026
+
+# 要给采集器读就切 json：字段齐全、时间戳是 RFC3339、不做折叠。
+log_level info
+log_format json
+
+# 可写多条。客户端用 Authorization: Bearer、x-api-key 或 x-goog-api-key 提交，任一匹配即放行。
+client_key {env.NOVA_CLIENT_KEY}
+
+# OpenAI：协议由末段 /chat/completions 推导。
+provider openai {
+    api_key {env.OPENAI_API_KEY}
+    url https://api.openai.com/v1/chat/completions
+    model gpt-5
+    model gpt-5-mini
+}
+
+# Anthropic：同一份配置里换协议只换地址与模型，网关自己处理线格式差异。
+provider anthropic {
+    api_key {env.ANTHROPIC_API_KEY}
+    url https://api.anthropic.com/v1/messages
+    model claude-sonnet-4
+}
+
+# Gemini：模型名与动作在路径上，url 因此用 {model} 指代，并要加引号。
+# 本版不支持在 Gemini 端点上写 discover。
+provider gemini {
+    api_key {env.GEMINI_API_KEY}
+    url "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    model gemini-2.5-flash
+    model gemini-2.5-pro
+}
+
+# 中转站：模型集合交给上游清单，过滤与改名在这里决定暴露什么。
+# 清单地址省略时由端点 url 推导（裁掉 /chat/completions，版本根原样保留，再拼 /models）。
+provider relay {
+    api_key {env.RELAY_API_KEY}
+    url https://relay.example.com/v1/chat/completions
+
+    discover
+    allow *
+    deny *-preview
+    expose * relay/*
+}

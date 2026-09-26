@@ -1,0 +1,50 @@
+# 模型自动发现、过滤与改名：上游清单决定「有哪些」，配置决定「暴露哪些、叫什么名字」。
+#
+# 上游是 examples/chatmock（缺省监听 127.0.0.1:18092），它的清单固定为
+# gpt-5、gpt-5-mini、gpt-4o-preview、claude-sonnet-4、llama-3。
+#
+#   go run ./examples/chatmock -addr 127.0.0.1:18092
+#   XDG_STATE_HOME=$(mktemp -d) NOVA_CLIENT_KEY=example-client-key go run ./cmd/nova run -c examples/discover/Novafile
+#   NOVA_CLIENT_KEY=example-client-key go run ./cmd/nova models -c examples/discover/Novafile --verbose
+#
+# 五条清单项在这里被分成三类，正是这个例子的全部内容：
+#   gpt-5、gpt-5-mini   allow 命中、未被 deny，再被 expose 加前缀 → sensenova/*
+#   gpt-4o-preview      allow 命中但被 deny 排除
+#   claude-sonnet-4     allow 未命中（llama-3 同理）
+
+version 1
+
+listen 127.0.0.1:18093
+admin 127.0.0.1:18094
+
+log_level info
+log_format text
+
+client_key {env.NOVA_CLIENT_KEY}
+
+provider aggregator {
+    api_key mock-key-ok
+
+    # 版本根写成 /api/v4 这个非 /v1 的取值：清单地址的推导是「裁掉端点段再拼 /models、
+    # 版本根原样保留」，不是「换成 /v1/models」。这里因此能证明推导规则本身，
+    # 而不只是证明「恰好 /v1 能用」。
+    url http://127.0.0.1:18092/api/v4/chat/completions
+
+    # 省略地址：清单地址由上面的 url 推导为 http://127.0.0.1:18092/api/v4/models。
+    discover
+
+    # 过滤在**上游 id** 上做，两端隐式锚定：gpt* 是「以 gpt 开头」，* 可跨 /。
+    # 一条 allow 都不写表示全部保留；deny 优先于 allow。
+    allow gpt-*
+    deny *-preview
+
+    # 改名发生在过滤之后，可写多条、第一条命中即生效。
+    # 上游模式必须含恰好一个 *（它决定捕获哪一段），对外名模式用捕获值填充。
+    # 改名是替换：原名不再对客户端存在。
+    expose * sensenova/*
+
+    # 显式声明的模型永远生效、不参与过滤；与发现项同名时以显式那条为准，
+    # 于是可以借它改写上游名。上游 id gpt-5 因此有两个对外名，
+    # 一个来自发现（sensenova/gpt-5），一个来自这一行（gpt-5）。
+    model gpt-5 gpt-5-2025-01-01
+}

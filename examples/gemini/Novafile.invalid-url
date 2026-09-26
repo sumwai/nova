@@ -1,0 +1,18 @@
+# 这份配置**故意写错**，供 examples/gemini 的校验使用：Gemini 端点的 url 里没有 {model}。
+#
+#   nova config check -c examples/gemini/Novafile.invalid-url
+#
+# 缺失时的后果不是「少了个字段」，而是「所有模型都被发到同一个模型上」——那种错误
+# 不会被上游明确回绝，只会让一堆请求悄悄走错模型，因此加载期就必须挡住。
+# 这条校验因此不是在检查格式，而是在把一类静默的错发变成启动期的拒绝。
+
+version 1
+
+listen 127.0.0.1:18096
+admin 127.0.0.1:18097
+
+provider gemini-up {
+    api_key mock-key-ok
+    url "http://127.0.0.1:18095/v1beta/models/gemini-2.5-pro:generateContent"
+    model gem-pro
+}

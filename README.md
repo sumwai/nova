@@ -13,18 +13,38 @@
 
 ## 安装
 
+需要 Go（版本见 `mise.toml`，或系统里任意 1.25 以上的编译器）。
+
 ```sh
 make build-binary                    # 产出 bin/nova
 sudo make install                    # 安装到 /usr/local/bin/nova
 PREFIX=$HOME/.local make install     # 或装到用户目录
 ```
 
+不想装到系统里时，示例可以一条命令跑跑看：`go run ./examples/run quickstart`（见「示例」）。
+
 构建产物只有两个出口：`bin/nova` 与 `$(PREFIX)/bin/nova`。运行期另有一个状态文件
 （统计库，见「统计」一节），其落点是状态目录而不是构建产物。
 
+## 示例
+
+[`examples/`](examples/) 下每个例子是一份最小可运行配置加一段能自证的脚本，不需要任何凭据：
+
+```sh
+go run ./examples/run quickstart     # 一条命令跑完：起模拟上游、起 nova、打印每一步的期望与实际
+```
+
+七条例子覆盖协议转换、跨渠道回退、账号池、模型发现、Gemini 与真实上游骨架（最后这条接真实上游，
+因此只做不联网的配置校验，不启动服务）。输出里「期望」与「实际」并排：回退到了哪条渠道、
+用了哪条账号、上游收到的是哪种协议与哪个模型名，都是打出来的事实而不是描述。索引、端口、
+模拟上游（含按凭据注入的故障）的说明见 [`examples/README.md`](examples/README.md)。
+
+示例的脚本同时是它们的校验（`examples/<例名>/scenario.go`），随 `make check` 一起跑，
+因此不会在功能演进后变成过期的文档。
+
 ## 接口
 
-全部 HTTP 接口写在 [`docs/openapi.yaml`](docs/openapi.yaml)（OpenAPI 3.1）：数据面的四条
+全部 HTTP 接口写在 [`docs/openapi.yaml`](docs/openapi.yaml)（OpenAPI 3.1）：客户端入口的四条
 转发路径、模型清单、统计与探活，以及管理端点的热重载。每个接口的方法、鉴权、请求头、
 参数、错误形状与响应示例都在那里，不必翻源码。
 
@@ -432,7 +452,7 @@ curl 'http://127.0.0.1:8080/debug/stats?agent=*external*&detail=true&limit=20'
 `attempts` 是尝试总数，回退时两者之和都会体现。
 
 `/debug/stats` 缺省不鉴权，因为它随 `listen` 缺省只绑在回环上；`listen` 绑到非回环
-地址后，它与数据面一样要求 `client_key`。它不接受任何写操作，也不产生访问记录。
+地址后，它与客户端入口一样要求 `client_key`。它不接受任何写操作，也不产生访问记录。
 
 ### 环境变量与拆分文件
 
@@ -520,8 +540,13 @@ make release-dry-run BUMP=y   # 指定版本位再看结果
 
 ## 开发
 
+工具链版本固定在 `mise.toml`（Go 1.25.0）：`mise install` 后即可构建，
+`make`、`go test` 与示例都用同一个编译器。
+
 ```sh
-make check        # 编译 + vet + 单测(-race) + 格式检查
+make check        # 编译 + vet + 单测(-race) + 格式检查（示例的校验也在内）
 make test
 make build-binary
+make example NAME=quickstart   # 跑一个示例并打印每一步的期望与实际，ARGS=-serve 则保持服务
+make check-examples            # 只跑示例的校验
 ```

@@ -1,0 +1,45 @@
+# Gemini 双向：既是客户端协议，也是上游协议，两边的形态差异都在这里显出来。
+#
+# 上游是 examples/chatmock（缺省监听 127.0.0.1:18095）。
+#
+#   go run ./examples/chatmock -addr 127.0.0.1:18095
+#   XDG_STATE_HOME=$(mktemp -d) NOVA_CLIENT_KEY=example-client-key go run ./cmd/nova run -c examples/gemini/Novafile
+#
+# Gemini 与另外三种协议的三处差别，正是这个例子的全部内容：
+#   模型名与动作（是否流式）写在**路径**上，不在请求体里；
+#   上游地址因此用 {model} 指代模型名，并要加引号；
+#   凭据以 x-goog-api-key 注入。
+#
+# 两条渠道的对外名刻意不同，于是「客户端路径里的模型名 → 上游实际收到什么」
+# 可以分别用两种协议观测：
+#   gemini-2.5-flash  → chat-up（OpenAI 线格式上游），对外名与上游名相同
+#   gem-pro           → gemini-up（Gemini 线格式上游），上游名被改写成 gemini-2.5-pro-001
+
+version 1
+
+listen 127.0.0.1:18096
+admin 127.0.0.1:18097
+
+log_level info
+log_format text
+
+client_key {env.NOVA_CLIENT_KEY}
+
+provider chat-up {
+    api_key mock-key-ok
+    url http://127.0.0.1:18095/v1/chat/completions
+    model gemini-2.5-flash
+}
+
+provider gemini-up {
+    api_key mock-key-ok
+
+    # 必须加引号：不加引号时 `{` 会被词法器当成块开启，取值被切成多段。
+    # 网关按本次请求是否流式把末段在 :generateContent 与 :streamGenerateContent 之间互换，
+    # 流式另加 alt=sse。
+    url "http://127.0.0.1:18095/v1beta/models/{model}:generateContent"
+
+    # 对外名 gem-pro，上游名 gemini-2.5-pro-001：路径里的模型名取自选路结果，
+    # 因此发出去的是后者。
+    model gem-pro gemini-2.5-pro-001
+}

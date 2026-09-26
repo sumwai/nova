@@ -1,0 +1,55 @@
+# 一个渠道多个账号：账号池的调度、权重分摊与「哪些失败才换账号」。
+#
+# 上游是 examples/chatmock（缺省监听 127.0.0.1:18089）。
+#
+#   go run ./examples/chatmock -addr 127.0.0.1:18089
+#   XDG_STATE_HOME=$(mktemp -d) NOVA_CLIENT_KEY=example-client-key go run ./cmd/nova run -c examples/accounts/Novafile
+#
+# 三条渠道各演示一件事，各自只用一个对外模型名，因此互不干扰：
+#   retry-me     两条账号，第一条被限流（可重试），换第二条
+#   noretry-me   两条账号，第一条被拒绝（不可重试），**不**换第二条
+#   balanced-me  两条账号，balance 按顺序轮转起点
+#
+# 账号池的凭据后缀是模拟上游的故障开关（见 examples/README.md）：
+# -429 回限流、-bad 回 400、无后缀正常回包。
+
+version 1
+
+listen 127.0.0.1:18090
+admin 127.0.0.1:18091
+
+log_level info
+log_format text
+
+client_key {env.NOVA_CLIENT_KEY}
+
+# 不写 balance 时按声明顺序调度：前面的账号失败且可重试，才换后面的。
+# 上游限流归可重试，因此 429 会换来下一次尝试；日志里能看到 acct #1 与 acct #2。
+provider pool-retry {
+    api_key mock-key-429
+    api_key mock-key-ok
+
+    url http://127.0.0.1:18089/v1/chat/completions
+    model retry-me
+}
+
+# 同样是两条账号，但第一条被上游拒绝（400）：nova 归为不可重试，
+# 换账号不会让它变成成功，于是只有一次尝试。这不是缺陷，而是「不白白放大上游压力」。
+provider pool-noretry {
+    api_key mock-key-bad
+    api_key mock-key-ok
+
+    url http://127.0.0.1:18089/v1/chat/completions
+    model noretry-me
+}
+
+# 写 balance 时按权重轮询分摊：每次请求把起点前移一个位置。
+# 权重写在 api_key 的取值后面，省略即 1。
+provider pool-balanced {
+    api_key mock-key-ok-a
+    api_key mock-key-ok-b
+    balance
+
+    url http://127.0.0.1:18089/v1/chat/completions
+    model balanced-me
+}

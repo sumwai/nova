@@ -1,0 +1,87 @@
+# 跨渠道回退、优先级重排、加权分摊与上游超时。
+#
+# 上游是 examples/chatmock（缺省监听 127.0.0.1:18086）。
+#
+#   go run ./examples/chatmock -addr 127.0.0.1:18086
+#   XDG_STATE_HOME=$(mktemp -d) NOVA_CLIENT_KEY=example-client-key go run ./cmd/nova run -c examples/route-fallback/Novafile
+#
+# 四条对外模型名各自演示一件事，互不干扰：
+#   shared     主用 relay-a 恒失败（503），回退到恒成功的 relay-b
+#   reordered  同一对渠道、调换规则里的顺序，用来重排优先级
+#   balanced   两条正常渠道按 3:1 轮转起点
+#   timed-out  主用渠道不回包，200ms 后判为上游超时，换到回退候选
+#
+# 「恒失败」与「不回包」都由模拟上游按凭据后缀注入（见 examples/README.md）。
+
+version 1
+
+listen 127.0.0.1:18087
+admin 127.0.0.1:18088
+
+log_level info
+log_format text
+
+client_key {env.NOVA_CLIENT_KEY}
+
+# mock-key-5xx 让模拟上游回 503。nova 把 5xx 归为可重试的上游不可用，因此会换下一个候选。
+provider relay-a {
+    api_key mock-key-5xx
+    url http://127.0.0.1:18086/v1/chat/completions
+    model shared
+    model reordered
+}
+
+# mock-key-ok 不带故障开关，模拟上游正常回包。
+provider relay-b {
+    api_key mock-key-ok
+    url http://127.0.0.1:18086/v1/chat/completions
+    model shared
+    model reordered
+    model timed-out
+}
+
+# 不回包的渠道：端点的 timeout 是「最长无进展时间」，写成 200ms，于是
+# 「模拟上游不回应」在 200ms 后被判为上游超时（可重试），换到回退候选。
+provider relay-slow {
+    api_key mock-key-slow
+    url http://127.0.0.1:18086/v1/chat/completions
+    timeout 200ms
+    model timed-out
+}
+
+# 主用 relay-a，回退 relay-b。候选顺序是最终顺序：命中规则的模型不再做隐式排序。
+route shared {
+    provider relay-a
+    fallback relay-b
+}
+
+# 同样的两条渠道、调换顺序：不写 balance 时主用段按书写顺序回退，这里用来重排优先级。
+route reordered {
+    provider relay-b
+    fallback relay-a
+}
+
+# 加权分摊：两条都正常，按 3:1 轮转起点（relay-c 三份、relay-d 一份）。
+provider relay-c {
+    api_key mock-key-ok-a
+    url http://127.0.0.1:18086/v1/chat/completions
+    model balanced
+}
+
+provider relay-d {
+    api_key mock-key-ok-b
+    url http://127.0.0.1:18086/v1/chat/completions
+    model balanced
+}
+
+route balanced {
+    balance
+    provider relay-c 3
+    provider relay-d 1
+}
+
+# 上游超时的处置与 5xx 同一条路径：第一次尝试超时，换到回退候选。
+route timed-out {
+    provider relay-slow
+    fallback relay-b
+}
