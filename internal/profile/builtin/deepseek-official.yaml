@@ -1,0 +1,13 @@
+schema: 1
+id: deepseek-official
+name: DeepSeek 官方
+updated_at: 2026-09-26T00:00:00Z
+docs: [https://api-docs.deepseek.com/]
+api_pattern: '^https://api\.deepseek\.com/'
+auth: { header: authorization, scheme: Bearer, env: DEEPSEEK_API_KEY }
+endpoints:
+  openai_chat: { url: https://api.deepseek.com/chat/completions, protocol: openai_chat }
+  anthropic_messages: { url: https://api.deepseek.com/anthropic/v1/messages, protocol: anthropic_messages }
+models:
+  - { id: deepseek-flash, endpoints: [openai_chat, anthropic_messages] }
+  - { id: deepseek-v4-pro, endpoints: [openai_chat, anthropic_messages] }

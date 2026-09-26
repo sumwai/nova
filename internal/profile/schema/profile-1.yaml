@@ -1,0 +1,197 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://nova.dev/schema/profile-1.yaml
+title: nova 平台档案
+description: >-
+  端点、协议、认证头、模型 id、计划形态与错误映射的声明。字段与设计文档第三节
+  的字段表一一对应；顶层 additionalProperties 为 false，未知字段一律拒绝。
+type: object
+additionalProperties: false
+required: [schema, id, endpoints]
+properties:
+  $schema:
+    type: string
+  schema:
+    type: integer
+  id:
+    type: string
+    minLength: 1
+  name:
+    type: string
+  updated_at:
+    type: string
+  docs:
+    type: array
+    items:
+      type: string
+  api_pattern:
+    type: string
+  auth:
+    $ref: "#/$defs/auth"
+  headers:
+    type: object
+    additionalProperties:
+      type: string
+  endpoints:
+    type: object
+    minProperties: 1
+    additionalProperties:
+      $ref: "#/$defs/endpoint"
+  models:
+    type: array
+    items:
+      $ref: "#/$defs/model"
+  discover:
+    $ref: "#/$defs/discover"
+  usage:
+    $ref: "#/$defs/usage"
+  plans:
+    type: array
+    items:
+      $ref: "#/$defs/plan"
+  limits_mapping:
+    type: array
+    items:
+      $ref: "#/$defs/limitsMapping"
+$defs:
+  auth:
+    type: object
+    additionalProperties: false
+    required: [header]
+    properties:
+      header:
+        enum: [authorization, x-api-key, x-goog-api-key]
+      scheme:
+        type: string
+      env:
+        type: string
+  endpoint:
+    type: object
+    additionalProperties: false
+    required: [url, protocol]
+    properties:
+      url:
+        type: string
+        minLength: 1
+      protocol:
+        enum: [openai_chat, openai_responses, anthropic_messages, gemini]
+  model:
+    type: object
+    additionalProperties: false
+    required: [id]
+    properties:
+      id:
+        type: string
+        minLength: 1
+      public:
+        type: string
+      endpoints:
+        type: array
+        items:
+          type: string
+          minLength: 1
+      free:
+        type: boolean
+      # 单价：币种加每百万 token 的价格。free 与 price 是两条互斥的事实，
+      # 免费必须显式写 free，全零的 price 视为「查不到价格」。
+      price:
+        $ref: "#/$defs/price"
+      price_from:
+        type: string
+        minLength: 1
+  discover:
+    type: object
+    additionalProperties: false
+    required: [url]
+    properties:
+      url:
+        type: string
+        minLength: 1
+      shape:
+        type: string
+      allow:
+        type: array
+        items:
+          type: string
+      deny:
+        type: array
+        items:
+          type: string
+  usage:
+    type: object
+    additionalProperties: false
+    # probe（nova 内置探测名）与 exec（绝对路径）只能给出其中一个。
+    oneOf:
+      - required: [probe]
+      - required: [exec]
+    properties:
+      probe:
+        type: string
+        minLength: 1
+      exec:
+        type: string
+        minLength: 1
+      interval:
+        type: string
+      schema:
+        type: string
+  plan:
+    type: object
+    additionalProperties: false
+    required: [id]
+    properties:
+      id:
+        type: string
+        minLength: 1
+      paid:
+        $ref: "#/$defs/paid"
+      limits:
+        type: array
+        # 静态声明的限制只给上限、窗口与口径，不要求 remaining；remaining 只在观测中出现。
+        items:
+          $ref: "limits-1.yaml#/$defs/limit"
+  paid:
+    type: object
+    additionalProperties: false
+    properties:
+      amount:
+        type: number
+      currency:
+        type: string
+      period:
+        enum: [day, week, month, year]
+  price:
+    type: object
+    additionalProperties: false
+    required: [currency]
+    properties:
+      currency:
+        type: string
+        minLength: 1
+      input_mtok:
+        type: number
+        minimum: 0
+      output_mtok:
+        type: number
+        minimum: 0
+      cache_read_mtok:
+        type: number
+        minimum: 0
+      cache_write_mtok:
+        type: number
+        minimum: 0
+      reasoning_mtok:
+        type: number
+        minimum: 0
+  limitsMapping:
+    type: object
+    additionalProperties: false
+    required: [status, class]
+    properties:
+      status:
+        type: integer
+        minimum: 100
+        maximum: 599
+      match_body:
+        type: string
+      class:
+        enum: [transient-rate, window-exhausted, permanent]

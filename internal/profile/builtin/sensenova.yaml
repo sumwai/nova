@@ -1,0 +1,16 @@
+schema: 1
+id: sensenova
+name: SenseNova 日日新
+updated_at: 2026-09-26T00:00:00Z
+docs: [https://platform.sensenova.cn/docs]
+api_pattern: '^https://token\.sensenova\.cn/'
+auth: { header: authorization, scheme: Bearer, env: SENSENOVA_API_KEY }
+endpoints:
+  openai_chat: { url: https://token.sensenova.cn/v1/chat/completions, protocol: openai_chat }
+  anthropic_messages: { url: https://token.sensenova.cn/v1/messages, protocol: anthropic_messages }
+models:
+  - { id: deepseek-flash, endpoints: [openai_chat, anthropic_messages] }
+  - { id: deepseek-v4-flash, endpoints: [openai_chat, anthropic_messages] }
+  - { id: glm-5.2, endpoints: [openai_chat] }
+  - { id: kimi-k3, endpoints: [openai_chat] }
+  - { id: sensenova-6.8-flash-lite, endpoints: [openai_chat] }

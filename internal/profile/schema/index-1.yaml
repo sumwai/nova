@@ -1,0 +1,38 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://nova.dev/schema/index-1.yaml
+title: nova 档案源索引
+description: >-
+  远端源发布的索引，与 index.yaml.sig 分离签名。文件集合必须与索引声明完全相等，
+  多一个也拒绝；此处只约束单份索引的形状，签名与 serial 单调性由订阅层负责。
+type: object
+additionalProperties: false
+required: [schema, name, serial, not_after, profiles]
+properties:
+  $schema:
+    type: string
+  schema:
+    type: integer
+  name:
+    type: string
+    minLength: 1
+  serial:
+    type: integer
+    minimum: 0
+  not_after:
+    type: string
+  profiles:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, path, sha256]
+      properties:
+        id:
+          type: string
+          minLength: 1
+        path:
+          type: string
+          minLength: 1
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'

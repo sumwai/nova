@@ -1,0 +1,92 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://nova.dev/schema/limits-1.yaml
+title: nova 额度文档
+description: >-
+  额度文档由探测输出或档案静态声明提供，作用域由结构表达：account 为跨模型共享，
+  models 只影响所列模型。字段含义与缺失/零的区别见设计文档第五节。
+type: object
+additionalProperties: false
+required: [schema]
+properties:
+  $schema:
+    type: string
+  schema:
+    type: integer
+  observed_at:
+    type: string
+  source:
+    enum: [exec, headers, profile, learned]
+  expires_at:
+    type: string
+  account:
+    type: array
+    items:
+      allOf:
+        - $ref: "#/$defs/limit"
+        # 观测值必须能确定 remaining：单给 remaining，或 limit 与 used，
+        # 或 limit 与 remaining。只给 used 无法确定剩余量，一律拒绝；
+        # 声明 unbounded: true 的无上限额度不参与剩余量判定，直接放行。
+        - anyOf:
+            - required: [remaining]
+            - required: [limit, used]
+            - required: [limit, remaining]
+            - required: [unbounded]
+              properties:
+                unbounded:
+                  const: true
+  models:
+    type: object
+    additionalProperties:
+      type: array
+      items:
+        allOf:
+          - $ref: "#/$defs/limit"
+          - anyOf:
+              - required: [remaining]
+              - required: [limit, used]
+              - required: [limit, remaining]
+              - required: [unbounded]
+                properties:
+                  unbounded:
+                    const: true
+$defs:
+  limit:
+    type: object
+    additionalProperties: false
+    required: [kind, metric, window]
+    properties:
+      kind:
+        enum: [rate, quota]
+      metric:
+        enum: [tokens, requests, usd, credits]
+      # 滚动窗口写成数量加单位，自然周期写成具名取值，总量或余额写成 absolute。
+      window:
+        type: string
+        pattern: '^(absolute|day|week|month|[0-9]+(s|m|h|d))$'
+      tz:
+        type: string
+      anchor:
+        type: string
+      limit:
+        type: number
+      used:
+        type: number
+      remaining:
+        type: number
+      resets_at:
+        type: string
+      unbounded:
+        type: boolean
+      assumed:
+        type: boolean
+      pool:
+        type: string
+    allOf:
+      # 自然周期按档案声明的时区切分，因此必须带 tz；滚动窗口与 absolute 不带。
+      - if:
+          properties:
+            window:
+              enum: [day, week, month]
+          required: [window]
+        then:
+          required: [tz]

@@ -1,0 +1,18 @@
+schema: 1
+id: opencode-go
+name: OpenCode Go
+updated_at: 2026-09-26T00:00:00Z
+docs: [https://opencode.ai/docs/go/]
+api_pattern: '^https://opencode\.ai/zen/go/'
+auth: { header: authorization, scheme: Bearer, env: OPENCODE_API_KEY }
+endpoints:
+  openai_chat: { url: https://opencode.ai/zen/go/v1/chat/completions, protocol: openai_chat }
+  anthropic_messages: { url: https://opencode.ai/zen/go/v1/messages, protocol: anthropic_messages }
+models:
+  - { id: deepseek-flash, endpoints: [openai_chat] }
+  - { id: deepseek-v4-flash, endpoints: [openai_chat] }
+  - { id: deepseek-v4.1-flash, endpoints: [openai_chat] }
+  - { id: deepseek-v4-pro, endpoints: [openai_chat] }
+  - { id: kimi-k3, endpoints: [openai_chat] }
+  - { id: glm-5.3, endpoints: [openai_chat] }
+  - { id: minimax-m3, endpoints: [openai_chat] }
