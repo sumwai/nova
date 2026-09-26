@@ -262,3 +262,47 @@ func TestTableStateDirKeepsSnapshotsInsideStateDir(t *testing.T) {
 		t.Fatal("两个不同的作用域不得落到同一个快照目录")
 	}
 }
+
+// TestQuotaExhaustedErrorSplitsRateFromQuota 守护纯限流不报额度耗尽码。
+//
+// 全部候选都只是此刻限流时，客户端应当收到可供退避重试的限流错误；
+// 回同一个额度耗尽码会把一次短期退避说成额度问题，引导使用者去换渠道或报警。
+func TestQuotaExhaustedErrorSplitsRateFromQuota(t *testing.T) {
+	until := time.Date(2026, 9, 27, 5, 0, 0, 0, time.UTC)
+
+	rateErr := quotaExhaustedError([]availability{{
+		reason: limits.Reason{
+			Verdict: limits.VerdictRateLimited, Metric: "requests", Window: "1m", Model: "m", Until: until,
+		},
+	}})
+	if got := domain.AsError(rateErr); got == nil || got.Code != domain.CodeUpstreamRateLimited {
+		t.Errorf("纯限流的错误码 = %v，期望 %s", got, domain.CodeUpstreamRateLimited)
+	}
+
+	quotaErr := quotaExhaustedError([]availability{
+		{reason: limits.Reason{Verdict: limits.VerdictQuotaExhausted, Metric: "usd", Window: "month", Model: "m"}},
+		{reason: limits.Reason{Verdict: limits.VerdictRateLimited, Metric: "requests", Window: "1m", Model: "m"}},
+	})
+	if got := domain.AsError(quotaErr); got == nil || got.Code != domain.CodeUpstreamQuotaExhausted {
+		t.Errorf("含额度耗尽的错误码 = %v，期望 %s", got, domain.CodeUpstreamQuotaExhausted)
+	}
+}
+
+// TestQuotaExhaustedErrorDetailCarriesModelAndUntil 守护 detail 带模型与恢复时刻。
+//
+// 同一码不同模型、不同恢复时刻是两组事实；只按码/metric/窗口折叠会把它们
+// 静默合并成一条，倒查时看不出到底是哪个模型何时恢复。
+func TestQuotaExhaustedErrorDetailCarriesModelAndUntil(t *testing.T) {
+	until := time.Date(2026, 9, 27, 5, 0, 0, 0, time.UTC)
+	err := quotaExhaustedError([]availability{
+		{reason: limits.Reason{Verdict: limits.VerdictQuotaExhausted, Metric: "usd", Window: "month", Model: "alpha", Until: until}},
+		{reason: limits.Reason{Verdict: limits.VerdictQuotaExhausted, Metric: "usd", Window: "month", Model: "beta", Until: until}},
+	})
+
+	detail := domain.AsError(err).Detail
+	for _, want := range []string{"alpha", "beta", "2026-09-27T05:00:00Z"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("detail = %q，期望含 %q", detail, want)
+		}
+	}
+}

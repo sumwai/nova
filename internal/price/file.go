@@ -1,7 +1,10 @@
 package price
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -34,8 +37,37 @@ func LoadFile(path string) (map[string]Unit, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取价格文件失败：%v", err)
 	}
+	return ParseFile(data)
+}
+
+// ParseFile 解析价格文件的字节内容；LoadFile 只负责读取。
+//
+// 解析是严格的：未知字段即报错。价格文件全篇都是单价数字，字段名拼错时既没有默认值
+// 可退、也没有别处能补上这个信息，若静默跳过，一个少了 output_mtok 的条目会变成
+// 「只有输入价」的 Known，而使用者以为自己写了两项。校验器与消费者必须用同一份解析
+// 结果，因此这里不接受「先宽松解析、再人工核对字段」的做法。
+//
+// 同时拒绝第二份 YAML 文档：价格表是一张映射，多文档没有承载它的形状，
+// 允许它只会让「只读了第一份」这件事不被察觉。
+func ParseFile(data []byte) (map[string]Unit, error) {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+
 	var raw map[string]fileEntry
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := decoder.Decode(&raw); err != nil {
+		if errors.Is(err, io.EOF) {
+			// 空文件等价于「没有任何条目」，不是解析失败：注释掉全部条目的迭代过程
+			// 不该让装配在启动时才炸掉。
+			return map[string]Unit{}, nil
+		}
+		return nil, fmt.Errorf("解析价格文件失败：%v", err)
+	}
+	var extra any
+	switch err := decoder.Decode(&extra); {
+	case err == nil:
+		return nil, fmt.Errorf("解析价格文件失败：只接受一份文档（顶层是「条目键 → 单价」的映射），发现有第二份")
+	case errors.Is(err, io.EOF):
+	default:
 		return nil, fmt.Errorf("解析价格文件失败：%v", err)
 	}
 

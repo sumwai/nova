@@ -1,6 +1,9 @@
 package config
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // defaultPricesCurrency 是 prices 块省略 currency 时的缺省币种。
 const defaultPricesCurrency = "USD"
@@ -30,6 +33,22 @@ type Prices struct {
 // DefaultPrices 返回未写 prices 块时的缺省值：币种 USD，无本地文件。
 func DefaultPrices() Prices {
 	return Prices{Currency: defaultPricesCurrency}
+}
+
+// PriceFileError 把价格文件读取失败包成一条指回 prices 块的配置错误。
+//
+// 定位指向块头而不是路径那一行：块头是「这份价格从哪来」的声明处，而路径只是它的一个取值；
+// 读取失败时使用者要改的往往是整块声明或文件本身，指回声明处更省一轮换算。
+//
+// 封装放在配置层：装配期（gateway）与不联网的校验路径（config check / models）都要报
+// 这同一个失败，两处各写一遍措辞会在一次改动后给出两种错误。
+func PriceFileError(p Prices, err error) error {
+	return &Error{
+		File: p.File,
+		Line: p.Line,
+		Col:  p.Col,
+		Msg:  fmt.Sprintf("prices 块声明的价格文件 %s 无法使用：%v", p.Path, err),
+	}
 }
 
 // parsePrices 解析一个顶层 prices 块；返回时 p.pos 指向块后的第一行。

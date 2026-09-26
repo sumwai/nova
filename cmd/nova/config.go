@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/sumwai/nova/internal/config"
+	"github.com/sumwai/nova/internal/price"
 	"github.com/sumwai/nova/internal/profileapply"
 )
 
@@ -40,6 +41,9 @@ func newConfigCheckCmd() *cobra.Command {
 			}
 			cfg, err := loadConfig(path)
 			if err != nil {
+				return err
+			}
+			if err := validatePriceFile(cfg); err != nil {
 				return err
 			}
 
@@ -95,4 +99,19 @@ func loadConfig(path string) (*config.Config, error) {
 		ConfigDir: configDir,
 		Getenv:    os.Getenv,
 	})
+}
+
+// validatePriceFile 在不联网的校验路径上读取 prices 块声明的价格文件。
+//
+// 装配期本就要求这份文件可读（读不到即装配失败），但不联网的 config check 若不读它，
+// 路径写错只能等到 nova run 才发现——而那正是「校验通过」最容易被误读的场景。
+// 这里只做「能打开并解析」这一层，价格数字如何参与排序仍由装配期决定。
+func validatePriceFile(cfg *config.Config) error {
+	if !cfg.Prices.PathDeclared {
+		return nil
+	}
+	if _, err := price.LoadFile(cfg.Prices.Path); err != nil {
+		return config.PriceFileError(cfg.Prices, err)
+	}
+	return nil
 }

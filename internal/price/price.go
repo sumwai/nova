@@ -136,6 +136,10 @@ func withDefaults(opts Options) Options {
 type Table struct {
 	opts    Options
 	entries map[string]Entry
+	// unresolved 是 price_from 指向了但三处来源都没有的键。它服务装配期提醒：
+	// 一条悬空引用与「这个模型本来就没价」在查表结果上都是 Unknown，只有把
+	// 悬空这件事单独记下来，提醒才不必靠猜。
+	unresolved map[string]bool
 }
 
 // builtin 是内置价格表。
@@ -149,7 +153,7 @@ var builtin = map[string]Unit{}
 // 优先级：档案里的 price/free/price_from > prices { file } > 内置表。查不到任何
 // 来源的键是 Unknown，不是 Free。
 func Build(declared []Declared, external map[string]Unit, opts Options) *Table {
-	table := &Table{opts: withDefaults(opts), entries: map[string]Entry{}}
+	table := &Table{opts: withDefaults(opts), entries: map[string]Entry{}, unresolved: map[string]bool{}}
 
 	declaredByKey := make(map[string]Declared, len(declared))
 	for _, item := range declared {
@@ -218,8 +222,14 @@ func (t *Table) resolveUncached(key string, declared map[string]Declared, extern
 			}
 			return Entry{Kind: Known, Unit: unit, Source: "profile"}
 		case spec.From != "":
-			if referenced := t.resolve(spec.From, declared, external, stack); referenced.Kind != Unknown {
+			referenced := t.resolve(spec.From, declared, external, stack)
+			if referenced.Kind != Unknown {
 				return referenced
+			}
+			// 引用目标根本没被任何来源声明过才算悬空；目标存在只是自己也没价，
+			// 那是那张表的问题，不是这条引用写错了键。
+			if !t.declares(spec.From, declared, external) {
+				t.unresolved[spec.From] = true
 			}
 		}
 	}
@@ -345,6 +355,31 @@ func (t *Table) Lookup(key string) Entry {
 	}
 	// 未登记的键也要带上名义价：否则它在排序里会退化成 0，看起来像免费。
 	return Entry{Kind: Unknown, Unit: t.nominalFor(t.opts.Currency), Assumed: true, Source: "unknown"}
+}
+
+// declares 报告一个键是否被任何一处来源声明过（不看它最终解析成什么）。
+func (t *Table) declares(key string, declared map[string]Declared, external map[string]Unit) bool {
+	if _, ok := declared[key]; ok {
+		return true
+	}
+	if _, ok := external[key]; ok {
+		return true
+	}
+	_, ok := builtin[key]
+	return ok
+}
+
+// UnresolvedReferences 返回被 price_from 引用但没有任何来源声明的键，按字典序。
+//
+// 装配层用它在启动时记一条提醒：悬空引用与「查不到价格」在选路上都退化成 Unknown，
+// 不单独说一句，写错键这件事就只在排序结果里匿名地体现出来。
+func (t *Table) UnresolvedReferences() []string {
+	out := make([]string, 0, len(t.unresolved))
+	for key := range t.unresolved {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Currency 返回表的缺省币种。

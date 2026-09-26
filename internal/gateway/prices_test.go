@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sumwai/nova/internal/config"
@@ -90,5 +91,55 @@ func TestBuildPriceTableReportsBadFile(t *testing.T) {
 	}
 	if cerr.Line != 7 || cerr.Col != 5 {
 		t.Errorf("定位 = %s:%d:%d，期望指回 prices 块行", cerr.File, cerr.Line, cerr.Col)
+	}
+}
+
+// TestPriceReferenceWarnings 守护悬空 price_from 在装配期被提一句并指回端点。
+func TestPriceReferenceWarnings(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{{
+		Name: "vendor",
+		Endpoints: []config.Endpoint{{
+			File: "Novafile",
+			Line: 12,
+			Models: []config.Model{{
+				Name:  "m",
+				Price: price.Declared{Key: "vendor/m", From: "absent/key"},
+			}},
+		}},
+	}}}
+	table := price.Build([]price.Declared{{Key: "vendor/m", From: "absent/key"}}, nil, price.Options{})
+
+	warnings := priceReferenceWarnings(cfg, table)
+	if len(warnings) != 1 {
+		t.Fatalf("提醒数 = %d，期望 1", len(warnings))
+	}
+	if warnings[0].Line != 12 || warnings[0].File != "Novafile" {
+		t.Errorf("定位 = %s:%d，期望指回端点行", warnings[0].File, warnings[0].Line)
+	}
+	if !strings.Contains(warnings[0].Msg, "absent/key") {
+		t.Errorf("提醒 = %q，期望含悬空的键", warnings[0].Msg)
+	}
+}
+
+// TestPriceReferenceWarningsSilentWhenResolved 守护能解析的 price_from 不产生提醒。
+func TestPriceReferenceWarningsSilentWhenResolved(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{{
+		Name: "vendor",
+		Endpoints: []config.Endpoint{{
+			File: "Novafile",
+			Line: 12,
+			Models: []config.Model{{
+				Name:  "m",
+				Price: price.Declared{Key: "vendor/m", From: "vendor/target"},
+			}},
+		}},
+	}}}
+	table := price.Build([]price.Declared{
+		{Key: "vendor/m", From: "vendor/target"},
+		{Key: "vendor/target", Unit: &price.Unit{Currency: "USD", InputMTok: 1, OutputMTok: 2}},
+	}, nil, price.Options{})
+
+	if got := priceReferenceWarnings(cfg, table); len(got) != 0 {
+		t.Errorf("提醒 = %v，期望没有提醒", got)
 	}
 }

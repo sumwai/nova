@@ -31,7 +31,7 @@ func buildPriceTable(cfg *config.Config) (*price.Table, error) {
 	if cfg.Prices.Path != "" {
 		loaded, err := price.LoadFile(cfg.Prices.Path)
 		if err != nil {
-			return nil, priceFileError(cfg, err)
+			return nil, config.PriceFileError(cfg.Prices, err)
 		}
 		external = loaded
 	}
@@ -39,15 +39,43 @@ func buildPriceTable(cfg *config.Config) (*price.Table, error) {
 	return price.Build(declared, external, price.Options{Currency: cfg.Prices.Currency}), nil
 }
 
-// priceFileError 把价格文件读取失败包成一条指回 prices 块的配置错误。
+// priceReferenceWarnings 报告 price_from 指向了不存在条目的模型。
 //
-// 定位指向块头而不是路径那一行：块头是「这份价格从哪来」的声明处，而路径只是它的一个取值；
-// 读取失败时使用者要改的往往是整块声明或文件本身，指回声明处更省一轮换算。
-func priceFileError(cfg *config.Config, err error) error {
-	return &config.Error{
-		File: cfg.Prices.File,
-		Line: cfg.Prices.Line,
-		Col:  cfg.Prices.Col,
-		Msg:  fmt.Sprintf("prices 块声明的价格文件 %s 无法使用：%v", cfg.Prices.Path, err),
+// 悬空引用与「本来就没价」在查表结果上都是 Unknown，因此它不会自己浮到日志里。
+// 提醒按条目去重：多份渠道引用同一个不存在的键时，把键说一遍就够，
+// 但每条引用仍然指向它自己的端点，方便定位是哪个模型写错了。
+func priceReferenceWarnings(cfg *config.Config, table *price.Table) []config.Warning {
+	missing := map[string]bool{}
+	for _, key := range table.UnresolvedReferences() {
+		missing[key] = true
 	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	seen := map[string]bool{}
+	var warnings []config.Warning
+	for i := range cfg.Providers {
+		provider := &cfg.Providers[i]
+		for j := range provider.Endpoints {
+			endpoint := &provider.Endpoints[j]
+			for _, model := range endpoint.Models {
+				if model.Price.From == "" || !missing[model.Price.From] {
+					continue
+				}
+				key := provider.Name + "\x00" + model.Name + "\x00" + model.Price.From
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				warnings = append(warnings, config.Warning{
+					File: endpoint.File,
+					Line: endpoint.Line,
+					Msg: fmt.Sprintf("模型 %s 的 price_from 指向不存在的价格条目 %s；该模型按查不到价格处理（不是免费）",
+						model.Name, model.Price.From),
+				})
+			}
+		}
+	}
+	return warnings
 }

@@ -243,6 +243,51 @@ func TestLoadFileMissingReportsError(t *testing.T) {
 	}
 }
 
+// TestLoadFileRejectsUnknownField 守护价格文件是严格解析：字段名拼错即报错。
+//
+// 宽松解析会把一个少了 output_mtok 的条目变成「只有输入价」的 Known，
+// 而使用者以为自己写了两项，因此拼错的字段名不得静默跳过。
+func TestLoadFileRejectsUnknownField(t *testing.T) {
+	for name, content := range map[string]string{
+		"条目字段拼错": "vendor/model:\n  currency: USD\n  input_mtoks: 0.28\n",
+		"币种字段拼错": "vendor/model:\n  curreny: USD\n  input_mtok: 0.28\n",
+		"顶层不是映射": "- vendor/model\n",
+		"第二份文档":  "vendor/model:\n  input_mtok: 1\n---\nvendor/other:\n  input_mtok: 2\n",
+	} {
+		if _, err := ParseFile([]byte(content)); err == nil {
+			t.Errorf("%s：ParseFile 应报错", name)
+		}
+	}
+}
+
+// TestLoadFileAcceptsEmpty 守护空文件等价于「没有任何条目」，不是解析失败。
+func TestLoadFileAcceptsEmpty(t *testing.T) {
+	loaded, err := ParseFile([]byte("# 只有注释\n"))
+	if err != nil {
+		t.Fatalf("空价格文件不应报错：%v", err)
+	}
+	if len(loaded) != 0 {
+		t.Errorf("空价格文件加载出 %d 条条目，期望 0", len(loaded))
+	}
+}
+
+// TestUnresolvedReferences 守护悬空 price_from 被单独记下。
+//
+// 「引用目标不存在」与「目标存在但自己也没价」在查表结果上都是 Unknown，
+// 只有前者才是写错键，因此只有前者进 unresolved。
+func TestUnresolvedReferences(t *testing.T) {
+	table := Build([]Declared{
+		{Key: "p/alias", From: "missing/key"},
+		{Key: "p/target"},
+		{Key: "p/alias2", From: "p/target"},
+	}, nil, Options{})
+
+	got := table.UnresolvedReferences()
+	if len(got) != 1 || got[0] != "missing/key" {
+		t.Errorf("悬空引用 = %v，期望 [missing/key]", got)
+	}
+}
+
 // TestDefaultUsage 守护排序用的固定输出估计。
 func TestDefaultUsage(t *testing.T) {
 	table := Build(nil, nil, Options{})

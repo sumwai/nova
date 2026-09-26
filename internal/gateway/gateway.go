@@ -213,6 +213,11 @@ func Assemble(ctx context.Context, cfg *config.Config, opts AssembleOptions) (*A
 	if err != nil {
 		return nil, err
 	}
+	// 悬空 price_from 与「没写价格」在查表结果上都是 Unknown，把它单独提一句，
+	// 否则写错键这件事只会在 prefer price 的排序里匿名地体现出来。
+	for _, warning := range priceReferenceWarnings(cfg, pricesTable) {
+		logger.warning(warning)
+	}
 
 	resolver, routeWarnings := newModelRouteResolver(endpoints, cfg, pricesTable)
 	for _, warning := range routeWarnings {

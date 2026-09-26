@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/sumwai/nova/internal/adapters/anthropic"
 	"github.com/sumwai/nova/internal/adapters/gemini"
@@ -17,6 +18,7 @@ import (
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/credential"
 	"github.com/sumwai/nova/internal/domain"
+	"github.com/sumwai/nova/internal/limits"
 	"github.com/sumwai/nova/internal/pipeline"
 	"github.com/sumwai/nova/internal/price"
 	"github.com/sumwai/nova/internal/transport"
@@ -852,18 +854,33 @@ func (r *modelRouteResolver) availableAccounts(provider string, refs []string, m
 // 选路层的空结果有两种含义：模型本身没有候选（调用方按 model_not_found 处理），
 // 或候选都在额度上不可用（可重试，换渠道可能成功）。两者必须分开，
 // 否则额度耗尽会被报成「模型不存在」。判定原因写进 detail：
-// absolute 触顶需显式清除、估算态这些事实在别处没有出口。
+// absolute 触顶需显式清除、估算态、恢复时刻这些事实在别处没有出口。
+//
+// 错误码按「剔除原因是否全是限流」分流：纯 rate 触顶只说明此刻应当退避，
+// 与「窗口额度耗尽」不是同一件事，回同一个码会让客户端把一次可短期重试的退避
+// 当成额度问题去换渠道或报警。
 func quotaExhaustedError(skipped []availability) error {
 	seen := map[string]bool{}
 	parts := make([]string, 0, len(skipped))
+	allRate := len(skipped) > 0
 	for _, item := range skipped {
 		reason := item.reason
-		key := string(reason.Verdict) + "/" + reason.Metric + "/" + reason.Window
+		if reason.Verdict != limits.VerdictRateLimited {
+			allRate = false
+		}
+		// 去重键带模型与恢复时刻：同一码不同模型、不同恢复时刻是两组事实，
+		// 只按「码/metric/window」折叠会把它们静默合并成一条。
+		key := strings.Join([]string{
+			string(reason.Verdict), reason.Metric, reason.Window, reason.Model, reason.Until.UTC().Format(time.RFC3339),
+		}, "/")
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
 		detail := string(reason.Verdict)
+		if reason.Model != "" {
+			detail += " " + reason.Model
+		}
 		if reason.Metric != "" {
 			detail += " " + reason.Metric
 		}
@@ -876,10 +893,21 @@ func quotaExhaustedError(skipped []availability) error {
 		if reason.Estimated {
 			detail += "（估算）"
 		}
+		if !reason.Until.IsZero() {
+			detail += "，至 " + reason.Until.UTC().Format(time.RFC3339)
+		}
 		parts = append(parts, detail)
 	}
-	return domain.NewError(domain.CodeUpstreamQuotaExhausted, "所有候选渠道的额度均不可用").
-		WithDetail("被额度剔除的候选原因：" + strings.Join(parts, "、"))
+	code := domain.CodeUpstreamQuotaExhausted
+	message := "所有候选渠道的额度均不可用"
+	prefix := "被额度剔除的候选原因："
+	if allRate {
+		code = domain.CodeUpstreamRateLimited
+		message = "所有候选渠道此刻均被限流"
+		prefix = "被限流剔除的候选原因："
+	}
+	return domain.NewError(code, message).
+		WithDetail(prefix + strings.Join(parts, "、"))
 }
 
 // maxCandidates 返回单个模型展开账号后最长的候选链长度。
