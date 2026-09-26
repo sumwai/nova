@@ -7,6 +7,7 @@ import (
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/domain"
+	"github.com/sumwai/nova/internal/price"
 )
 
 // routeProvider 造一条只提供一个模型的渠道，账号唯一。
@@ -36,7 +37,7 @@ func routeConfig() *config.Config {
 
 func routeResolver(t *testing.T, cfg *config.Config) (*modelRouteResolver, []config.Warning) {
 	t.Helper()
-	return newModelRouteResolver(testEndpoints(cfg), cfg)
+	return newModelRouteResolver(testEndpoints(cfg), cfg, testPriceTable(t, cfg))
 }
 
 func providerOrder(routes []domain.Route) []string {
@@ -249,6 +250,189 @@ func equalStrings(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+// pricedProvider 造一条提供单个模型的渠道，并带上一条单价声明。
+//
+// price 是每百万输出 token 的单价：排序用的固定用量估计只含输出，
+// 因此把价格放在输出上才能观察排序。currency 为空表示不写单价（模拟查不到价格的模型）。
+func pricedProvider(name, model, currency string, rate float64) config.Provider {
+	provider := routeProvider(name, model)
+	declared := price.Declared{Key: "p/" + name, Currency: currency}
+	if currency != "" {
+		declared.Unit = &price.Unit{Currency: currency, OutputMTok: rate}
+	}
+	provider.Endpoints[0].Models[0].Price = declared
+	return provider
+}
+
+// freeProvider 造一条显式免费的渠道。
+func freeProvider(name, model string) config.Provider {
+	provider := routeProvider(name, model)
+	provider.Endpoints[0].Models[0].Price = price.Declared{Key: "p/" + name, Free: true, Currency: "USD"}
+	return provider
+}
+
+// TestPreferOrderIgnoresPrices 守护 order 不受价格影响：即使带上单价，顺序仍是声明顺序。
+func TestPreferOrderIgnoresPrices(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		pricedProvider("a", "m", "USD", 10),
+		pricedProvider("b", "m", "USD", 1),
+		pricedProvider("c", "m", "USD", 5),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern: "m",
+		Prefer:  config.PreferOrder,
+		Candidates: []config.RouteCandidate{
+			{Provider: "a", Weight: 1},
+			{Provider: "b", Weight: 1},
+			{Provider: "c", Weight: 1},
+		},
+	}}
+
+	resolver, _ := routeResolver(t, cfg)
+	if got := providerOrder(candidatesOf(t, resolver, "m")); !equalStrings(got, []string{"a", "b", "c"}) {
+		t.Errorf("order 顺序 = %v，期望声明顺序", got)
+	}
+}
+
+// TestPreferPriceSortsByUnitCost 守护同币种内按单价升序。
+func TestPreferPriceSortsByUnitCost(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		pricedProvider("a", "m", "USD", 3),
+		pricedProvider("b", "m", "USD", 1),
+		pricedProvider("c", "m", "USD", 2),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern: "m",
+		Prefer:  config.PreferPrice,
+		Candidates: []config.RouteCandidate{
+			{Provider: "a", Weight: 1},
+			{Provider: "b", Weight: 1},
+			{Provider: "c", Weight: 1},
+		},
+	}}
+
+	resolver, _ := routeResolver(t, cfg)
+	if got := providerOrder(candidatesOf(t, resolver, "m")); !equalStrings(got, []string{"b", "c", "a"}) {
+		t.Errorf("price 顺序 = %v，期望按单价升序 b c a", got)
+	}
+}
+
+// TestPreferPriceKeepsFreeFirst 守护显式免费排在所有按量之前，且组内保持声明顺序。
+func TestPreferPriceKeepsFreeFirst(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		pricedProvider("a", "m", "USD", 0.5),
+		freeProvider("b", "m"),
+		freeProvider("c", "m"),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern: "m",
+		Prefer:  config.PreferPrice,
+		Candidates: []config.RouteCandidate{
+			{Provider: "a", Weight: 1},
+			{Provider: "b", Weight: 1},
+			{Provider: "c", Weight: 1},
+		},
+	}}
+
+	resolver, _ := routeResolver(t, cfg)
+	if got := providerOrder(candidatesOf(t, resolver, "m")); !equalStrings(got, []string{"b", "c", "a"}) {
+		t.Errorf("price 顺序 = %v，期望免费 b c 在前、按量 a 在后", got)
+	}
+}
+
+// TestPreferPriceUnknownJoinsByNominal 守护未知价用名义价参与排序，不被排到最后。
+//
+// 已知输出单价 10 与 2，中位数是 6；未知条目按 6 排，落在两者之间。
+func TestPreferPriceUnknownJoinsByNominal(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		pricedProvider("a", "m", "USD", 10),
+		pricedProvider("b", "m", "USD", 2),
+		pricedProvider("c", "m", "", 0),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern: "m",
+		Prefer:  config.PreferPrice,
+		Candidates: []config.RouteCandidate{
+			{Provider: "a", Weight: 1},
+			{Provider: "b", Weight: 1},
+			{Provider: "c", Weight: 1},
+		},
+	}}
+
+	resolver, warnings := routeResolver(t, cfg)
+	got := providerOrder(candidatesOf(t, resolver, "m"))
+	if !equalStrings(got, []string{"b", "c", "a"}) {
+		t.Errorf("price 顺序 = %v，期望未知价 c 按名义价落在中间", got)
+	}
+	// 名义价参与排序时必须被标 assumed，否则「这个顺序不是按真实单价得出的」无从看见。
+	found := false
+	for _, warning := range warnings {
+		if strings.Contains(warning.Msg, "价格未知") && strings.Contains(warning.Msg, "assumed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("期望一条「价格未知…assumed」提醒，实际：%v", warnings)
+	}
+}
+
+// TestPreferPriceDoesNotCompareCurrencies 守护跨币种不比较：各自分组、组内排序。
+//
+// 声明顺序是 a(USD 10) b(EUR 100) c(USD 1) d(EUR 1)。USD 组内应为 c a，EUR 组内应为 d b，
+// 组按首次出现排成 USD 组在前。EUR 的 1 小于 USD 的 1 也不会跳进 USD 组，因为两者不可比。
+func TestPreferPriceDoesNotCompareCurrencies(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		pricedProvider("a", "m", "USD", 10),
+		pricedProvider("b", "m", "EUR", 100),
+		pricedProvider("c", "m", "USD", 1),
+		pricedProvider("d", "m", "EUR", 1),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern: "m",
+		Prefer:  config.PreferPrice,
+		Candidates: []config.RouteCandidate{
+			{Provider: "a", Weight: 1},
+			{Provider: "b", Weight: 1},
+			{Provider: "c", Weight: 1},
+			{Provider: "d", Weight: 1},
+		},
+	}}
+
+	resolver, _ := routeResolver(t, cfg)
+	got := providerOrder(candidatesOf(t, resolver, "m"))
+	if !equalStrings(got, []string{"c", "a", "d", "b"}) {
+		t.Errorf("price 顺序 = %v，期望 USD 组 c a 在前、EUR 组 d b 在后", got)
+	}
+}
+
+// TestPreferPriceThenBalanceRotates 守护 prefer 与 balance 的关系：先按价格排序，再轮转起点。
+func TestPreferPriceThenBalanceRotates(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		pricedProvider("a", "m", "USD", 3),
+		pricedProvider("b", "m", "USD", 1),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern:  "m",
+		Prefer:   config.PreferPrice,
+		Balanced: true,
+		Candidates: []config.RouteCandidate{
+			{Provider: "a", Weight: 1},
+			{Provider: "b", Weight: 1},
+		},
+	}}
+
+	resolver, _ := routeResolver(t, cfg)
+	var firsts []string
+	for round := 0; round < 4; round++ {
+		got := providerOrder(candidatesOf(t, resolver, "m"))
+		firsts = append(firsts, got[0])
+	}
+	// 排序后 b 在前，轮转只改起点：b,a,b,a。
+	if want := []string{"b", "a", "b", "a"}; !equalStrings(firsts, want) {
+		t.Errorf("首选渠道序列 = %v，期望 %v", firsts, want)
+	}
 }
 
 func indexOfProvider(routes []domain.Route, provider string) int {

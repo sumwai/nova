@@ -96,6 +96,21 @@ func (p *parser) applyRouteLine(ln line, route *ModelRoute) error {
 		route.Balanced = true
 		return nil
 
+	case directivePrefer:
+		if err := p.rejectRepeat(head); err != nil {
+			return err
+		}
+		return p.setValue(ln, func(v token) error {
+			switch v.text {
+			case PreferOrder, PreferPrice:
+				route.Prefer = v.text
+				return nil
+			}
+			return errorf(ln.file, v.line, v.col,
+				"%s 的取值 %q 不认识，取值只能是 %s / %s",
+				directivePrefer, v.text, PreferOrder, PreferPrice)
+		})
+
 	case directiveProvider:
 		return p.appendRouteCandidates(ln, route, false)
 

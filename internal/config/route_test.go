@@ -280,3 +280,71 @@ func TestRouteIsListedAsInstruction(t *testing.T) {
 		t.Errorf("指令清单里没有 %s：%v", directiveRoute, InstructionNames())
 	}
 }
+
+// TestParseRoutePrefer 守护 prefer 的两个取值；未写时等价于 order。
+func TestParseRoutePrefer(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "未写等价于 order",
+			src:  "version 1\n" + routeProvider("a") + "route m {\n    provider a\n}\n",
+			want: "",
+		},
+		{
+			name: "order",
+			src:  "version 1\n" + routeProvider("a") + "route m {\n    prefer order\n    provider a\n}\n",
+			want: PreferOrder,
+		},
+		{
+			name: "price",
+			src:  "version 1\n" + routeProvider("a") + "route m {\n    prefer price\n    provider a\n}\n",
+			want: PreferPrice,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := mustParse(t, tt.src)
+			route := cfg.ModelRoutes[0]
+			if route.Prefer != tt.want {
+				t.Errorf("prefer = %q，期望 %q", route.Prefer, tt.want)
+			}
+			if got, want := route.PreferPrice(), tt.want == PreferPrice; got != want {
+				t.Errorf("PreferPrice() = %v，期望 %v", got, want)
+			}
+		})
+	}
+}
+
+// TestRoutePreferRejectsUnknownValue 守护非法取值被拒，错误里列出两个可选值。
+func TestRoutePreferRejectsUnknownValue(t *testing.T) {
+	err := parseErr(t, "version 1\n"+routeProvider("a")+
+		"route m {\n    prefer cheapest\n    provider a\n}\n")
+	for _, want := range []string{"不认识", PreferOrder, PreferPrice} {
+		if !strings.Contains(err.Msg, want) {
+			t.Errorf("消息 = %q，期望包含 %q", err.Msg, want)
+		}
+	}
+}
+
+// prefer 在同一规则里只能写一次，走 rejectRepeat 口径。
+func TestRoutePreferWrittenTwice(t *testing.T) {
+	err := parseErr(t, "version 1\n"+routeProvider("a")+
+		"route m {\n    prefer order\n    prefer price\n    provider a\n}\n")
+	for _, want := range []string{"prefer", "不能写两次"} {
+		if !strings.Contains(err.Msg, want) {
+			t.Errorf("消息 = %q，期望包含 %q", err.Msg, want)
+		}
+	}
+}
+
+// prefer 缺少取值时报出缺值，而不是默默按 order 处理。
+func TestRoutePreferMissingValue(t *testing.T) {
+	err := parseErr(t, "version 1\n"+routeProvider("a")+
+		"route m {\n    prefer\n    provider a\n}\n")
+	if !strings.Contains(err.Msg, "缺少取值") {
+		t.Errorf("消息 = %q，期望指出缺少取值", err.Msg)
+	}
+}

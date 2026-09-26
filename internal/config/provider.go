@@ -23,7 +23,16 @@ type childBlock struct {
 // 端点指令（url / protocol / timeout / model）构成这条渠道的「默认端点」——
 // 单端点时因此不必多写一层花括号，而多端点时每条端点的指令仍然只在它自己那一层，
 // 「哪些模型走哪条端点」不会因为平铺而丢失。
+//
+// 块头只有两个记号（`provider <名>`）时不分流到块：它是「引用同名档案」的简写，
+// 展开阶段才把档案补齐。带 `{` 的三记号形态仍是手写渠道，语义完全不变。
+//
+// 两种形态对同一个名字不能并存：先写单行引用、再写同名块（或反之）由 addProvider
+// 统一按重名拒绝，而不是让「哪一个赢」成为一个没有答案的问题。
 func (p *parser) parseProvider(head line) error {
+	if len(head.tokens) == 2 {
+		return p.parseProviderReference(head)
+	}
 	if len(head.tokens) != 3 || head.tokens[2].kind != tokenBlockOpen {
 		return errorf(head.file, head.tokens[0].line, head.tokens[0].col,
 			"provider 块写成 `provider <名字> {`；现在这一行是 %q", describeLine(head))
@@ -85,10 +94,61 @@ func (p *parser) parseProvider(head line) error {
 		provider.Endpoints = append(provider.Endpoints, endpoint)
 	}
 
+	// 块内写了 account 但没有写 profile 时，按渠道名引用同名档案。
+	//
+	// 这是单行 `provider <名>` 引用的块形态：加一个块只是为了写账号，
+	// 让同一个档案名在这里再写一遍没有新信息。account 引用的凭据按档案 id 存放，
+	// 因此这条引用不是隐式猜测，而是这种写法唯一可能的含义。
+	if !provider.ProfileRef && hasNamedAccount(&provider) {
+		provider.Profile = provider.Name
+		provider.ProfileRef = true
+	}
+
 	if err := p.finishProvider(&provider); err != nil {
 		return err
 	}
 	return p.addProvider(provider)
+}
+
+// hasNamedAccount 报告渠道里是否写了引用凭据库的 account 行。
+func hasNamedAccount(provider *Provider) bool {
+	for i := range provider.Accounts {
+		if provider.Accounts[i].Name != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// parseProviderReference 处理 `provider <名>` 单行形态：引用同名档案。
+//
+// 名字同时充当档案 id：多数场景下渠道名就是档案 id（opencode-go、deepseek-official），
+// 不必再把同一个名字写两遍。两者不一致时用块内 `profile <id>` 写。
+func (p *parser) parseProviderReference(head line) error {
+	nameTok := head.tokens[1]
+	if nameTok.kind != tokenWord {
+		return errorf(head.file, nameTok.line, nameTok.col,
+			"provider 的名字不能是花括号；块头写成 `provider <名字> {`")
+	}
+	// 下一行紧跟 provider 级指令（api_key / url / model …）说明这一行漏了 `{`：
+	// 单行引用与块头只差一个花括号，但含义完全不同。不在这里报，错误会落到
+	// 下一行变成「未知指令 api_key」，指向的不是真正要改的那一行。
+	if p.pos+1 < len(p.lines) {
+		if next := p.lines[p.pos+1]; contains(providerDirectives, next.tokens[0].text) {
+			return errorf(head.file, head.tokens[0].line, head.tokens[0].col,
+				"provider %s 缺少块头花括号：`provider <名>` 单独成行只作档案引用；"+
+					"声明渠道要写 `provider %s {`", nameTok.text, nameTok.text)
+		}
+	}
+	p.pos++
+	return p.addProvider(Provider{
+		Name:       nameTok.text,
+		Profile:    nameTok.text,
+		ProfileRef: true,
+		File:       nameTok.file,
+		Line:       nameTok.line,
+		Col:        nameTok.col,
+	})
 }
 
 // applyProviderLine 处理 provider 块体里的一条 provider 级指令。
@@ -107,11 +167,11 @@ func (p *parser) applyProviderLine(
 		return p.unknownDirective(head, providerDirectives)
 	}
 	// model 、allow / deny 与 expose 可以写多次，其余指令在同一个作用域里只能出现一次。
-	// api_key 同样可以写多次：一条 api_key 声明一个账号，多账号是同一句指令的重复，
+	// api_key 与 account 同样可以写多次：一句声明一个账号，多账号是同一句指令的重复，
 	// 不是另一种写法。
 	if head.text != directiveModel && head.text != directiveAllow &&
 		head.text != directiveDeny && head.text != directiveExpose &&
-		head.text != directiveAPIKey {
+		head.text != directiveAPIKey && head.text != directiveAccount {
 		if err := p.rejectRepeat(head); err != nil {
 			return err
 		}
@@ -121,8 +181,25 @@ func (p *parser) applyProviderLine(
 	case directiveAPIKey:
 		return p.appendAccount(ln, provider)
 
+	case directiveAccount:
+		return p.appendNamedAccount(ln, provider)
+
 	case directiveBalance:
 		return p.setBalance(ln, provider)
+
+	case directiveProfile:
+		// 取值是档案 id，必须是词记号：档案 id 是字面量，展开它与 {env.NAME} 无关。
+		// 块内写了 profile 时它就决定引用哪份档案，块名只作渠道标识与日志定位；
+		// 手写的 url / api_key / model 一并保留，供展开阶段按档案合并。
+		return p.setValue(ln, func(v token) error {
+			if v.kind != tokenWord {
+				return errorf(ln.file, v.line, v.col,
+					"%s 的取值是档案 id，不能是占位符 %s", directiveProfile, v.text)
+			}
+			provider.Profile = v.text
+			provider.ProfileRef = true
+			return nil
+		})
 
 	case directiveEndpoint:
 		// endpoint 子块走 blockOpener 分支；走到这里说明这一行没带 `{`。
@@ -180,6 +257,64 @@ func (p *parser) appendAccount(ln line, provider *Provider) error {
 			return errorf(ln.file, weightTok.line, weightTok.col,
 				"分摊权重 %q 不是正整数（形如 %s {env.OPENAI_KEY} 3）",
 				weightTok.text, directiveAPIKey)
+		}
+		account.Weight = weight
+	}
+	provider.Accounts = append(provider.Accounts, account)
+	return nil
+}
+
+// appendNamedAccount 追加一个引用凭据库的账号。
+//
+// 形态是 `account <名> [weight N]`：账号名是字面量，不是占位符——它是凭据库里的
+// 索引键，展开阶段拿它去查密钥。密钥本身不在这里写，因此这条指令不含任何秘密。
+// 只有引用了平台档案的渠道才能用它：凭据按档案 id 存放。
+func (p *parser) appendNamedAccount(ln line, provider *Provider) error {
+	head := ln.tokens[0]
+	switch {
+	case len(ln.tokens) < 2:
+		return errorf(ln.file, head.line, valueColumn(head),
+			"%s 缺少账号名（形如 %s work；要加权就写 %s work %s 2）",
+			directiveAccount, directiveAccount, directiveAccount, accountWeightKeyword)
+	case len(ln.tokens) > 4:
+		extra := ln.tokens[4]
+		return errorf(ln.file, extra.line, extra.col,
+			"%s 至多接受两个取值（账号名与权重），多出来的是 %q", directiveAccount, extra.text)
+	}
+
+	nameTok := ln.tokens[1]
+	if nameTok.kind != tokenWord {
+		return errorf(ln.file, nameTok.line, nameTok.col,
+			"%s 的账号名是字面量，不能是占位符 %s", directiveAccount, nameTok.text)
+	}
+
+	account := Account{
+		Name:   nameTok.text,
+		Weight: 1,
+		Index:  len(provider.Accounts) + 1,
+		File:   ln.file,
+		Line:   ln.no,
+		Col:    head.col,
+	}
+	switch len(ln.tokens) {
+	case 2:
+	case 3:
+		keywordTok := ln.tokens[2]
+		return errorf(ln.file, keywordTok.line, keywordTok.col,
+			"%s 的第二个取值只有 %s 一种（形如 %s work %s 2）",
+			directiveAccount, accountWeightKeyword, directiveAccount, accountWeightKeyword)
+	default:
+		keywordTok, weightTok := ln.tokens[2], ln.tokens[3]
+		if keywordTok.text != accountWeightKeyword {
+			return errorf(ln.file, keywordTok.line, keywordTok.col,
+				"%s 的第二个取值只有 %s 一种（形如 %s work %s 2），现在是 %q",
+				directiveAccount, accountWeightKeyword, directiveAccount, accountWeightKeyword, keywordTok.text)
+		}
+		weight, err := strconv.Atoi(weightTok.text)
+		if err != nil || weight < 1 {
+			return errorf(ln.file, weightTok.line, weightTok.col,
+				"分摊权重 %q 不是正整数（形如 %s work %s 2）",
+				weightTok.text, directiveAccount, accountWeightKeyword)
 		}
 		account.Weight = weight
 	}
@@ -586,15 +721,18 @@ func deriveListingURL(endpointURL string, protocol domain.Protocol) (string, boo
 
 // finishProvider 校验一条渠道，并在协议省略时从地址把它推出来。
 func (p *parser) finishProvider(provider *Provider) error {
-	if len(provider.Accounts) == 0 {
-		return errorf(provider.File, provider.Line, provider.Col,
-			"provider %s 没有任何凭据：至少需要一条 %s",
-			provider.Name, directiveAPIKey)
-	}
-	if len(provider.Endpoints) == 0 {
-		return errorf(provider.File, provider.Line, provider.Col,
-			"provider %s 没有任何端点：端点由 url 与 model 声明，"+
-				"既可以写在 provider 一级，也可以写成 endpoint 子块", provider.Name)
+	// 引用形态的凭据与端点由档案在展开阶段补齐，这里不要求配置里已有。
+	if !provider.ProfileRef {
+		if len(provider.Accounts) == 0 {
+			return errorf(provider.File, provider.Line, provider.Col,
+				"provider %s 没有任何凭据：至少需要一条 %s",
+				provider.Name, directiveAPIKey)
+		}
+		if len(provider.Endpoints) == 0 {
+			return errorf(provider.File, provider.Line, provider.Col,
+				"provider %s 没有任何端点：端点由 url 与 model 声明，"+
+					"既可以写在 provider 一级，也可以写成 endpoint 子块", provider.Name)
+		}
 	}
 	for i := range provider.Endpoints {
 		if err := p.finishEndpoint(provider, &provider.Endpoints[i]); err != nil {
@@ -631,11 +769,17 @@ func (p *parser) warnAccountPolicy(provider *Provider) {
 		if account.Weight == 1 {
 			continue
 		}
+		// 提醒要指向真正写权重的那条指令：account 与 api_key 都能加权，
+		// 一律说成 api_key 会让人去找一条并不存在的行。
+		directive := directiveAPIKey
+		if account.Name != "" {
+			directive = directiveAccount
+		}
 		p.cfg.Warnings = append(p.cfg.Warnings, Warning{
 			File: account.File,
 			Line: account.Line,
 			Msg: fmt.Sprintf("provider %s 未写 %s，账号按声明顺序调度，这条 %s 的权重没有作用",
-				provider.Name, directiveBalance, directiveAPIKey),
+				provider.Name, directiveBalance, directive),
 		})
 		return
 	}
@@ -682,12 +826,12 @@ func (p *parser) finishEndpoint(provider *Provider, endpoint *Endpoint) error {
 	if err := p.finishDiscovery(provider, endpoint); err != nil {
 		return err
 	}
-	if len(endpoint.Models) == 0 && endpoint.Discover == nil {
+	if len(endpoint.Models) == 0 && endpoint.Discover == nil && !provider.ProfileRef {
 		return fail("%s 没有声明任何 model；端点没有对外模型名就没有选路依据；"+
 			"模型由上游清单决定时写一行 discover", where)
 	}
 	if endpoint.Timeout <= 0 {
-		endpoint.Timeout = defaultTimeout
+		endpoint.Timeout = DefaultTimeout
 	}
 	return nil
 }

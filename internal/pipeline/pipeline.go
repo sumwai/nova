@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/sumwai/nova/internal/domain"
@@ -40,6 +41,8 @@ type Options struct {
 	// Breaker 是渠道熔断器；可为 nil（不熔断，候选渠道按解析顺序逐个尝试）。
 	// 非 nil 时，遍历候选时跳过处于熔断打开态的渠道，并在每次上游尝试结束后上报结果。
 	Breaker Breaker
+	// Limits 是额度层在转发路径上的实现；可为 nil（不做额度准入、观测与学习）。
+	Limits LimitRuntime
 	// MaxAttempts 是单请求最多发起的上游尝试次数；<= 0 时取 maxAttemptsDefault。
 	MaxAttempts int
 	// Backoff 是换下一候选前的退避策略；零值字段取对应默认值。
@@ -53,6 +56,7 @@ type Pipeline struct {
 	routes      domain.RouteResolver
 	observer    domain.Observer
 	breaker     Breaker
+	limits      LimitRuntime
 	maxAttempts int
 	backoff     backoff
 }
@@ -74,6 +78,8 @@ type attemptResult struct {
 	// StartedAt 与 EndedAt 是本次上游调用的两个边界时刻，由 doAttempt 紧贴上游调用前后采集。
 	StartedAt time.Time
 	EndedAt   time.Time
+	// Headers 是本次上游尝试的响应头；未取得时为 nil。额度观测取它。
+	Headers http.Header
 	// Err 是本次尝试的错误；nil 表示成功。
 	Err error
 }
@@ -98,6 +104,7 @@ func New(opts Options) (*Pipeline, error) {
 		routes:      opts.Routes,
 		observer:    opts.Observer,
 		breaker:     opts.Breaker,
+		limits:      opts.Limits,
 		maxAttempts: maxAttempts,
 		backoff:     newBackoff(opts.Backoff),
 	}, nil
@@ -147,6 +154,7 @@ func (p *Pipeline) completeAttempt(
 	}
 	result.Completion = completion
 	result.Usage = completion.Response.Usage
+	result.Headers = completion.Headers
 	parts, writeErr := p.writeCompletion(client, req, route, completion, out)
 	result.ResponseParts = parts
 	if writeErr != nil {
@@ -205,6 +213,7 @@ func (p *Pipeline) streamAttempt(
 	result.Err = p.upstream.Stream(ctx, route, req, body, sink)
 	result.EndedAt = time.Now()
 	result.Usage = sink.collectedUsage()
+	result.Headers = sink.responseHeaders()
 	result.WroteBytes = sink.wroteBytes()
 	result.clientWriteFailed = sink.writeFailed()
 	result.ResponseParts = sink.rewriteParts()
@@ -255,6 +264,12 @@ func (p *Pipeline) forward(
 
 	candidateRoutes, err := p.routes.Candidates(ctx, req)
 	if err != nil {
+		// 选路层可能用一个带错误码的统一错误表达「候选都在额度上不可用」这类
+		// 语义（可重试、可换渠道），那不是一个内部故障。统一错误原样透传，
+		// 其余才归为「选路失败」以避免未分级错误被当成可重试。
+		if domainErr := domain.AsError(err); domainErr != nil {
+			return domainErr
+		}
 		return domain.NewError(domain.CodeInternal, "选路失败").WithCause(err)
 	}
 	if len(candidateRoutes) == 0 {
@@ -264,19 +279,42 @@ func (p *Pipeline) forward(
 	attemptLimit := p.maxAttempts
 	var lastErr error
 	attemptsMade := 0
+	quotaSkipped := false
 	for i := 0; i < len(candidateRoutes) && attemptsMade < attemptLimit; i++ {
 		route := candidateRoutes[i]
 		// 熔断跳过：打开态渠道不参与调度，不计入尝试次数。
 		if !p.allowRoute(route) {
 			continue
 		}
+		// 额度准入与预留必须是原子一步：先判定再占位会在两步之间被并发请求钻空子。
+		// 估量按 metric 分量给出，requests 恒 1、tokens 取有效输出上限，否则并发预留
+		// 挡不住「剩余 1 个单位时同时请求的 N 个请求」。
+		var settle func(domain.Usage, error)
+		if p.limits != nil {
+			var ok bool
+			settle, ok = p.limits.Reserve(route, req.Model, costEstimate(req, route))
+			if !ok {
+				quotaSkipped = true
+				continue
+			}
+		}
 		body, requestParts, finalizeErr := p.finalizeRequest(req, route)
 		if finalizeErr != nil {
+			if settle != nil {
+				settle(domain.Usage{}, finalizeErr)
+			}
 			return finalizeErr
 		}
 		attemptsMade++
 		p.markRoutedModel(out, route)
-		attempt := doAttempt(ctx, route, body, requestParts)
+		attempt := p.doAttemptSettled(ctx, doAttempt, route, body, requestParts, settle)
+		// 响应头是额度观测的来源；额度耗尽的失败交给额度层按自适应规则学习。
+		if p.limits != nil {
+			p.limits.Observe(route, req.Model, attempt.Headers, attempt.Err == nil)
+			if attempt.Err != nil && quotaExhausted(attempt.Err) {
+				p.limits.LearnExhausted(route, req.Model, attempt.Err)
+			}
+		}
 		p.recordRouteOutcome(route, attempt.Err)
 		attempt.ResponseParts = mergeParts(requestParts, attempt.ResponseParts)
 		p.recordAttempt(ctx, req, route, attemptsMade, attempt)
@@ -301,11 +339,53 @@ func (p *Pipeline) forward(
 	}
 	if lastErr == nil {
 		if attemptsMade == 0 {
+			if quotaSkipped {
+				return domain.NewError(domain.CodeUpstreamQuotaExhausted, "所有候选渠道的额度均不可用")
+			}
 			return domain.NewError(domain.CodeUpstreamUnavailable, "所有候选渠道均处于熔断状态")
 		}
 		return domain.NewError(domain.CodeUpstreamUnavailable, "候选渠道或尝试次数耗尽")
 	}
 	return lastErr
+}
+
+// costEstimate 给出一次尝试的成本上界。
+//
+// requests 恒 1：一次尝试最多消耗一个请求额度。tokens 取本次请求与渠道共同决定的
+// 有效输出上限（domain.OutputLimit 的统一口径），取不到时至少 1——一个非零下界是
+// 并发预留能挡住最后一点剩余量的前提。usd 与 credits 需要价格层，不在这里估计。
+func costEstimate(req *domain.Request, route domain.Route) CostEstimate {
+	tokens := 1.0
+	if limit := domain.OutputLimit(req.MaxTokens, route.OutputLimit); limit > 0 {
+		tokens = float64(limit)
+	}
+	return CostEstimate{Requests: 1, Tokens: tokens}
+}
+
+// doAttemptSettled 执行一次上游尝试，并在结束时结算预留。
+//
+// settle 用 defer 兜底：doAttempt panic 时进程可能被外层恢复继续服务，
+// 预留若不回滚就会永久占住容量。settle 幂等，正常路径与兜底路径各调用一次不会重复扣减。
+func (p *Pipeline) doAttemptSettled(
+	ctx context.Context,
+	doAttempt func(context.Context, domain.Route, []byte, domain.RewriteParts) attemptResult,
+	route domain.Route,
+	body []byte,
+	requestParts domain.RewriteParts,
+	settle func(domain.Usage, error),
+) (attempt attemptResult) {
+	if settle == nil {
+		return doAttempt(ctx, route, body, requestParts)
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			settle(domain.Usage{}, domain.NewError(domain.CodeInternal, "上游尝试未正常结束"))
+			panic(recovered)
+		}
+	}()
+	attempt = doAttempt(ctx, route, body, requestParts)
+	settle(attempt.Usage, attempt.Err)
+	return attempt
 }
 
 // markRoutedModel 把本次尝试实际使用的事由模型名注入客户端写出目标；目标不支持该能力时为空操作。

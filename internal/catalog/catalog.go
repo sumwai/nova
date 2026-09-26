@@ -10,6 +10,7 @@ package catalog
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/sumwai/nova/internal/domain"
@@ -43,6 +44,13 @@ type Endpoint struct {
 
 	// CredentialRef 是凭据引用（即 provider 名），由 Fetcher 用来取密钥。
 	CredentialRef string
+
+	// CredentialHeaderStyle 是调用上游时的凭据注入形态；零值表示按协议现状注入。
+	// 清单接口与转发接口共用同一条凭据注入路径，因此它必须与端点一起传进来。
+	CredentialHeaderStyle domain.CredentialHeaderStyle
+
+	// Headers 是渠道级静态请求头，与凭据头合并后随清单请求发出。
+	Headers http.Header
 
 	// Timeout 是端点自身的超时；发现超时取它与 defaultTimeout 中较小的那个。
 	Timeout time.Duration

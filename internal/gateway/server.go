@@ -38,6 +38,20 @@ type Options struct {
 	// 它与命令行结果输出分开：日志走 stderr 时，`nova version --json | jq`
 	// 才不会被日志行污染。
 	LogOutput io.Writer
+
+	// StateDir 是额度快照与档案已装快照的状态目录；空表示不落盘。
+	// gateway 不读环境变量，由调用方给出。
+	StateDir string
+
+	// LimitFailureThreshold 是额度自适应规则里的 N；<= 0 时取内部缺省值。
+	LimitFailureThreshold int
+
+	// PrepareConfig 在配置读入之后、装配之前调用一次，用来把配置里尚未展开的
+	// 引用补齐（当前是平台档案引用）。为 nil 时跳过。
+	//
+	// gateway 本身不认识档案：展开要读状态目录、要碰档案源，那是调用方的知识。
+	// 以函数注入，让同一段服务逻辑既能被真实展开驱动，也能被测试直接调用。
+	PrepareConfig func(*config.Config) error
 }
 
 // Run 装配配置并开始服务，直到 ctx 结束或某个监听器失败。
@@ -50,10 +64,18 @@ func Run(ctx context.Context, opt Options) error {
 	if err != nil {
 		return err
 	}
+	if err := prepareConfig(opt.PrepareConfig, cfg); err != nil {
+		return err
+	}
 	// 统计库在此打开并交给装配：它跨 reload 存活，因此属于进程而不是某一装配。
 	// 打开失败只降级不退出——观测能力不可用不该拦下一个本身健康的网关。
 	store, storeErr := stats.New(stats.Options{Path: opt.StatePath})
-	first, err := Assemble(ctx, cfg, AssembleOptions{LogOutput: opt.LogOutput, Stats: store})
+	first, err := Assemble(ctx, cfg, AssembleOptions{
+		LogOutput:             opt.LogOutput,
+		Stats:                 store,
+		StateDir:              opt.StateDir,
+		LimitFailureThreshold: opt.LimitFailureThreshold,
+	})
 	if err != nil {
 		_ = store.Close()
 		return err
@@ -62,10 +84,24 @@ func Run(ctx context.Context, opt Options) error {
 		first.Logger.failure("统计库不可用，本次运行不记录统计", storeErr)
 	}
 
-	s := &server{holder: NewHolder(first), out: opt.LogOutput, stats: store}
+	s := &server{
+		holder:                NewHolder(first),
+		out:                   opt.LogOutput,
+		stats:                 store,
+		prepare:               opt.PrepareConfig,
+		stateDir:              opt.StateDir,
+		limitFailureThreshold: opt.LimitFailureThreshold,
+	}
 	reportWarnings(first.Logger, cfg)
 	first.Logger.startup(cfg, first.Stats, false)
 	serveErr := s.serve(ctx)
+	// 退出前关掉当前装配：额度层把本地累计与学习到的标记落在快照里，
+	// 不 Close 就会丢掉最后一个 FlushInterval 窗口内的状态。
+	if current := s.holder.Current(); current != nil {
+		if closeErr := current.Close(); closeErr != nil {
+			current.Logger.failure("额度快照落盘失败", closeErr)
+		}
+	}
 	// 退出前关库：不关会把 WAL 与 shm 留在磁盘上，留给下一次启动去恢复。
 	_ = store.Close()
 	return serveErr
@@ -80,6 +116,12 @@ type server struct {
 	out    io.Writer
 	// stats 是进程级统计存储，跨 reload 复用；每次装配共用它，因此累计不会因换配置归零。
 	stats *stats.Store
+	// prepare 是启动时注入的配置展开钩子，reload 复用同一份，
+	// 因此热重载与启动对同一份配置的理解一致。
+	prepare func(*config.Config) error
+	// stateDir 与 limitFailureThreshold 是装配期额度层的依赖，reload 复用同一份。
+	stateDir              string
+	limitFailureThreshold int
 }
 
 // serve 建立两个监听器并等它们结束。
@@ -183,10 +225,26 @@ func (s *server) reload(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
+	if err := prepareConfig(s.prepare, next); err != nil {
+		return err
+	}
 	if err := checkReloadable(s.holder.Current().Config, next); err != nil {
 		return err
 	}
-	assembled, err := Assemble(ctx, next, AssembleOptions{LogOutput: s.out, Stats: s.stats})
+	// 先把当前装配的额度状态落盘，再装配新表：新表在 Assemble 里从磁盘载入，
+	// 不先落盘的话两次落盘之间的本地累计与学习到的标记会丢，且新旧两张表
+	// 会先后写同一份快照，后写的状态未必是更完整的。
+	if current := s.holder.Current(); current != nil && current.limits != nil {
+		if err := current.limits.Close(); err != nil {
+			current.Logger.failure("额度快照落盘失败", err)
+		}
+	}
+	assembled, err := Assemble(ctx, next, AssembleOptions{
+		LogOutput:             s.out,
+		Stats:                 s.stats,
+		StateDir:              s.stateDir,
+		LimitFailureThreshold: s.limitFailureThreshold,
+	})
 	if err != nil {
 		return err
 	}
@@ -201,6 +259,17 @@ func (s *server) reload(ctx context.Context, path string) error {
 		assembled.Logger.failure("旧装配释放失败", err)
 	}
 	return nil
+}
+
+// prepareConfig 调用非空的展开钩子。
+//
+// 抽成一个函数是为了让启动与 reload 两条路径共用同一句「nil 即跳过」：
+// 两处各写一个 if 时，漏掉一处会让热重载悄悄不展开，而启动看起来完全正常。
+func prepareConfig(prepare func(*config.Config) error, cfg *config.Config) error {
+	if prepare == nil {
+		return nil
+	}
+	return prepare(cfg)
 }
 
 // checkReloadable 拒绝那些 reload 兑现不了的改动。

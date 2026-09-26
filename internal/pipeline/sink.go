@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 
 	"github.com/sumwai/nova/internal/domain"
 )
@@ -13,6 +14,7 @@ import (
 //   - 是否写出失败（决定终态是否还能向该写出目标补发字节）
 //   - 响应侧改写标注
 //   - 本次尝试取得的用量
+//   - 上游响应头（供额度观测）
 type attemptSink interface {
 	domain.ChunkSink
 	// wroteBytes 报告本次尝试是否已向客户端写出过字节。
@@ -25,6 +27,8 @@ type attemptSink interface {
 	// collectedUsage 返回本次尝试取到的用量：取「最后一个携带用量的分片」，
 	// 未取得时返回来源未知的零值。
 	collectedUsage() domain.Usage
+	// responseHeaders 返回上游响应头；上游未给出或尚未到达时返回 nil。
+	responseHeaders() http.Header
 }
 
 // passthroughSink 是「客户端协议与上游协议一致」时的下沉目标。
@@ -39,11 +43,14 @@ type passthroughSink struct {
 	wrote bool
 	// failed 记录向客户端写出时是否拿到过错误（写出失败）。
 	failed bool
+	// headers 是上游响应头，用于额度观测。
+	headers http.Header
 }
 
 var (
-	_ domain.FrameSink = (*passthroughSink)(nil)
-	_ attemptSink      = (*passthroughSink)(nil)
+	_ domain.FrameSink          = (*passthroughSink)(nil)
+	_ domain.ResponseHeaderSink = (*passthroughSink)(nil)
+	_ attemptSink               = (*passthroughSink)(nil)
 )
 
 // Send 只接受结束分片：EOF 收尾分片（domain.Adapter.FinishStream 的返回值）没有对应的
@@ -84,6 +91,11 @@ func (s *passthroughSink) writeFailed() bool { return s.failed }
 
 func (s *passthroughSink) collectedUsage() domain.Usage { return s.usage }
 
+// SetResponseHeaders 记下上游响应头，供额度观测。
+func (s *passthroughSink) SetResponseHeaders(header http.Header) { s.headers = header }
+
+func (s *passthroughSink) responseHeaders() http.Header { return s.headers }
+
 // rewriteParts 报告响应侧改写标注。透传路径逐字节写出上游原始帧、不做任何改写，故恒为空。
 func (s *passthroughSink) rewriteParts() domain.RewriteParts { return nil }
 
@@ -102,9 +114,14 @@ type rebuildSink struct {
 	wrote      bool
 	// failed 记录向客户端写出时是否拿到过错误（写出失败）。
 	failed bool
+	// headers 是上游响应头，用于额度观测。
+	headers http.Header
 }
 
-var _ attemptSink = (*rebuildSink)(nil)
+var (
+	_ domain.ResponseHeaderSink = (*rebuildSink)(nil)
+	_ attemptSink               = (*rebuildSink)(nil)
+)
 
 // newRebuildSink 为一条流构造重建下沉目标，并预先生成流开始帧。
 //
@@ -178,6 +195,11 @@ func (s *rebuildSink) wroteBytes() bool { return s.wrote }
 func (s *rebuildSink) writeFailed() bool { return s.failed }
 
 func (s *rebuildSink) collectedUsage() domain.Usage { return s.usage }
+
+// SetResponseHeaders 记下上游响应头，供额度观测。
+func (s *rebuildSink) SetResponseHeaders(header http.Header) { s.headers = header }
+
+func (s *rebuildSink) responseHeaders() http.Header { return s.headers }
 
 // rewriteParts 报告响应侧改写标注：确实写出过网关编码字节（含开始帧）时，
 // 面向客户端的响应由网关重建。

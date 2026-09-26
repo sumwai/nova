@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync/atomic"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/sumwai/nova/internal/credential"
 	"github.com/sumwai/nova/internal/domain"
 	"github.com/sumwai/nova/internal/pipeline"
+	"github.com/sumwai/nova/internal/price"
 	"github.com/sumwai/nova/internal/transport"
 )
 
@@ -163,15 +165,25 @@ func routesByModel(endpoints []effectiveEndpoint) map[string][]endpointRoute {
 	for _, item := range endpoints {
 		provider := item.provider.Name
 		for _, model := range item.models {
+			// 发现来的模型没有档案里的价格声明，但价格文件仍按「档案 id/模型 id」
+			// 命名空间引用它。缺省键把这一点接上，否则 prices.file 对任何走 discover
+			// 的渠道都不生效；上游 id 才是模型 id，对外名（已被 expose 改写）不是。
+			priceKey := model.Price.Key
+			if priceKey == "" && item.provider.Profile != "" {
+				priceKey = price.FormatKey(item.provider.Profile, model.Upstream)
+			}
 			table[model.Name] = append(table[model.Name], endpointRoute{
 				Route: domain.Route{
-					UpstreamID:    upstreamID(provider, item.endpoint),
-					Provider:      provider,
-					Protocol:      item.endpoint.Protocol,
-					UpstreamModel: model.Upstream,
-					BaseURL:       item.endpoint.URL,
-					Timeout:       item.endpoint.Timeout,
-					CredentialRef: provider,
+					UpstreamID:            upstreamID(provider, item.endpoint),
+					Provider:              provider,
+					Protocol:              item.endpoint.Protocol,
+					UpstreamModel:         model.Upstream,
+					BaseURL:               item.endpoint.URL,
+					Timeout:               item.endpoint.Timeout,
+					CredentialRef:         provider,
+					CredentialHeaderStyle: item.provider.CredentialHeaderStyle,
+					Headers:               item.provider.Headers,
+					PriceKey:              priceKey,
 				},
 			})
 		}
@@ -304,6 +316,10 @@ type modelRouteResolver struct {
 	// 两层各有一颗轮转计数器：外层决定先试哪个渠道，内层决定先试哪份凭据。
 	accounts map[string]*accountPool
 	models   map[string]*modelCandidatePool
+	// limits 是逐账号额度表；nil 表示本次装配不做额度过滤与预留。
+	limits *limitRuntime
+	// prices 是本次装配建好的价格表，供 prefer price 排序使用；不为 nil。
+	prices *price.Table
 }
 
 // endpointRoute 是一条端点级候选：一个对外模型名落到某条端点上的结果。
@@ -368,12 +384,13 @@ func (p *accountPool) order() []string {
 //
 // 提醒只能在装配期算：一条规则能不能命中对外名、一个候选渠道有没有作用对象，
 // 都取决于此时实际存在的对外名集合（含从清单发现来的那些）。
-func newModelRouteResolver(endpoints []effectiveEndpoint, cfg *config.Config) (*modelRouteResolver, []config.Warning) {
-	routes, models, warnings := applyModelRoutes(routesByModel(endpoints), cfg)
+func newModelRouteResolver(endpoints []effectiveEndpoint, cfg *config.Config, prices *price.Table) (*modelRouteResolver, []config.Warning) {
+	routes, models, warnings := applyModelRoutes(routesByModel(endpoints), cfg, prices)
 	return &modelRouteResolver{
 		routes:   routes,
 		accounts: accountPools(cfg.Providers),
 		models:   models,
+		prices:   prices,
 	}, warnings
 }
 
@@ -430,12 +447,17 @@ func (p *modelCandidatePool) order(candidates []endpointRoute) []endpointRoute {
 // （按声明顺序，最后兜底）。后两段永远待在前一段之后，因此「主用全部失败才切换」
 // 是结构上的事实，而不是靠权重或运气。
 //
+// prefer 只决定每一段内部的顺序：order 就是声明顺序（与 prefer 引入前逐字一致），
+// price 按免费在前、其余按同币种单价升序。balance 是另一层：它在这份排序之上轮转
+// 主用段的起点，不改段内相对顺序，也不把回退段拉到前面。
+//
 // 返回的提醒对应两件事：一条规则没有命中任何对外名；一条规则里的某个渠道
 // 没有提供任何匹配该模式的模型。两者都只能在装配期回答，因为对外名集合包含
 // 从上游清单发现来的那些。
 func applyModelRoutes(
 	routes map[string][]endpointRoute,
 	cfg *config.Config,
+	prices *price.Table,
 ) (map[string][]endpointRoute, map[string]*modelCandidatePool, []config.Warning) {
 	out := make(map[string][]endpointRoute, len(routes))
 	models := make(map[string]*modelCandidatePool)
@@ -446,6 +468,7 @@ func applyModelRoutes(
 		seenCandidate[i] = map[string]bool{}
 	}
 
+	var warnings []config.Warning
 	for name, chain := range routes {
 		index := cfg.ModelRouteIndexFor(name)
 		if index < 0 {
@@ -459,10 +482,7 @@ func applyModelRoutes(
 		groups, at := groupByProvider(chain)
 		used := make([]bool, len(groups))
 
-		var preferred []endpointRoute
-		var fallbacks []endpointRoute
-		var segments []candidateSegment
-		total := 0
+		var preferred, fallbacks, tailGroups []candidateGroup
 		for _, candidate := range rule.Candidates {
 			group, ok := at[candidate.Provider]
 			if !ok {
@@ -470,35 +490,176 @@ func applyModelRoutes(
 			}
 			seenCandidate[index][candidate.Provider] = true
 			used[group] = true
+			entry := candidateGroup{routes: groups[group], weight: candidate.Weight}
 			if candidate.Fallback {
-				fallbacks = append(fallbacks, groups[group]...)
+				fallbacks = append(fallbacks, entry)
 				continue
 			}
-			start := len(preferred)
-			preferred = append(preferred, groups[group]...)
-			if rule.Balanced {
-				segments = append(segments, candidateSegment{
-					start: start, end: len(preferred), weight: candidate.Weight,
-				})
-				total += candidate.Weight
+			preferred = append(preferred, entry)
+		}
+		for i, group := range groups {
+			if !used[i] {
+				tailGroups = append(tailGroups, candidateGroup{routes: group})
 			}
 		}
 
+		// prefer 先定每段内的顺序，balance 再在这份顺序上轮转主用段的起点。
+		preferred = sortCandidateGroups(preferred, rule, prices)
+		fallbacks = sortCandidateGroups(fallbacks, rule, prices)
+		tailGroups = sortCandidateGroups(tailGroups, rule, prices)
+		warnings = append(warnings, assumedPriceWarnings(rule, preferred, fallbacks, tailGroups, prices)...)
+
 		// 三段依次拼起来：主用候选 → fallback 行声明的回退候选 → 规则没提到的渠道。
 		// 后两段都不参与轮转，它们只在前面全部失败之后才被用到。
-		tail := len(preferred)
-		reordered := append(preferred, fallbacks...)
-		for i, group := range groups {
-			if !used[i] {
-				reordered = append(reordered, group...)
+		var flattened []endpointRoute
+		var segments []candidateSegment
+		total := 0
+		for _, group := range preferred {
+			start := len(flattened)
+			flattened = append(flattened, group.routes...)
+			if rule.Balanced {
+				segments = append(segments, candidateSegment{
+					start: start, end: len(flattened), weight: group.weight,
+				})
+				total += group.weight
 			}
 		}
-		out[name] = reordered
+		tail := len(flattened)
+		for _, group := range fallbacks {
+			flattened = append(flattened, group.routes...)
+		}
+		for _, group := range tailGroups {
+			flattened = append(flattened, group.routes...)
+		}
+
+		out[name] = flattened
 		// 有规则就建池，即使没写 balance（segments 为空）：它同时是一个标记，
 		// 告诉请求期这个名字的候选顺序已经由规则定下，不再做同协议优先的隐式划分。
 		models[name] = &modelCandidatePool{segments: segments, tail: tail, total: total}
 	}
-	return out, models, routeWarnings(cfg.ModelRoutes, hit, seenCandidate)
+	return out, models, append(warnings, routeWarnings(cfg.ModelRoutes, hit, seenCandidate)...)
+}
+
+// candidateGroup 是候选链上按渠道切分的一段，以及它在 balance 下的权重。
+//
+// 权重只对主用段有意义；回退段与未列出的渠道不参与轮转，权重留零值。
+type candidateGroup struct {
+	routes []endpointRoute
+	weight int
+}
+
+// sortCandidateGroups 按规则的 prefer 重排候选组。
+//
+// order（含未写 prefer）原样返回：这就是声明顺序，与 prefer 引入之前逐字一致。
+// price 先按免费在前，再把其余组按币种分组、组内按估计成本升序。不同币种只分组、
+// 不互相比较；组内用稳定排序，同价与同币种内沿用声明顺序。
+func sortCandidateGroups(groups []candidateGroup, rule *config.ModelRoute, prices *price.Table) []candidateGroup {
+	if !rule.PreferPrice() || prices == nil || len(groups) < 2 {
+		return groups
+	}
+	usage := prices.DefaultUsage()
+	costs := make([]priceCost, len(groups))
+	for i, group := range groups {
+		costs[i] = groupCost(prices, usage, group.routes)
+	}
+
+	out := make([]candidateGroup, 0, len(groups))
+	priced := make([]int, 0, len(groups))
+	for i, cost := range costs {
+		if cost.free {
+			out = append(out, groups[i])
+			continue
+		}
+		priced = append(priced, i)
+	}
+
+	// 币种桶按首次出现排序；桶内按估计成本升序。跨币种不比较，因此不合成一个序列。
+	type bucket struct{ indices []int }
+	var order []*bucket
+	byCurrency := make(map[string]*bucket)
+	for _, i := range priced {
+		currency := costs[i].currency
+		b, ok := byCurrency[currency]
+		if !ok {
+			b = &bucket{}
+			byCurrency[currency] = b
+			order = append(order, b)
+		}
+		b.indices = append(b.indices, i)
+	}
+	for _, b := range order {
+		sort.SliceStable(b.indices, func(x, y int) bool {
+			return costs[b.indices[x]].estimate < costs[b.indices[y]].estimate
+		})
+		for _, i := range b.indices {
+			out = append(out, groups[i])
+		}
+	}
+	return out
+}
+
+// priceCost 是一条候选组在排序口径下的价格事实。
+type priceCost struct {
+	free     bool
+	currency string
+	estimate float64
+}
+
+// groupCost 取一个候选组的价格事实。
+//
+// 组内同一对外名、同一渠道的候选共享同一个价格键，因此取首条即可；组内为空时
+// 返回零值，它不参与任何比较。
+func groupCost(table *price.Table, usage price.Usage, routes []endpointRoute) priceCost {
+	if len(routes) == 0 {
+		return priceCost{}
+	}
+	entry := table.Lookup(routes[0].PriceKey)
+	return priceCost{
+		free:     entry.Kind == price.Free,
+		currency: entry.Unit.Currency,
+		estimate: price.Estimate(entry, usage),
+	}
+}
+
+// assumedPriceWarnings 报告 prefer price 规则里用名义价参与排序的渠道。
+//
+// 价格未知不是错误，但它是「这个顺序不是按真实单价得出的」这一事实，必须被看见；
+// 同一渠道在多条规则里各报一次没有新增信息，按渠道去重。
+func assumedPriceWarnings(
+	rule *config.ModelRoute,
+	preferred, fallbacks, tailGroups []candidateGroup,
+	table *price.Table,
+) []config.Warning {
+	if table == nil || !rule.PreferPrice() {
+		return nil
+	}
+	seen := map[string]bool{}
+	var warnings []config.Warning
+	for _, list := range [][]candidateGroup{preferred, fallbacks, tailGroups} {
+		for _, group := range list {
+			if len(group.routes) == 0 {
+				continue
+			}
+			route := group.routes[0]
+			if seen[route.Provider] {
+				continue
+			}
+			entry := table.Lookup(route.PriceKey)
+			// 用 Assumed 而不是 Kind：假定值才是「这个顺序不是按真实单价得出的」的判据，
+			// 未知条目经名义价填充后这一位为真，显式 free / known 条目为假。
+			if !entry.Assumed {
+				continue
+			}
+			seen[route.Provider] = true
+			warnings = append(warnings, config.Warning{
+				File: rule.File,
+				Line: rule.Line,
+				Msg: fmt.Sprintf("route %s 按 price 排序，渠道 %s 的价格未知，"+
+					"用名义价参与排序（标 assumed）", rule.Pattern, route.Provider),
+			})
+		}
+	}
+	return warnings
 }
 
 // groupByProvider 把一条候选链按渠道切成若干组，并返回渠道名到组下标。
@@ -580,6 +741,11 @@ func accountPools(providers []config.Provider) map[string]*accountPool {
 
 // Candidates 返回该 model 命中某个对外名时的候选渠道。
 //
+// 选路分两段。第一段是硬约束过滤（本层能回答的是额度耗尽、已到期与此刻限流）：
+// 被剔除的账号不进第二段，模型能力、协议与 permanent 标记在本版还没有数据源，
+// 待档案提供能力字段与错误分类接入后再加入这一层。第二段是 prefer 排序，装配期
+// 已按规则落定（见 applyModelRoutes）；这里只在该顺序上做账号展开与轮转，不重排渠道。
+//
 // 同协议的候选排在最前、跨协议的候选按原顺序留在链尾当回退（见
 // domain.PreferRoutesForProtocol）：首选同协议可以省掉重建，把请求按原协议的字段原样
 // 上发；跨协议的候选一条都不丢，因此同一个名字在两个协议端点下都可用时，另一个协议
@@ -608,16 +774,30 @@ func (r *modelRouteResolver) Candidates(_ context.Context, req *domain.Request) 
 	// 否则一个请求会在 E1 上从 #2 开始、在 E2 上又从 #1 开始。
 	orders := make(map[string][]string, len(r.accounts))
 	expanded := make([]domain.Route, 0, len(candidates))
+	// skipped 记录被额度层剔除的候选：空候选因此能区分「本来没有候选」
+	// 与「候选都因额度不可用」，后者回可重试的额度耗尽码而不是 404。
+	var skipped []availability
 	for _, candidate := range candidates {
+		pool := r.accounts[candidate.Provider]
+		if pool == nil {
+			// 单账号渠道没有账号池：Route.AccountRef 留空。额度不可用时整条候选跳过。
+			entry := r.accountAvailability(candidate.Provider, "", req.Model)
+			if !entry.ok {
+				skipped = append(skipped, entry)
+				continue
+			}
+			expanded = append(expanded, candidate.Route)
+			continue
+		}
 		order, cached := orders[candidate.Provider]
 		if !cached {
-			if pool := r.accounts[candidate.Provider]; pool != nil {
-				order = pool.order()
-			}
+			var reasons []availability
+			order, reasons = r.availableAccounts(candidate.Provider, pool.order(), req.Model)
 			orders[candidate.Provider] = order
+			skipped = append(skipped, reasons...)
 		}
 		if len(order) == 0 {
-			expanded = append(expanded, candidate.Route)
+			// 账号池里的账号都不可用：这条渠道整条跳过，不交给流水线空试。
 			continue
 		}
 		for _, ref := range order {
@@ -632,7 +812,74 @@ func (r *modelRouteResolver) Candidates(_ context.Context, req *domain.Request) 
 	if !ruled {
 		expanded = domain.PreferRoutesForProtocol(req.Protocol, expanded)
 	}
+	if len(expanded) == 0 && len(skipped) > 0 {
+		return nil, quotaExhaustedError(skipped)
+	}
 	return expanded, nil
+}
+
+// accountAvailability 报告某账号此刻是否在额度上可用，并给出原因；未装配额度层时恒为可用。
+func (r *modelRouteResolver) accountAvailability(provider, ref, model string) availability {
+	if r.limits == nil {
+		return availability{ok: true}
+	}
+	return r.limits.availability(provider, ref, model)
+}
+
+// availableAccounts 按额度可用性过滤账号顺序，保持原有先后，并返回被剔除账号的判定原因。
+//
+// 过滤只去掉 quota 耗尽、已到期与此刻限流的账号；rate 限流的账号只在本请求跳过，
+// 不写账号状态（Table.Available 已保证这一点），下个请求会重新参与。
+func (r *modelRouteResolver) availableAccounts(provider string, refs []string, model string) ([]string, []availability) {
+	if r.limits == nil || len(refs) == 0 {
+		return refs, nil
+	}
+	out := make([]string, 0, len(refs))
+	var skipped []availability
+	for _, ref := range refs {
+		entry := r.accountAvailability(provider, ref, model)
+		if entry.ok {
+			out = append(out, ref)
+			continue
+		}
+		skipped = append(skipped, entry)
+	}
+	return out, skipped
+}
+
+// quotaExhaustedError 把「全部候选都被额度层剔除」整理成一条可重试的上游错误。
+//
+// 选路层的空结果有两种含义：模型本身没有候选（调用方按 model_not_found 处理），
+// 或候选都在额度上不可用（可重试，换渠道可能成功）。两者必须分开，
+// 否则额度耗尽会被报成「模型不存在」。判定原因写进 detail：
+// absolute 触顶需显式清除、估算态这些事实在别处没有出口。
+func quotaExhaustedError(skipped []availability) error {
+	seen := map[string]bool{}
+	parts := make([]string, 0, len(skipped))
+	for _, item := range skipped {
+		reason := item.reason
+		key := string(reason.Verdict) + "/" + reason.Metric + "/" + reason.Window
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		detail := string(reason.Verdict)
+		if reason.Metric != "" {
+			detail += " " + reason.Metric
+		}
+		if reason.Window != "" {
+			detail += "/" + reason.Window
+		}
+		if reason.RequiresClear {
+			detail += "（需显式清除）"
+		}
+		if reason.Estimated {
+			detail += "（估算）"
+		}
+		parts = append(parts, detail)
+	}
+	return domain.NewError(domain.CodeUpstreamQuotaExhausted, "所有候选渠道的额度均不可用").
+		WithDetail("被额度剔除的候选原因：" + strings.Join(parts, "、"))
 }
 
 // maxCandidates 返回单个模型展开账号后最长的候选链长度。
@@ -668,6 +915,7 @@ func forwarderOptions(
 	adapters pipeline.AdapterLookup,
 	caller domain.UpstreamCaller,
 	observer domain.Observer,
+	limitRuntime *limitRuntime,
 ) pipeline.Options {
 	return pipeline.Options{
 		Adapters: adapters,
@@ -676,6 +924,8 @@ func forwarderOptions(
 		// Observer 记每次上游尝试：客户端只拿到聚合后的错误码，
 		// 上游的状态码与响应片段只在尝试记录里可见，缺了它排障只能靠猜。
 		Observer: observer,
+		// Limits 在选路之后再做一次原子准入与预留，并采集响应头观测、学习额度耗尽。
+		Limits: limitRuntime,
 		// Breaker 留零值：本版不做熔断，候选按声明顺序逐个尝试。
 		// 上游那份实现（internal/router）在生产装配里本来就没生效过，没有搬过来。
 		MaxAttempts: resolver.maxCandidates(),

@@ -2,14 +2,44 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/sumwai/nova/internal/config"
 )
+
+// 展开钩子在装配之前调用：它报错即启动失败，不会先起监听器。
+func TestRunCallsPrepareConfigBeforeServing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "Novafile")
+	src := "version 1\nlisten 127.0.0.1:18080\nadmin 127.0.0.1:18081\n" +
+		"provider p {\n    url https://example.com/v1/chat/completions\n    api_key k\n    model m\n}\n"
+	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+		t.Fatalf("写配置文件失败：%v", err)
+	}
+
+	want := errors.New("展开失败")
+	called := false
+	err := Run(context.Background(), Options{
+		ConfigPath: path,
+		LogOutput:  io.Discard,
+		PrepareConfig: func(*config.Config) error {
+			called = true
+			return want
+		},
+	})
+	if !called {
+		t.Fatal("PrepareConfig 没有被调用")
+	}
+	if !errors.Is(err, want) {
+		t.Errorf("错误 = %v，期望把展开失败原样上抛", err)
+	}
+}
 
 // testAssembly 造一份可供测试使用的装配。
 //

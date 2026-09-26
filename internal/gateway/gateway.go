@@ -8,6 +8,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,9 @@ type Assembly struct {
 	Config  *config.Config
 	Logger  *logger
 	Handler http.Handler
+
+	// limits 是本次装配建好的额度表集合，换出时落盘。
+	limits *limitRuntime
 
 	// Models 是本次装配的对外模型目录，按首现顺序去重。
 	// 它是客户端入口的 GET /v1/models 与 `nova models` 的唯一数据来源。
@@ -59,6 +63,9 @@ func (a *Assembly) Close() error {
 	}
 	for _, client := range a.clients {
 		client.CloseIdleConnections()
+	}
+	if a.limits != nil {
+		return a.limits.Close()
 	}
 	return nil
 }
@@ -117,6 +124,10 @@ type AssembleOptions struct {
 	// Stats 是进程级统计存储；nil 表示不采集（只做装配检查的调用方传 nil）。
 	// 它由进程持有而不是随装配创建：reload 换掉的是配置与日志句柄，统计必须连续。
 	Stats *stats.Store
+	// StateDir 是额度快照的落点；空表示不落盘。gateway 不读环境变量，由调用方给出。
+	StateDir string
+	// LimitFailureThreshold 是自适应规则里的 N；<= 0 时取 defaultLimitFailureThreshold。
+	LimitFailureThreshold int
 }
 
 // Assemble 按配置装配出一套运行时对象。
@@ -196,11 +207,28 @@ func Assemble(ctx context.Context, cfg *config.Config, opts AssembleOptions) (*A
 		return nil, fmt.Errorf("构造上游客户端失败：%w", err)
 	}
 
-	resolver, routeWarnings := newModelRouteResolver(endpoints, cfg)
+	// 价格表在选路表之前建：prefer price 要在装配期就把候选顺序定下来，
+	// 而顺序依赖每个模型的单价。读不到声明的价格文件就是装配失败，不静默降级。
+	pricesTable, err := buildPriceTable(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	resolver, routeWarnings := newModelRouteResolver(endpoints, cfg, pricesTable)
 	for _, warning := range routeWarnings {
 		logger.warning(warning)
 	}
-	forwarder, err := pipeline.New(forwarderOptions(resolver, lookup, upstreamClient, recorders))
+	limitRuntime, err := newLimitRuntime(cfg.Providers, opts.StateDir, opts.LimitFailureThreshold, logger, pricesTable)
+	if err != nil {
+		return nil, err
+	}
+	// 估算态不会自己浮到日志里：快照读失败、记账断档都只让 Available 给一个偏保守的值。
+	// 装配完成时把它一次说清，运行期就不再重复。
+	for _, warning := range limitRuntime.degradedWarnings() {
+		logger.failure("额度状态不完整，按估算态运行", errors.New(warning))
+	}
+	resolver.limits = limitRuntime
+	forwarder, err := pipeline.New(forwarderOptions(resolver, lookup, upstreamClient, recorders, limitRuntime))
 	if err != nil {
 		return nil, fmt.Errorf("构造转发流水线失败：%w", err)
 	}
@@ -225,6 +253,7 @@ func Assemble(ctx context.Context, cfg *config.Config, opts AssembleOptions) (*A
 		Discoveries: reports,
 		Stats:       stats,
 		clients:     []*http.Client{upstreamHTTP},
+		limits:      limitRuntime,
 	}, nil
 }
 

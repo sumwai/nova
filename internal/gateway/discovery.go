@@ -87,14 +87,16 @@ func discoveryTargets(cfg *config.Config) []discoveryTarget {
 				provider: provider.Name,
 				endpoint: endpoint,
 				spec: catalog.Endpoint{
-					Provider:      provider.Name,
-					ListingURL:    endpoint.Discover.URL,
-					Protocol:      endpoint.Protocol,
-					CredentialRef: provider.Name,
-					Timeout:       endpoint.Timeout,
-					Allow:         endpoint.Discover.Allow,
-					Deny:          endpoint.Discover.Deny,
-					Expose:        exposeAliases(endpoint.Discover.Expose),
+					Provider:              provider.Name,
+					ListingURL:            endpoint.Discover.URL,
+					Protocol:              endpoint.Protocol,
+					CredentialRef:         provider.Name,
+					CredentialHeaderStyle: provider.CredentialHeaderStyle,
+					Headers:               provider.Headers,
+					Timeout:               endpoint.Timeout,
+					Allow:                 endpoint.Discover.Allow,
+					Deny:                  endpoint.Discover.Deny,
+					Expose:                exposeAliases(endpoint.Discover.Expose),
 				},
 			})
 		}
@@ -172,9 +174,11 @@ type listingFetcher struct {
 // Listing 实现 catalog.Fetcher。
 func (f listingFetcher) Listing(ctx context.Context, ep catalog.Endpoint) ([]byte, error) {
 	headers, err := f.credentials.UpstreamHeaders(ctx, domain.Route{
-		UpstreamID:    ep.Provider,
-		Protocol:      ep.Protocol,
-		CredentialRef: ep.CredentialRef,
+		UpstreamID:            ep.Provider,
+		Protocol:              ep.Protocol,
+		CredentialRef:         ep.CredentialRef,
+		CredentialHeaderStyle: ep.CredentialHeaderStyle,
+		Headers:               ep.Headers,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("解析请求头失败：%w", err)

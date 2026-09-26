@@ -10,7 +10,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/gateway"
+	"github.com/sumwai/nova/internal/profileapply"
 )
 
 // configEnvVar 是通过环境变量指定配置文件路径时使用的变量名。
@@ -42,13 +44,33 @@ func newRunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// 档案展开要读同一份状态目录下的已装快照，因此这里把状态目录
+			// 一次算好、注入展开层；gateway 只负责在合适的时机调它。
+			stateDir, err := defaultStateDir()
+			if err != nil {
+				return err
+			}
+			// 凭据库定位不到时不阻断启动：只有真用到它的配置才会在展开期报错，
+			// 而那时错误消息会指出凭据库里缺了哪个账号。
+			configDir, err := defaultConfigBaseDir()
+			if err != nil {
+				configDir = ""
+			}
 			ctx, stop := notifyShutdown(cmd)
 			defer stop()
 
 			return gateway.Run(ctx, gateway.Options{
 				ConfigPath: path,
 				StatePath:  statePath,
+				StateDir:   stateDir,
 				LogOutput:  cmd.ErrOrStderr(),
+				PrepareConfig: func(cfg *config.Config) error {
+					return profileapply.Apply(cfg, profileapply.Options{
+						StateDir:  stateDir,
+						ConfigDir: configDir,
+						Getenv:    os.Getenv,
+					})
+				},
 			})
 		},
 	}
@@ -107,22 +129,43 @@ func resolveConfigPath(flagValue string, getenv func(string) string) (string, er
 	return defaultConfigPath()
 }
 
-// defaultStatePath 返回统计库的缺省路径：状态目录下的 nova/stats.db。
+// defaultStateDir 返回本机的 nova 状态目录。
 //
 // 状态目录与配置目录分开：配置回答「希望怎么跑」，状态记录「实际跑过什么」，
 // 前者通常纳入版本控制或由运维下发，后者是本机数据，混在一起会让两者互相牵连。
 //
 // 定位不到主目录时报错而不是退回当前目录：相对路径会让「上次的统计被写到哪了」
 // 随工作目录漂移，而那是重启后对不上账时最难查的一件事。
-func defaultStatePath() (string, error) {
+func defaultStateDir() (string, error) {
 	if dir := os.Getenv(stateEnvVar); dir != "" {
-		return filepath.Join(dir, "nova", "stats.db"), nil
+		return filepath.Join(dir, "nova"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("无法确定状态目录（%w）；统计库没有落点", err)
+		return "", fmt.Errorf("无法确定状态目录（%w）", err)
 	}
-	return filepath.Join(home, ".local", "state", "nova", "stats.db"), nil
+	return filepath.Join(home, ".local", "state", "nova"), nil
+}
+
+// defaultStatePath 返回统计库的缺省路径：状态目录下的 stats.db。
+func defaultStatePath() (string, error) {
+	dir, err := defaultStateDir()
+	if err != nil {
+		return "", fmt.Errorf("%w；统计库没有落点", err)
+	}
+	return filepath.Join(dir, "stats.db"), nil
+}
+
+// defaultConfigBaseDir 返回 XDG 约定下的用户配置目录（${XDG_CONFIG_HOME:-~/.config}）。
+//
+// 它与 defaultConfigPath 同口径：Nova 自己的目录是它下面的 nova/，配置文件
+// （Novafile）与凭据库（credentials.json）都放在那里。定位不到时报错，不退回当前目录。
+func defaultConfigBaseDir() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("无法确定用户配置目录（%w）", err)
+	}
+	return dir, nil
 }
 
 // defaultConfigPath 返回 XDG 约定下的缺省配置路径。

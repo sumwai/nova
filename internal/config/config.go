@@ -17,12 +17,15 @@ package config
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"time"
 
 	"github.com/sumwai/nova/internal/domain"
+	"github.com/sumwai/nova/internal/limits"
+	"github.com/sumwai/nova/internal/price"
 )
 
 // CurrentSchema 是本二进制实现的最高配置语法代数。
@@ -49,9 +52,13 @@ const (
 	defaultLogFormat = "text"
 	// 缺省只绑回环：本版对客户端请求没有别的兜底鉴别手段，绑到所有接口就等于
 	// 把上游凭据敞给任何能连上这台机器的人。对外服务时显式写 listen 即可。
-	defaultListen  = "127.0.0.1:8080"
-	defaultAdmin   = "localhost:2026"
-	defaultTimeout = 60 * time.Second
+	defaultListen = "127.0.0.1:8080"
+	defaultAdmin  = "localhost:2026"
+	// DefaultTimeout 是端点未写 timeout 时的缺省单次上游调用超时。
+	//
+	// 导出是因为展开层要把它写进从档案生成的端点：缺省值只能有一个出处，
+	// 展开层再抄一份字面量会在两处慢慢长出不同的数。
+	DefaultTimeout = 60 * time.Second
 )
 
 // Config 是一份 Novafile 的解析结果。
@@ -95,6 +102,14 @@ type Config struct {
 	// 一个名字取第一条命中它的规则；没有规则命中时，候选按 Providers 的声明顺序回退。
 	ModelRoutes []ModelRoute
 
+	// Profiles 是顶层 profiles 块的解析结果：平台档案的来源与刷新周期。
+	// 未写该块时取 DefaultProfiles 的缺省值（只有 source builtin、刷新 24h）。
+	Profiles Profiles
+
+	// Prices 是顶层 prices 块的解析结果：价格层的缺省币种与本地价格表文件。
+	// 未写该块时取 DefaultPrices 的缺省值（币种 USD、无本地文件）。
+	Prices Prices
+
 	// Warnings 是解析期攒下的、不阻止加载的提醒。
 	// 收集起来统一输出，让一次加载里的全部问题一次说完，而不是报一条改一条。
 	Warnings []Warning
@@ -120,6 +135,29 @@ type Provider struct {
 	// 顺序有意义：同一个对外模型名落在多条端点上时，它就是回退顺序。
 	Endpoints []Endpoint
 
+	// Profile 是这条渠道引用的平台档案 id。
+	//
+	// 两种写法都会写它：`provider <名>` 单独成行时取渠道名，块内写 `profile <id>` 时取该取值。
+	// 展开成端点与凭据发生在解析之后的装配阶段，因此这里保留的是引用本身，
+	// 而不是展开结果——解析层不联网、不读档案，`config check` 才能只校验配置。
+	Profile string
+
+	// ProfileRef 表示这条渠道是「引用一份档案」，尚未展开。
+	//
+	// 为真时「必须有凭据」「必须有端点」「端点必须有 model」三条必填断言放行，
+	// 交由展开阶段从档案补齐；其余校验（重名、端点排序、账号策略提醒）照旧。
+	ProfileRef bool
+
+	// CredentialHeaderStyle 是这条渠道调用上游时的凭据注入形态。
+	//
+	// 展开阶段从档案的 auth.header / auth.scheme 写入；手写渠道留零值，
+	// 由运行期按协议现状注入（见 domain.CredentialHeaderStyle）。
+	CredentialHeaderStyle domain.CredentialHeaderStyle
+
+	// Headers 是渠道级静态请求头，展开阶段从档案的 headers 写入。
+	// 它与凭据头合并后交给适配器补协议内置必需头；nil 表示没有额外请求头。
+	Headers http.Header
+
 	// File / Line / Col 指向 provider 名字的位置，用于报错时指回块头。
 	File string
 	Line int
@@ -132,7 +170,16 @@ type Provider struct {
 // 同一渠道的多份凭据因此不必重复声明端点，也不会随两份声明而漂移。
 type Account struct {
 	// APIKey 是明文密钥，由 api_key 指令给出，{env.NAME} 已在解析期展开。
+	//
+	// Name 非空时这里为空：那份凭据的密钥要到展开阶段才按档案 id 与账号名
+	// 从凭据库里取出，解析层因此不读磁盘。
 	APIKey string
+
+	// Name 是凭据库里的账号名，由 account 指令给出。
+	//
+	// 非空表示这是一条「引用凭据库里的账号」的声明，密钥在展开阶段填入 APIKey。
+	// 凭据按档案 id 存放，因此这类声明只在引用了平台档案的渠道里才有意义。
+	Name string
 
 	// Weight 是 balance 下的分摊权重，缺省 1。
 	// 未写 balance 时它没有作用，加载期会记一条提醒。
@@ -141,6 +188,13 @@ type Account struct {
 	// Index 是声明序号，从 1 起，按 api_key 行的出现顺序。
 	// 日志、凭据引用与轮转顺序都用它定位账号。
 	Index int
+
+	// Limits 是该账号的声明式额度，展开阶段从档案 plans 的静态限制写入。
+	//
+	// 类型取 limits 的中性声明，而不是 profile.Limit：config 不得依赖 internal/profile，
+	// 依赖方向因此是 config → limits → profile，不成环。空切片表示该账号没有声明额度，
+	// 一律视为可用，不因缺少额度表被剔除。
+	Limits []limits.Declared
 
 	// File / Line / Col 指向这条 api_key 指令，用于报错与提醒的定位。
 	File string
@@ -257,6 +311,13 @@ type Model struct {
 
 	// Upstream 是发往上游时写进请求体的模型名。未显式给出时等于 Name。
 	Upstream string
+
+	// Price 是该模型的价格声明，展开阶段从档案的 price / free / price_from 写入。
+	//
+	// 类型取 price 的中性声明，而不是 profile.Price：config 不得依赖 internal/profile，
+	// 依赖方向因此是 config → price →（无 profile 依赖）。手写模型没有这个声明，
+	// 零值表示查不到价格，一律按 Unknown 处理，不会被当成免费。
+	Price price.Declared
 }
 
 // Route 是一个对外模型名落到某条端点上的结果。
@@ -389,6 +450,10 @@ type ModelRoute struct {
 	// 为假时块内顺序就是优先级，逐条回退。
 	Balanced bool
 
+	// Prefer 是候选在可用集合上的排序策略：order 按声明顺序，price 按单价升序。
+	// 空串等价于 order（未写 prefer）。
+	Prefer string
+
 	// Candidates 是规则里列出的候选渠道，按声明顺序。
 	Candidates []RouteCandidate
 
@@ -397,6 +462,15 @@ type ModelRoute struct {
 	Line int
 	Col  int
 }
+
+// Prefer 是 route 块可选的排序策略。
+const (
+	// PreferOrder 完全按声明顺序，只剔除不可用。
+	PreferOrder = "order"
+
+	// PreferPrice 免费在前，其余按同币种单价升序；未知价用名义价参与排序。
+	PreferPrice = "price"
+)
 
 // RouteCandidate 是规则里列出的一条候选渠道。
 type RouteCandidate struct {
@@ -414,6 +488,11 @@ type RouteCandidate struct {
 	File string
 	Line int
 	Col  int
+}
+
+// PreferPrice 报告这条规则按价格排序；未写 prefer（空串）等价于 order。
+func (r *ModelRoute) PreferPrice() bool {
+	return r.Prefer == PreferPrice
 }
 
 // ModelRouteIndexFor 返回第一条命中该对外名的规则下标，没有则返回 -1。
@@ -540,6 +619,8 @@ func ParseWith(src []byte, filename string, opts Options) (*Config, error) {
 		LogFormat: defaultLogFormat,
 		Listen:    defaultListen,
 		Admin:     defaultAdmin,
+		Profiles:  DefaultProfiles(),
+		Prices:    DefaultPrices(),
 	}
 
 	// import 展开排在语法解析之前：它产出的行要参与同一次语法分析，
@@ -569,7 +650,7 @@ func ParseWith(src []byte, filename string, opts Options) (*Config, error) {
 func InstructionNames() []string {
 	var names []string
 	seen := map[string]bool{}
-	for _, table := range [][]string{globalDirectives, providerDirectives, endpointDirectives, blockDirectives} {
+	for _, table := range [][]string{globalDirectives, providerDirectives, endpointDirectives, routeDirectives, profilesDirectives, pricesDirectives, blockDirectives} {
 		for _, name := range table {
 			// 同一个名字可能出现在多个层级（timeout、model 等既能在 provider 一级
 			// 也能落在 endpoint 块里），对外声明的是名字集合，因此按名字去重。

@@ -9,6 +9,7 @@ import (
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/domain"
+	"github.com/sumwai/nova/internal/price"
 )
 
 func TestProtocolForPathMapsOnlyRegisteredPaths(t *testing.T) {
@@ -137,7 +138,8 @@ func TestRoutesByModelKeepsCandidateOrder(t *testing.T) {
 	if got := shared[0].Timeout; got != 5*time.Second {
 		t.Errorf("Timeout = %v，期望照搬端点的超时", got)
 	}
-	// 本版没有能配置这两项的指令，它们必须留零值，而不是被某个默认值悄悄填上。
+	// OutputLimit 当前没有能配置它的指令，必须留零值；CredentialHeaderStyle 也未被
+	// 这条手写配置声明，同样留零值，由运行期按协议现状注入。
 	if shared[0].OutputLimit != nil {
 		t.Errorf("OutputLimit = %v，期望 nil", *shared[0].OutputLimit)
 	}
@@ -146,9 +148,41 @@ func TestRoutesByModelKeepsCandidateOrder(t *testing.T) {
 	}
 }
 
+// TestRoutesByModelCarriesChannelAuthFacts 守护渠道声明的注入形态与静态头随路由下传。
+//
+// 档案展开写进渠道的 auth.header 与 headers 必须落到 domain.Route 上，
+// 否则运行期仍按协议猜、按空头发出，档案声明的平台事实等于没写。
+func TestRoutesByModelCarriesChannelAuthFacts(t *testing.T) {
+	cfg := testConfig()
+	cfg.Providers[0].CredentialHeaderStyle = domain.CredentialHeaderAuthorization
+	cfg.Providers[0].Headers = http.Header{"X-Tenant": []string{"acme"}}
+
+	shared := routesByModel(testEndpoints(cfg))["shared"]
+	if got := shared[0].CredentialHeaderStyle; got != domain.CredentialHeaderAuthorization {
+		t.Errorf("CredentialHeaderStyle = %q，期望 authorization", got)
+	}
+	if got := shared[0].Headers.Get("X-Tenant"); got != "acme" {
+		t.Errorf("Headers[X-Tenant] = %q，期望 acme", got)
+	}
+	// 未声明的渠道保留零值，仍按协议现状注入。
+	if got := shared[1].CredentialHeaderStyle; got != domain.CredentialHeaderAuto {
+		t.Errorf("未声明渠道的 CredentialHeaderStyle = %q，期望零值", got)
+	}
+}
+
+// testPriceTable 由配置里的价格声明造一张价格表，供选路用例使用。
+func testPriceTable(t *testing.T, cfg *config.Config) *price.Table {
+	t.Helper()
+	table, err := buildPriceTable(cfg)
+	if err != nil {
+		t.Fatalf("构造价格表失败：%v", err)
+	}
+	return table
+}
+
 func TestModelRouteResolverPrefersSameProtocol(t *testing.T) {
 	cfg := testConfig()
-	resolver, _ := newModelRouteResolver(testEndpoints(cfg), cfg)
+	resolver, _ := newModelRouteResolver(testEndpoints(cfg), cfg, testPriceTable(t, cfg))
 
 	got, err := resolver.Candidates(context.Background(), &domain.Request{
 		Model:    "shared",
@@ -172,7 +206,7 @@ func TestModelRouteResolverPrefersSameProtocol(t *testing.T) {
 
 func TestModelRouteResolverMissReturnsNoCandidates(t *testing.T) {
 	cfg := testConfig()
-	resolver, _ := newModelRouteResolver(testEndpoints(cfg), cfg)
+	resolver, _ := newModelRouteResolver(testEndpoints(cfg), cfg, testPriceTable(t, cfg))
 	for _, req := range []*domain.Request{
 		nil,
 		{Model: "unknown", Protocol: domain.ProtocolOpenAIChat},

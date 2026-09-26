@@ -8,6 +8,7 @@ import (
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/domain"
+	"github.com/sumwai/nova/internal/limits"
 )
 
 // acct 造一个账号，序号与权重都要显式给：序号就是它的引用，权重缺省在解析期填 1，
@@ -37,7 +38,7 @@ func accountConfig(balanced bool, accounts ...config.Account) *config.Config {
 // 的用例必须复用同一个实例，而不能每次重新装配。
 func resolverOf(t *testing.T, cfg *config.Config) *modelRouteResolver {
 	t.Helper()
-	resolver, _ := newModelRouteResolver(testEndpoints(cfg), cfg)
+	resolver, _ := newModelRouteResolver(testEndpoints(cfg), cfg, testPriceTable(t, cfg))
 	return resolver
 }
 
@@ -160,6 +161,95 @@ func TestBalancedPoolSharesOrderAcrossEndpoints(t *testing.T) {
 			got[0].AccountRef, got[1].AccountRef, got[2].AccountRef, got[3].AccountRef)
 	}
 }
+
+// TestPoolSkipsQuotaExhaustedAccount 守护额度耗尽的账号在展开阶段就被剔除。
+//
+// 账号 #1 的声明额度 remaining 为 0，可用性判定为 quota-exhausted；它不得进入候选链，
+// 以免每次请求都先打它再回退。账号 #2 没有声明限制，视为可用。
+func TestPoolSkipsQuotaExhaustedAccount(t *testing.T) {
+	exhausted := acct(1, 1)
+	exhausted.Limits = []limits.Declared{{
+		Kind:      "quota",
+		Metric:    "requests",
+		Window:    "1m",
+		Remaining: floatPtr(0),
+	}}
+	healthy := acct(2, 1)
+	cfg := accountConfig(false, exhausted, healthy)
+
+	resolver := resolverOf(t, cfg)
+	runtime, err := newLimitRuntime(cfg.Providers, "", 0, nil, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	resolver.limits = runtime
+
+	got := candidatesOf(t, resolver, "shared")
+	if len(got) != 1 || got[0].AccountRef != "#2" {
+		t.Fatalf("候选 = %+v，期望只留未耗尽的 #2", got)
+	}
+}
+
+// TestSingleExhaustedAccountSkipsCandidate 守护单账号渠道额度耗尽时整条候选被跳过，
+// 且空候选的原因是「额度不可用」而不是「模型不存在」。
+func TestSingleExhaustedAccountSkipsCandidate(t *testing.T) {
+	exhausted := acct(1, 1)
+	exhausted.Limits = []limits.Declared{{
+		Kind:      "quota",
+		Metric:    "requests",
+		Window:    "1m",
+		Remaining: floatPtr(0),
+	}}
+	cfg := accountConfig(false, exhausted)
+
+	resolver := resolverOf(t, cfg)
+	runtime, err := newLimitRuntime(cfg.Providers, "", 0, nil, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	resolver.limits = runtime
+
+	_, err = resolver.Candidates(context.Background(), &domain.Request{
+		Model:    "shared",
+		Protocol: domain.ProtocolOpenAIChat,
+	})
+	domainErr := domain.AsError(err)
+	if domainErr == nil || domainErr.Code != domain.CodeUpstreamQuotaExhausted {
+		t.Fatalf("单账号耗尽时应报额度耗尽错误，实际 %v", err)
+	}
+}
+
+// TestAccountPoolAllExhaustedReportsQuota 守护账号池全部耗尽时也回额度耗尽码。
+func TestAccountPoolAllExhaustedReportsQuota(t *testing.T) {
+	cfg := accountConfig(false, acct(1, 1), acct(2, 1))
+	for i := range cfg.Providers[0].Accounts {
+		cfg.Providers[0].Accounts[i].Limits = []limits.Declared{{
+			Kind:      "quota",
+			Metric:    "requests",
+			Window:    "1m",
+			Remaining: floatPtr(0),
+		}}
+	}
+
+	resolver := resolverOf(t, cfg)
+	runtime, err := newLimitRuntime(cfg.Providers, "", 0, nil, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	resolver.limits = runtime
+
+	_, err = resolver.Candidates(context.Background(), &domain.Request{
+		Model:    "shared",
+		Protocol: domain.ProtocolOpenAIChat,
+	})
+	domainErr := domain.AsError(err)
+	if domainErr == nil || domainErr.Code != domain.CodeUpstreamQuotaExhausted {
+		t.Fatalf("账号池全部耗尽时应报额度耗尽错误，实际 %v", err)
+	}
+}
+
+// floatPtr 返回浮点值的指针副本，供声明里的 remaining 使用。
+func floatPtr(value float64) *float64 { return &value }
 
 // TestAccountPoolOrderAppliesWeights 守护加权轮转：按累计权重决定这次的起点。
 //

@@ -121,7 +121,8 @@ func New(credentials map[string][]Account) *Provider {
 // UpstreamHeaders 实现 upstream.HeaderProvider 的契约。
 //
 // 每次调用都返回一个全新的 http.Header（调用方会直接写入，不得返回共享 map），
-// 内容 = 本次凭据头 + route.Headers。注入形态取自 route.Protocol：协议是路由（端点）的事实，
+// 内容 = 本次凭据头 + route.Headers。注入形态优先取自 route.CredentialHeaderStyle（渠道声明），
+// 为零值时按 route.Protocol 的协议现状注入：协议是路由（端点）的事实，
 // 凭据只回答用哪份密钥；合并规则里凭据头是被上游用来鉴权的唯一来源，
 // 因此与 route.Headers 同名冲突时以凭据头为准，配置里的静态头不能把它覆盖掉。
 func (p *Provider) UpstreamHeaders(_ context.Context, route domain.Route) (http.Header, error) {
@@ -129,7 +130,7 @@ func (p *Provider) UpstreamHeaders(_ context.Context, route domain.Route) (http.
 	if err != nil {
 		return nil, err
 	}
-	headers, credentialHeader, err := credentialHeaders(route.Protocol, cred.APIKey)
+	headers, credentialHeader, err := credentialHeaders(route.CredentialHeaderStyle, route.Protocol, cred.APIKey)
 	if err != nil {
 		return nil, err
 	}
@@ -164,13 +165,39 @@ func (p *Provider) credentialFor(channel, accountRef string) (Credential, error)
 		fmt.Sprintf("渠道 %q 里没有账号 %q", channel, accountRef))
 }
 
-// credentialHeaders 按本次路由的协议产出一份全新的凭据头，并返回凭据头的标准名。
+// credentialHeaders 产出一份全新的凭据头，并返回凭据头的标准名。
 //
-// 第二个返回值供合并阶段跳过同名静态头；不支持的协议按平台内部错误返回，
-// 不去猜一种注入形态——猜错会把凭据泄露到错误的请求头里，
-// 而「协议取值为空」这类装配缺陷也会因此变成显式失败，而不是悄悄发一个必然 401 的请求。
-func credentialHeaders(protocol domain.Protocol, apiKey string) (http.Header, string, error) {
+// 注入形态的优先级是「渠道声明 > 协议现状」：渠道写明了 header 就按它注入，
+// 为零值时才按协议推。渠道声明的形态来自平台档案的 auth.header——同一个平台的
+// OpenAI 兼容端点与 Anthropic 兼容端点可能都只认 Authorization，
+// 按协议硬套 x-api-key 会把凭据送进一个上游不看的头里。
+//
+// 第二个返回值供合并阶段跳过同名静态头；无法兑现的形态（未识别协议、非法渠道声明）
+// 按平台内部错误返回，不去猜一种注入形态——猜错会把凭据泄露到错误的请求头里，
+// 而这类装配缺陷也会因此变成显式失败，而不是悄悄发一个必然 401 的请求。
+func credentialHeaders(
+	style domain.CredentialHeaderStyle,
+	protocol domain.Protocol,
+	apiKey string,
+) (http.Header, string, error) {
 	headers := make(http.Header)
+	switch style {
+	case domain.CredentialHeaderAuthorization:
+		headers.Set(headerAuthorization, "Bearer "+apiKey)
+		return headers, headerAuthorization, nil
+	case domain.CredentialHeaderXAPIKey:
+		headers.Set(headerXAPIKey, apiKey)
+		return headers, http.CanonicalHeaderKey(headerXAPIKey), nil
+	case domain.CredentialHeaderXGoogAPIKey:
+		headers.Set(headerXGoogAPIKey, apiKey)
+		return headers, http.CanonicalHeaderKey(headerXGoogAPIKey), nil
+	case domain.CredentialHeaderAuto:
+		// 渠道未声明注入形态，按协议现状推。
+	default:
+		return nil, "", domain.NewError(domain.CodeInternal,
+			fmt.Sprintf("渠道声明的凭据注入形态 %q 不支持", string(style)))
+	}
+
 	switch protocol {
 	case domain.ProtocolOpenAIChat, domain.ProtocolOpenAIResponses:
 		headers.Set(headerAuthorization, "Bearer "+apiKey)

@@ -163,6 +163,89 @@ func TestUpstreamHeadersProtocolDrivesHeaderStyle(t *testing.T) {
 	}
 }
 
+// TestUpstreamHeadersHonorsCredentialHeaderStyle 守护「渠道声明优先于协议现状」。
+//
+// 同一个平台的 OpenAI 兼容端点与 Anthropic 兼容端点可能都只认 Authorization；
+// 档案声明了注入形态时不能按协议硬套 x-api-key。零值仍按协议现状注入。
+func TestUpstreamHeadersHonorsCredentialHeaderStyle(t *testing.T) {
+	const apiKey = "sk-style"
+	tests := []struct {
+		name     string
+		style    domain.CredentialHeaderStyle
+		protocol domain.Protocol
+		wantName string
+		wantVal  string
+	}{
+		{
+			name:     "渠道声明 authorization 覆盖 anthropic 的协议默认",
+			style:    domain.CredentialHeaderAuthorization,
+			protocol: domain.ProtocolAnthropicMessages,
+			wantName: "Authorization",
+			wantVal:  "Bearer " + apiKey,
+		},
+		{
+			name:     "渠道声明 x-api-key 覆盖 openai 的协议默认",
+			style:    domain.CredentialHeaderXAPIKey,
+			protocol: domain.ProtocolOpenAIChat,
+			wantName: "x-api-key",
+			wantVal:  apiKey,
+		},
+		{
+			name:     "渠道声明 x-goog-api-key",
+			style:    domain.CredentialHeaderXGoogAPIKey,
+			protocol: domain.ProtocolGemini,
+			wantName: "x-goog-api-key",
+			wantVal:  apiKey,
+		},
+		{
+			name:     "零值仍按协议现状注入",
+			style:    domain.CredentialHeaderAuto,
+			protocol: domain.ProtocolAnthropicMessages,
+			wantName: "x-api-key",
+			wantVal:  apiKey,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := singleRef("ref", Credential{APIKey: apiKey})
+			headers, err := provider.UpstreamHeaders(context.Background(), domain.Route{
+				CredentialRef:         "ref",
+				Protocol:              tt.protocol,
+				CredentialHeaderStyle: tt.style,
+			})
+			if err != nil {
+				t.Fatalf("UpstreamHeaders 返回错误：%v", err)
+			}
+			if got := headers.Get(tt.wantName); got != tt.wantVal {
+				t.Fatalf("%s = %q，期望 %q", tt.wantName, got, tt.wantVal)
+			}
+			other := "Authorization"
+			if tt.wantName == other {
+				other = "x-api-key"
+			}
+			if got := headers.Get(other); got != "" {
+				t.Fatalf("不应出现 %s，实际为 %q", other, got)
+			}
+		})
+	}
+}
+
+// TestUpstreamHeadersRejectsUnknownCredentialHeaderStyle 守护非法渠道声明显式失败。
+func TestUpstreamHeadersRejectsUnknownCredentialHeaderStyle(t *testing.T) {
+	provider := singleRef("ref", Credential{APIKey: "sk"})
+	headers, err := provider.UpstreamHeaders(context.Background(), domain.Route{
+		CredentialRef:         "ref",
+		Protocol:              domain.ProtocolOpenAIChat,
+		CredentialHeaderStyle: domain.CredentialHeaderStyle("custom-header"),
+	})
+	if err == nil {
+		t.Fatal("非法注入形态应返回错误")
+	}
+	if headers != nil {
+		t.Fatalf("出错时应返回 nil 头，实际 %v", headers)
+	}
+}
+
 // TestUpstreamHeadersSelectsCredentialByRef 守护「按 route.CredentialRef 选凭据」：
 //
 // 一份配置里可以有多个上游渠道，每个渠道一份密钥。请求头必须按本次尝试的路由取出对应的那一份，

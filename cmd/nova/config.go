@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/sumwai/nova/internal/config"
+	"github.com/sumwai/nova/internal/profileapply"
 )
 
 func newConfigCmd() *cobra.Command {
@@ -37,7 +38,7 @@ func newConfigCheckCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := config.Load(path)
+			cfg, err := loadConfig(path)
 			if err != nil {
 				return err
 			}
@@ -69,4 +70,29 @@ func newConfigCheckCmd() *cobra.Command {
 	}
 	registerConfigFlag(cmd, &configPath)
 	return cmd
+}
+
+// loadConfig 解析并展开一份配置，供不联网的命令行路径使用。
+//
+// config check 与 models 都要把档案引用展开成具体端点，因此两者共用同一份入口。
+// 状态目录与配置目录就在这里读：展开远端源需要前者，展开凭据需要后者，
+// 而两者都属于本机状态，不属于配置。
+func loadConfig(path string) (*config.Config, error) {
+	// 状态目录不可得（HOME / XDG_STATE_HOME 都缺失）时退回空串：展开层把它当作
+	// 「没有可用快照」，只有配置真引用到远端源的档案时才会在错误消息里说明原因。
+	// config check 与 models 在引入档案引用之前不依赖主目录，不该因它失败。
+	stateDir, err := defaultStateDir()
+	if err != nil {
+		stateDir = ""
+	}
+	// 配置目录同理：定位不到时不读凭据库，只有真引用到档案的渠道才会在展开期报错。
+	configDir, err := defaultConfigBaseDir()
+	if err != nil {
+		configDir = ""
+	}
+	return profileapply.Load(path, profileapply.Options{
+		StateDir:  stateDir,
+		ConfigDir: configDir,
+		Getenv:    os.Getenv,
+	})
 }

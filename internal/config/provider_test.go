@@ -43,8 +43,8 @@ provider openai {
 	if endpoint.Protocol != domain.ProtocolOpenAIChat {
 		t.Errorf("协议 = %q，期望从地址推导出 openai_chat", endpoint.Protocol)
 	}
-	if endpoint.Timeout != defaultTimeout {
-		t.Errorf("超时 = %v，期望缺省 %v", endpoint.Timeout, defaultTimeout)
+	if endpoint.Timeout != DefaultTimeout {
+		t.Errorf("超时 = %v，期望缺省 %v", endpoint.Timeout, DefaultTimeout)
 	}
 	if len(endpoint.Models) != 2 {
 		t.Fatalf("模型 数 = %d，期望 2", len(endpoint.Models))

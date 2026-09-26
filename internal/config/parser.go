@@ -19,11 +19,27 @@ const (
 	directiveProvider  = "provider"
 	directiveImport    = "import"
 	directiveRoute     = "route"
+	directiveProfiles  = "profiles"
+	directivePrices    = "prices"
+)
+
+// profiles 块体内的指令名。
+const (
+	directiveSource  = "source"
+	directiveRefresh = "refresh"
+)
+
+// prices 块体内的指令名。
+const (
+	directiveCurrency = "currency"
+	directiveFile     = "file"
 )
 
 // provider 与 endpoint 两级的指令名。
 const (
 	directiveAPIKey   = "api_key"
+	directiveAccount  = "account"
+	directiveProfile  = "profile"
 	directiveURL      = "url"
 	directiveProtocol = "protocol"
 	directiveTimeout  = "timeout"
@@ -35,9 +51,16 @@ const (
 	directiveExpose   = "expose"
 	directiveBalance  = "balance"
 	directiveFallback = "fallback"
+	directivePrefer   = "prefer"
 )
 
-// 下面四张表分别是三层作用域的合法指令名，外加一份「能开启块的名字」。
+// accountWeightKeyword 是 account 指令里给账号加权的关键字。
+//
+// 用关键字而不是第二个位置取值（`account work 2`）：位置取值与账号名相邻，
+// 一个漏写的名字会被当成权重，报错反而指向一个看不出来的地方。
+const accountWeightKeyword = "weight"
+
+// 下面几张表分别是各作用域的合法指令名，外加一份「能开启块的名字」。
 //
 // 它们是三处的唯一数据源：语法层的合法性判定、「未知指令」建议的候选集合、
 // 以及 InstructionNames 对外报出的清单。三者若各有一份副本，迟早会互相矛盾，
@@ -46,12 +69,13 @@ var (
 	globalDirectives = []string{
 		directiveVersion, directiveLogLevel, directiveLogFormat, directiveListen,
 		directiveAdmin, directiveClientKey, directiveProvider, directiveImport, directiveRoute,
+		directiveProfiles, directivePrices,
 	}
 
 	providerDirectives = []string{
-		directiveAPIKey, directiveBalance, directiveURL, directiveProtocol, directiveTimeout,
-		directiveModel, directiveEndpoint, directiveDiscover, directiveAllow, directiveDeny,
-		directiveExpose,
+		directiveAPIKey, directiveAccount, directiveProfile, directiveBalance, directiveURL, directiveProtocol,
+		directiveTimeout, directiveModel, directiveEndpoint, directiveDiscover, directiveAllow,
+		directiveDeny, directiveExpose,
 	}
 
 	// endpointDirectives 是 endpoint 子块的合法指令名。
@@ -68,10 +92,21 @@ var (
 	//
 	// provider 在这个作用域里是「引用一条已有渠道」，与顶层的「声明一条渠道」
 	// 不是同一件事：块头带花括号的是声明（顶层），不带花括号的是引用。
-	routeDirectives = []string{directiveBalance, directiveProvider, directiveFallback}
+	routeDirectives = []string{directiveBalance, directiveProvider, directiveFallback, directivePrefer}
+
+	// profilesDirectives 是 profiles 块的合法指令名。
+	//
+	// 它独立成一张表：source 与 refresh 只在该块内有意义，混进顶层指令表会让它们
+	// 在顶层被认下，而那时它们没有任何作用对象。
+	profilesDirectives = []string{directiveSource, directiveRefresh}
+
+	// pricesDirectives 是 prices 块的合法指令名。
+	//
+	// 与 profilesDirectives 同理：currency 与 file 只在 prices 块内有意义。
+	pricesDirectives = []string{directiveCurrency, directiveFile}
 
 	// blockDirectives 是能开启一个块的指令名，只为对外声明能力清单而存在。
-	blockDirectives = []string{directiveProvider, directiveEndpoint, directiveRoute}
+	blockDirectives = []string{directiveProvider, directiveEndpoint, directiveRoute, directiveProfiles, directivePrices}
 )
 
 // line 是一行里的全部记号。
@@ -141,6 +176,14 @@ func (p *parser) run() error {
 			}
 		case directiveRoute:
 			if err := p.parseModelRoute(ln); err != nil {
+				return err
+			}
+		case directiveProfiles:
+			if err := p.parseProfiles(ln); err != nil {
+				return err
+			}
+		case directivePrices:
+			if err := p.parsePrices(ln); err != nil {
 				return err
 			}
 		case directiveImport:
