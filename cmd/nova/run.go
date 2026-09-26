@@ -29,7 +29,7 @@ func newRunCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "启动网关",
-		Long: `启动网关：装配配置、监听数据面与管理端点，直到收到 INT 或 TERM。
+		Long: `启动网关：装配配置、监听客户端入口与管理端点，直到收到 INT 或 TERM。
 
 配置路径的取值顺序是 命令行 -c > 环境变量 NOVA_CONFIG > XDG 缺省路径。`,
 		Args: rejectExtraArgs,

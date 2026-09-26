@@ -24,7 +24,7 @@ import (
 // Assembly 是一次配置装配的产物。
 //
 // 一次 reload 造一份新的 Assembly 整体换入，而不是就地改字段：换入是一次指针
-// 赋值，读侧取一次指针就拿到自洽的一整套；就地改字段则会出现「新的数据面配着
+// 赋值，读侧取一次指针就拿到自洽的一整套；就地改字段则会出现「新的客户端入口配着
 // 旧的日志句柄」这类半旧半新的状态，而这种状态只在并发下才暴露。
 type Assembly struct {
 	Config  *config.Config
@@ -32,7 +32,7 @@ type Assembly struct {
 	Handler http.Handler
 
 	// Models 是本次装配的对外模型目录，按首现顺序去重。
-	// 它是数据面 GET /v1/models 与 `nova models` 的唯一数据来源。
+	// 它是客户端入口的 GET /v1/models 与 `nova models` 的唯一数据来源。
 	Models []ModelEntry
 
 	// Discoveries 是本次装配逐条发现型端点的结果，供 `nova models` 展示。
@@ -102,7 +102,7 @@ func (h *Holder) replace(next *Assembly) *Assembly {
 	return previous
 }
 
-// ServeHTTP 把请求交给当前装配的数据面。
+// ServeHTTP 把请求交给当前装配的那套处理器。
 //
 // 只在对齐指针时持读锁，整个请求处理期间不再持锁：流式响应可能持续几分钟，
 // 持锁会让这期间的每一次 reload 都被挡在门外。
@@ -238,7 +238,7 @@ const healthzPath = "/healthz"
 // Prometheus 文本格式，而这里的输出是 JSON。
 const statsPath = "/debug/stats"
 
-// newDataPlane 造数据面的 HTTP 处理器。
+// newDataPlane 造客户端入口的 HTTP 处理器。
 //
 // 转发入口挂在根路径上，由它自己按固定映射判定路径是否受支持，并给出协议化的 404；
 // 模型清单另挂一条精确路径，同样过鉴权，不带凭据时按协议形状回 401；
@@ -266,7 +266,7 @@ func newDataPlane(
 // statsAuthorize 给统计端点套上鉴权，但只在监听地址不是回环时。
 //
 // 统计端点包含模型名、渠道名、客户端与用量，缺省监听在 127.0.0.1 上时只有本机能读，
-// 再套一层客户端凭据没有意义。绑到非回环地址后它就和数据面一样需要凭据，
+// 再套一层客户端凭据没有意义。绑到非回环地址后它就和客户端入口一样需要凭据，
 // 判定与配置层那条非回环警告同源（config.IsLoopbackAddress），不另立一套口径。
 func statsAuthorize(next http.Handler, cfg *config.Config, resolve transport.AdapterResolver) http.Handler {
 	if config.IsLoopbackAddress(cfg.Listen) {

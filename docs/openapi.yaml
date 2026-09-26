@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: nova
-  version: "0.1.0"
+  version: "0.1.2"
   summary: 大模型 API 转发网关
   description: |
     nova 是一个大模型 API 转发网关：客户端请求经鉴权后按对外模型名选路，需要时在四种线协议
@@ -17,15 +17,15 @@ info:
 
     | 监听器 | 配置项 | 缺省地址 | 用途 |
     |---|---|---|---|
-    | 数据面 | `listen` | `127.0.0.1:8080` | 转发、模型清单、统计、探活 |
+    | 客户端入口 | `listen` | `127.0.0.1:8080` | 转发、模型清单、统计、探活 |
     | 管理端点 | `admin` | `localhost:2026` | 热重载 |
 
-    两者都缺省只绑回环。数据面在配置了 `client_key` 时要求客户端凭据；管理端点没有鉴权，
+    两者都缺省只绑回环。客户端入口在配置了 `client_key` 时要求客户端凭据；管理端点没有鉴权，
     因此更不应绑到非回环地址。
 
     ## 鉴权
 
-    配置了 `client_key`（可多条）时，数据面上的转发路径与 `GET /v1/models` 要求客户端凭据。
+    配置了 `client_key`（可多条）时，客户端入口的转发路径与 `GET /v1/models` 要求客户端凭据。
     以下三种头部任一匹配即放行：
 
     - `Authorization: Bearer <key>`
@@ -63,12 +63,12 @@ info:
 
     ## 未注册的路径
 
-    数据面上未注册的路径一律回纯文本 404（不经适配器编码）。已注册路径上的错误才按协议
+    客户端入口上未注册的路径一律回纯文本 404（不经适配器编码）。已注册路径上的错误才按协议
     形状编码。
 
 servers:
   - url: http://127.0.0.1:8080
-    description: 数据面（配置项 `listen`）
+    description: 客户端入口（配置项 `listen`）
   - url: http://localhost:2026
     description: 管理端点（配置项 `admin`）
 
@@ -463,7 +463,7 @@ paths:
 
         ## 鉴权
 
-        `listen` 绑到回环地址时不鉴权（这是缺省形态）；绑到非回环地址后与数据面一样要求
+        `listen` 绑到回环地址时不鉴权（这是缺省形态）；绑到非回环地址后与客户端入口一样要求
         `client_key`。
       parameters:
         - $ref: "#/components/parameters/FilterClient"

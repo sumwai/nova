@@ -181,7 +181,7 @@ func routesByModel(endpoints []effectiveEndpoint) map[string][]endpointRoute {
 
 // modelEntries 由生效端点集合构造对外目录，按首次出现的顺序去重。
 //
-// 顺序取首次出现而不是字典序：这个列表会被 nova models 与数据面 /v1/models 展示，
+// 顺序取首次出现而不是字典序：这个列表会被 nova models 与客户端入口的 /v1/models 展示，
 // 让它与配置里读到的顺序一致，对着配置排查时不必来回换算位置。
 func modelEntries(endpoints []effectiveEndpoint, discovered map[*config.Endpoint][]catalog.Model) []ModelEntry {
 	var entries []ModelEntry

@@ -10,7 +10,7 @@ import (
 
 // modelsPath 是客户端查询模型清单的路径。
 //
-// 它与三个转发路径同级挂在数据面上：OpenAI 与 Anthropic 的模型清单接口路径都是它，
+// 它与三个转发路径同级挂在客户端入口上：OpenAI 与 Anthropic 的模型清单接口路径都是它，
 // 形状由请求头判定（见 protocolForModelsRequest）。
 const modelsPath = "/v1/models"
 

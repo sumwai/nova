@@ -47,7 +47,7 @@ const (
 	// 缺省输出人读的文本：nova 的多数实例跑在终端或 systemd 下，两者都要人眼能读；
 	// 需要给日志采集器喂结构化数据时显式写 log_format json。
 	defaultLogFormat = "text"
-	// 缺省只绑回环：本版的数据面没有别的兜底鉴别手段，绑到所有接口就等于
+	// 缺省只绑回环：本版对客户端请求没有别的兜底鉴别手段，绑到所有接口就等于
 	// 把上游凭据敞给任何能连上这台机器的人。对外服务时显式写 listen 即可。
 	defaultListen  = "127.0.0.1:8080"
 	defaultAdmin   = "localhost:2026"
@@ -79,7 +79,7 @@ type Config struct {
 	// 而「终端能不能显示颜色」是环境事实而不是意图，因此不进配置（见 gateway 的渲染层）。
 	LogFormat string
 
-	// Listen 是数据面监听地址，缺省 127.0.0.1:8080（只绑回环）。
+	// Listen 是客户端入口的监听地址，缺省 127.0.0.1:8080（只绑回环）。
 	Listen string
 
 	// Admin 是管理端点地址，缺省 localhost:2026。

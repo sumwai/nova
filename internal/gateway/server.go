@@ -84,7 +84,7 @@ type server struct {
 
 // serve 建立两个监听器并等它们结束。
 //
-// 两个地址是两份独立的事实：数据面失败说明网关无法服务；管理端点失败说明 reload
+// 两个地址是两份独立的事实：客户端入口失败说明网关无法服务；管理端点失败说明 reload
 // 会静默失效。后者同样不可容忍——一个连不上的管理端点会让「配置改了却没生效」
 // 变成一桩无从下手的悬案，因此任一监听器报错都终止整个进程。
 func (s *server) serve(ctx context.Context) error {
@@ -92,11 +92,11 @@ func (s *server) serve(ctx context.Context) error {
 
 	gatewayLn, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
-		return fmt.Errorf("监听数据面 %s 失败：%w", cfg.Listen, err)
+		return fmt.Errorf("监听客户端入口 %s 失败：%w", cfg.Listen, err)
 	}
 	adminLn, err := net.Listen("tcp", cfg.Admin)
 	if err != nil {
-		// 数据面已经起在端口上，管理端点失败时若不关掉它，
+		// 客户端入口已经起在端口上，管理端点失败时若不关掉它，
 		// 这次失败的启动会在端口上留下一个连不上的监听器。
 		_ = gatewayLn.Close()
 		return fmt.Errorf("监听管理端点 %s 失败：%w", cfg.Admin, err)

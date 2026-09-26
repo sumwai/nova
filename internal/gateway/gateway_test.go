@@ -113,7 +113,7 @@ func TestAssemblyCloseIsIdempotent(t *testing.T) {
 	}
 }
 
-// stubForwarder 是一个只留下痕迹的数据面转发入口，用于分辨「请求走到了转发」
+// stubForwarder 是一个只留下痕迹的转发处理器，用于分辨「请求走到了转发」
 // 与「请求在鉴权或路由那一步就被挡住了」。它回一个没人会误认成真实响应的状态码。
 type stubForwarder struct {
 	called bool

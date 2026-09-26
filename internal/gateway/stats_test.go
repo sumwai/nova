@@ -45,7 +45,7 @@ func TestDataPlaneServesStatsOnLoopbackWithoutAuth(t *testing.T) {
 	}
 }
 
-// 绑到非回环地址后统计端点与数据面用同一份 client_key。
+// 绑到非回环地址后统计端点与客户端入口用同一份 client_key。
 func TestDataPlaneAuthorizesStatsOffLoopback(t *testing.T) {
 	var forward stubForwarder
 	store := testStatsStore(t)

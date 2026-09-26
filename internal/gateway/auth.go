@@ -25,7 +25,7 @@ const apiKeyHeader = "x-api-key"
 // Gemini 的 SDK 只会发这一个头，不认它就是「Gemini 客户端连不进网关」。
 const googleAPIKeyHeader = "x-goog-api-key"
 
-// authorize 按配置里的 client_key 给数据面加上客户端鉴权。
+// authorize 按配置里的 client_key 给客户端入口加上客户端鉴权。
 //
 // keys 为空时原样返回 next：不写 client_key 就是不鉴权。配置层已经为此在「绑到非回环
 // 地址」时报过警告，装配层不重复判断——同一件事有两处来源时，两处迟早会不一致。
