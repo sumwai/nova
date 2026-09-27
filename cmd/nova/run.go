@@ -58,14 +58,20 @@ func newRunCmd() *cobra.Command {
 			if err != nil {
 				configDir = ""
 			}
+			// 探测数据目录定位不到时不阻断启动：只有声明了 exec 探测的档案才用到它。
+			dataDir, err := defaultDataDir()
+			if err != nil {
+				dataDir = ""
+			}
 			ctx, stop := notifyShutdown(cmd)
 			defer stop()
 
 			return gateway.Run(ctx, gateway.Options{
-				ConfigPath: path,
-				StatePath:  statePath,
-				StateDir:   stateDir,
-				LogOutput:  cmd.ErrOrStderr(),
+				ConfigPath:   path,
+				StatePath:    statePath,
+				StateDir:     stateDir,
+				LogOutput:    cmd.ErrOrStderr(),
+				ProbeDataDir: dataDir,
 				PrepareConfig: func(cfg *config.Config) error {
 					return profileapply.Apply(cfg, profileapply.Options{
 						StateDir:  stateDir,

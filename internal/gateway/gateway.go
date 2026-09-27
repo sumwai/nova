@@ -17,6 +17,7 @@ import (
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/credential"
 	"github.com/sumwai/nova/internal/pipeline"
+	"github.com/sumwai/nova/internal/probe"
 	"github.com/sumwai/nova/internal/stats"
 	"github.com/sumwai/nova/internal/transport"
 	"github.com/sumwai/nova/internal/upstream"
@@ -128,6 +129,8 @@ type AssembleOptions struct {
 	StateDir string
 	// LimitFailureThreshold 是自适应规则里的 N；<= 0 时取 defaultLimitFailureThreshold。
 	LimitFailureThreshold int
+	// ProbeDataDir 是 exec 用量探测的数据目录（${XDG_DATA_HOME}/nova）；空表示不跑探测。
+	ProbeDataDir string
 }
 
 // Assemble 按配置装配出一套运行时对象。
@@ -226,6 +229,9 @@ func Assemble(ctx context.Context, cfg *config.Config, opts AssembleOptions) (*A
 	limitRuntime, err := newLimitRuntime(cfg.Providers, opts.StateDir, opts.LimitFailureThreshold, logger, pricesTable)
 	if err != nil {
 		return nil, err
+	}
+	if opts.ProbeDataDir != "" {
+		limitRuntime.startProbes(cfg.Providers, &probe.Runner{DataDir: opts.ProbeDataDir})
 	}
 	// 估算态不会自己浮到日志里：快照读失败、记账断档都只让 Available 给一个偏保守的值。
 	// 装配完成时把它一次说清，运行期就不再重复。

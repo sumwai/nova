@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/sumwai/nova/internal/domain"
 	"github.com/sumwai/nova/internal/limits"
 	"github.com/sumwai/nova/internal/pipeline"
+	"github.com/sumwai/nova/internal/probe"
 )
 
 // hintedError 让测试构造一个携带 Retry-After 提示的额度耗尽错误。
@@ -377,5 +379,58 @@ func TestQuotaExhaustedErrorDetailCarriesModelAndUntil(t *testing.T) {
 		if !strings.Contains(detail, want) {
 			t.Errorf("detail = %q，期望含 %q", detail, want)
 		}
+	}
+}
+
+// TestRunProbeMergesObservation 守护 exec 探测的结果被并入账号额度表。
+func TestRunProbeMergesObservation(t *testing.T) {
+	runtime, err := newLimitRuntime(limitedConfig().Providers, "", 0, nil, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	if !runtime.available("relay", "", "shared") {
+		t.Fatal("初始状态下账号应可用")
+	}
+
+	dataDir := filepath.Join(t.TempDir(), "nova")
+	probeDir := filepath.Join(dataDir, "probes")
+	if err := os.MkdirAll(probeDir, 0o700); err != nil {
+		t.Fatalf("创建 probes 目录失败：%v", err)
+	}
+	// 观测时刻取当前时刻：额度层按新鲜度判它是否可信，写死一个固定时刻会随时变成过期。
+	now := time.Now().UTC().Format(time.RFC3339)
+	content := "#!/bin/sh\nprintf '%s\\n' 'schema: 1' 'source: exec' 'observed_at: " + now +
+		"' 'account:' '  - { kind: quota, metric: requests, window: 1m, remaining: 0 }'\n"
+	script := filepath.Join(probeDir, "usage.sh")
+	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
+		t.Fatalf("写入探测脚本失败：%v", err)
+	}
+
+	runtime.runProbe("relay", script, &probe.Runner{DataDir: dataDir})
+	if runtime.available("relay", "", "shared") {
+		t.Fatal("探测观测到剩余量为 0 后账号应不可用")
+	}
+}
+
+// TestStartProbesWarnsOnBuiltinProbe 守护声明了内置 probe 的渠道被明确提示未实现。
+func TestStartProbesWarnsOnBuiltinProbe(t *testing.T) {
+	cfg := limitedConfig()
+	cfg.Providers[0].Usage = &config.Usage{Probe: "opencode-go"}
+
+	var out bytes.Buffer
+	log, err := newLogger(&config.Config{LogLevel: "info", LogFormat: "text"}, &out)
+	if err != nil {
+		t.Fatalf("建日志失败：%v", err)
+	}
+	runtime, err := newLimitRuntime(cfg.Providers, "", 0, log, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	runtime.startProbes(cfg.Providers, &probe.Runner{DataDir: t.TempDir()})
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+	if !strings.Contains(out.String(), "未实现内置探测") {
+		t.Errorf("日志 = %q，期望提示内置探测未实现", out.String())
 	}
 }

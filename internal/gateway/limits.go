@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"github.com/sumwai/nova/internal/limits"
 	"github.com/sumwai/nova/internal/pipeline"
 	"github.com/sumwai/nova/internal/price"
+	"github.com/sumwai/nova/internal/probe"
 )
 
 // defaultLimitFailureThreshold 是设计第六节保守自适应规则的缺省 N：同一账号连续 N 次
@@ -29,6 +31,15 @@ const defaultLimitFailureThreshold = 5
 // 并不是「连续」失败。窗口只约束累加，不限制升级后标记的存活时长（那由 until 与
 // 保守上限决定）。
 const defaultLimitFailureWindow = 10 * time.Minute
+
+// 用量探测的缺省节奏与单次超时。
+//
+// 探测间隔优先取档案声明的 interval；未声明时用一分钟。单次超时按设计第五节
+// 「硬超时后 kill」取 probe 侧的缺省值。
+const (
+	defaultProbeInterval = 60 * time.Second
+	defaultProbeTimeout  = probe.DefaultTimeout
+)
 
 // limitRuntime 把逐账号的额度表接到转发路径上。
 //
@@ -50,6 +61,11 @@ type limitRuntime struct {
 	// warned 记录已输出过的观测拒绝提醒，键是账号与缺失键的组合。
 	// 同一份档案会对每个请求产出同一组被拒绝的键；逐请求重复输出只会刷屏。
 	warned map[string]bool
+
+	// probeStop 关闭后周期探测退出；probeWG 等它们结束。
+	probeStop     chan struct{}
+	probeStopOnce sync.Once
+	probeWG       sync.WaitGroup
 }
 
 // failureState 记录一个账号上连续同码失败的码、次数与最近一次失败时刻。
@@ -75,6 +91,7 @@ func newLimitRuntime(providers []config.Provider, stateDir string, threshold int
 		failures:  make(map[string]failureState),
 		now:       time.Now,
 		warned:    make(map[string]bool),
+		probeStop: make(chan struct{}),
 	}
 	for i := range providers {
 		provider := &providers[i]
@@ -367,8 +384,84 @@ func (rt *limitRuntime) ClearProvider(provider, model string) int {
 	return cleared
 }
 
+// startProbes 为声明了 exec 探测的渠道启动周期探测。装配期调用一次。
+//
+// 每个渠道一个 goroutine，启动后立即探测一次，之后按 interval 重复。内置 probe
+// （usage.probe）本版未实现，遇到时记一条并在装配日志里说明，不静默跳过。
+//
+// 设计第十二节要求「只对活跃账号」并「首次被选中即时一次」；这里对所有声明了探测的
+// 渠道周期探测，是更简单也更保守的近似：多探冷账号只浪费一点本地进程，漏探会
+// 让额度状态停在估算态。账号维度的活跃跟踪待运行期有稳定的活跃判定后再加。
+func (rt *limitRuntime) startProbes(providers []config.Provider, runner *probe.Runner) {
+	if runner == nil {
+		return
+	}
+	for i := range providers {
+		provider := &providers[i]
+		if provider.Usage == nil {
+			continue
+		}
+		if provider.Usage.Exec == "" {
+			if provider.Usage.Probe != "" && rt.log != nil {
+				rt.log.warning(config.Warning{File: provider.File, Line: provider.Line,
+					Msg: "provider " + provider.Name + " 声明了内置 probe " + provider.Usage.Probe +
+						"，本版未实现内置探测，该渠道不会自动刷新额度"})
+			}
+			continue
+		}
+		interval := provider.Usage.Interval
+		if interval <= 0 {
+			interval = defaultProbeInterval
+		}
+		rt.probeWG.Add(1)
+		go rt.probeLoop(provider.Name, provider.Usage.Exec, interval, runner)
+	}
+}
+
+// probeLoop 周期运行一个渠道的 exec 探测，直到 Close。
+func (rt *limitRuntime) probeLoop(provider, execPath string, interval time.Duration, runner *probe.Runner) {
+	defer rt.probeWG.Done()
+	rt.runProbe(provider, execPath, runner)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-rt.probeStop:
+			return
+		case <-ticker.C:
+			rt.runProbe(provider, execPath, runner)
+		}
+	}
+}
+
+// runProbe 跑一次 exec 探测，并把结果并入该渠道每个账号的额度表。
+//
+// 探测失败只记一条：额度状态保持上一次的观测或静态声明，不因探测不可用而变。
+// 合并只落在已声明的键上，档案没声明的 metric/window 会被 MergeObserved 拒收，
+// 与响应头观测同一口径。
+func (rt *limitRuntime) runProbe(provider, execPath string, runner *probe.Runner) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
+	defer cancel()
+
+	doc, err := runner.Run(ctx, execPath)
+	if err != nil {
+		if rt.log != nil {
+			rt.log.failure("用量探测失败（"+provider+"）", err)
+		}
+		return
+	}
+	for ref, table := range rt.tables[provider] {
+		if mergeErr := table.MergeObserved(doc); mergeErr != nil {
+			rt.warnOnce("probe/"+provider+"/"+ref+"/"+mergeErr.Error(), "用量探测结果未合并", mergeErr)
+		}
+	}
+}
+
 // Close 落盘并关闭全部额度表。
 func (rt *limitRuntime) Close() error {
+	rt.probeStopOnce.Do(func() { close(rt.probeStop) })
+	rt.probeWG.Wait()
+
 	var errs []error
 	for _, byRef := range rt.tables {
 		for _, table := range byRef {

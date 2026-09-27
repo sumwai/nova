@@ -44,6 +44,9 @@ type Options struct {
 	// gateway 不读环境变量，由调用方给出。
 	StateDir string
 
+	// ProbeDataDir 是 exec 用量探测的数据目录（${XDG_DATA_HOME}/nova）；空表示不跑探测。
+	ProbeDataDir string
+
 	// LimitFailureThreshold 是额度自适应规则里的 N；<= 0 时取内部缺省值。
 	LimitFailureThreshold int
 
@@ -82,6 +85,7 @@ func Run(ctx context.Context, opt Options) error {
 		LogOutput:             opt.LogOutput,
 		Stats:                 store,
 		StateDir:              opt.StateDir,
+		ProbeDataDir:          opt.ProbeDataDir,
 		LimitFailureThreshold: opt.LimitFailureThreshold,
 	})
 	if err != nil {
@@ -100,6 +104,7 @@ func Run(ctx context.Context, opt Options) error {
 		refreshProfiles:       opt.RefreshProfiles,
 		configPath:            opt.ConfigPath,
 		stateDir:              opt.StateDir,
+		probeDataDir:          opt.ProbeDataDir,
 		limitFailureThreshold: opt.LimitFailureThreshold,
 	}
 	reportWarnings(first.Logger, cfg)
@@ -141,6 +146,7 @@ type server struct {
 	configPath string
 	// stateDir 与 limitFailureThreshold 是装配期额度层的依赖，reload 复用同一份。
 	stateDir              string
+	probeDataDir          string
 	limitFailureThreshold int
 }
 
@@ -266,6 +272,7 @@ func (s *server) reload(ctx context.Context, path string) error {
 		LogOutput:             s.out,
 		Stats:                 s.stats,
 		StateDir:              s.stateDir,
+		ProbeDataDir:          s.probeDataDir,
 		LimitFailureThreshold: s.limitFailureThreshold,
 	})
 	if err != nil {
