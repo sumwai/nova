@@ -102,13 +102,27 @@ func Apply(cfg *config.Config, opts Options) error {
 
 	for i := range cfg.Providers {
 		provider := &cfg.Providers[i]
-		if !provider.ProfileRef {
+		if provider.ProfileRef {
+			loaded, ok := registry.Lookup(provider.Profile)
+			if !ok {
+				return missingProfileError(provider, statuses)
+			}
+			if err := expandProvider(provider, loaded, getenv, store, cfg); err != nil {
+				return err
+			}
 			continue
 		}
-		loaded, ok := registry.Lookup(provider.Profile)
-		if !ok {
-			return missingProfileError(provider, statuses)
+		// 手写渠道按端点地址认档案：写了 profile 就是显式意图，不再猜；
+		// 没写时用 api_pattern 找到唯一一份命中，价格、额度与模型集合因此也能
+		// 接到一条手写地址的渠道上。命中多份时报错，不静默取一份。
+		loaded, err := detectProfile(registry, provider)
+		if err != nil {
+			return err
 		}
+		if loaded == nil {
+			continue
+		}
+		provider.Profile = loaded.ID
 		if err := expandProvider(provider, loaded, getenv, store, cfg); err != nil {
 			return err
 		}

@@ -3,6 +3,7 @@ package profileapply
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -13,6 +14,57 @@ import (
 	"github.com/sumwai/nova/internal/price"
 	"github.com/sumwai/nova/internal/profile"
 )
+
+// detectProfile 按端点地址与档案的 api_pattern 认档案。
+//
+// 只对未写 profile 的手写渠道生效：写了 profile 就是显式意图，不再猜。命中一份即采用；
+// 命中两份及以上时报错并列候选——「哪一份对」没有确定答案，静默取一份会让价格、额度
+// 与模型集合都来自另一份档案。
+//
+// 命中 0 不提醒：内网中继与模拟上游的地址都会落进这一类，逐条提醒会把真正需要显式
+// 写 profile 的那次歧义淹没在噪声里。
+func detectProfile(registry *profile.Registry, provider *config.Provider) (*profile.Profile, error) {
+	if provider.Profile != "" {
+		return nil, nil
+	}
+	hits := map[string]*profile.Profile{}
+	for _, id := range registry.IDs() {
+		loaded, ok := registry.Lookup(id)
+		if !ok || loaded.APIPattern == "" {
+			continue
+		}
+		// 档案加载已校验 api_pattern 可编译；这里再判一次是因为展开层不依赖
+		// 「上游校验一定跑过」，一份编译不了的档案不该让整次展开崩掉。
+		pattern, err := regexp.Compile(loaded.APIPattern)
+		if err != nil {
+			continue
+		}
+		for _, endpoint := range provider.Endpoints {
+			if endpoint.URL != "" && pattern.MatchString(endpoint.URL) {
+				hits[id] = loaded
+				break
+			}
+		}
+	}
+
+	switch len(hits) {
+	case 0:
+		return nil, nil
+	case 1:
+		for _, loaded := range hits {
+			return loaded, nil
+		}
+	}
+
+	ids := make([]string, 0, len(hits))
+	for id := range hits {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return nil, locationError(provider,
+		"provider %s 的端点地址命中多份档案（%s）；按地址自动认档案有歧义，请在块内显式写 `profile <id>`",
+		provider.Name, strings.Join(ids, "、"))
+}
 
 // missingProfileError 报告一条渠道引用的档案不在任何源里。
 //
@@ -324,14 +376,38 @@ func mergeManualEndpoints(
 			merged.Timeout = manual.Timeout
 		}
 		for _, model := range manual.Models {
-			if err := appendProfileModel(provider, &merged, provider.Profile, string(manual.Protocol),
-				model.Name, model.Upstream, price.Declared{}); err != nil {
+			if err := mergeManualModel(provider, &merged, model); err != nil {
 				return nil, err
 			}
 		}
 		endpoints[index] = merged
 	}
 	return endpoints, nil
+}
+
+// mergeManualModel 把手写模型并入一条已挂上档案模型的端点。
+//
+// 与 appendProfileModel 的差别在重名时的处置：档案自身的两条声明重名是错误，
+// 而手写声明与档案声明同名，在按地址自动认档案时会大量出现——使用者写下地址与
+// 模型名，档案再补上价格与额度。此时保留档案那条，只要求两处对「上游模型名」
+// 的看法一致；不一致就是「同一个对外名指向两个上游模型」的语义冲突，报错要比
+// 静默选一边诚实。
+func mergeManualModel(provider *config.Provider, endpoint *config.Endpoint, manual config.Model) error {
+	for i := range endpoint.Models {
+		existing := &endpoint.Models[i]
+		if existing.Name != manual.Name {
+			continue
+		}
+		if manual.Upstream != existing.Upstream {
+			return locationError(provider,
+				"模型 %s 在手写端点里指向上游 %s，档案 %s 的同名模型指向上游 %s；"+
+					"同一个对外名不能同时指两个上游模型，请改名或删掉手写声明",
+				manual.Name, manual.Upstream, provider.Profile, existing.Upstream)
+		}
+		return nil
+	}
+	endpoint.Models = append(endpoint.Models, manual)
+	return nil
 }
 
 // fillCredentials 按「块内 api_key > 凭据库 > 档案 auth.env」的顺序取凭据。

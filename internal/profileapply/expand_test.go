@@ -679,3 +679,158 @@ func writeFile(t *testing.T, path, content string) {
 		t.Fatalf("写文件 %s 失败：%v", path, err)
 	}
 }
+
+// localRelaySource 造一个只含一份档案的本地源，返回配置目录。
+//
+// api_pattern 指向 relay.example.com，供「手写地址自动认档案」的用例使用。
+func localRelaySource(t *testing.T, modelYAML string) string {
+	t.Helper()
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "profiles")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatalf("创建档案目录失败：%v", err)
+	}
+	writeFile(t, filepath.Join(profileDir, "relay.yaml"), `
+schema: 1
+id: relay
+name: Relay
+updated_at: 2026-09-26T00:00:00Z
+api_pattern: '^https://relay\.example\.com/'
+auth: { header: authorization, scheme: Bearer, env: RELAY_KEY }
+endpoints:
+  openai_chat: { url: https://relay.example.com/v1/chat/completions, protocol: openai_chat }
+models:
+`+modelYAML)
+	return dir
+}
+
+// 手写渠道的地址命中唯一档案时，价格与模型集合随档案接入。
+func TestManualProviderAutoDetectsProfileByURL(t *testing.T) {
+	dir := localRelaySource(t, "  - { id: m, price_from: relay/m-price }\n")
+	configPath := filepath.Join(dir, "Novafile")
+	writeFile(t, configPath, `version 1
+profiles {
+    source ./profiles
+}
+provider myrelay {
+    api_key k
+    url https://relay.example.com/v1/chat/completions
+    model m
+}
+`)
+
+	cfg, err := Load(configPath, Options{})
+	if err != nil {
+		t.Fatalf("展开失败：%v", err)
+	}
+	provider := cfg.Providers[0]
+	if provider.Profile != "relay" {
+		t.Fatalf("档案 id = %q，期望按地址认到 relay", provider.Profile)
+	}
+	if provider.ProfileRef {
+		t.Error("展开后 ProfileRef 应为假")
+	}
+	if len(provider.Endpoints) != 1 || len(provider.Endpoints[0].Models) != 1 {
+		t.Fatalf("端点 = %+v，期望一条端点一个同名模型", provider.Endpoints)
+	}
+	if got := provider.Endpoints[0].Models[0].Price.Key; got != "relay/m" {
+		t.Errorf("价格键 = %q，期望档案声明 relay/m", got)
+	}
+}
+
+// 地址同时命中两份档案时报错并列候选，不静默取一份。
+func TestManualProviderAmbiguousPatternReportsError(t *testing.T) {
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "profiles")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatalf("创建档案目录失败：%v", err)
+	}
+	for _, id := range []string{"relay-a", "relay-b"} {
+		writeFile(t, filepath.Join(profileDir, id+".yaml"), `
+schema: 1
+id: `+id+`
+api_pattern: '^https://relay\.example\.com/'
+auth: { header: authorization, scheme: Bearer, env: RELAY_KEY }
+endpoints:
+  openai_chat: { url: https://relay.example.com/v1/chat/completions, protocol: openai_chat }
+models:
+  - { id: m }
+`)
+	}
+	configPath := filepath.Join(dir, "Novafile")
+	writeFile(t, configPath, `version 1
+profiles {
+    source ./profiles
+}
+provider myrelay {
+    api_key k
+    url https://relay.example.com/v1/chat/completions
+    model m
+}
+`)
+
+	_, err := Load(configPath, Options{})
+	if err == nil {
+		t.Fatal("命中两份档案时应报错")
+	}
+	for _, want := range []string{"relay-a", "relay-b", "profile"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误 = %v，期望含 %q", err, want)
+		}
+	}
+}
+
+// 地址不命中任何档案时保持手写渠道原样，不补价格也不报错。
+func TestManualProviderWithoutPatternStaysManual(t *testing.T) {
+	dir := localRelaySource(t, "  - { id: m, price_from: relay/m-price }\n")
+	configPath := filepath.Join(dir, "Novafile")
+	writeFile(t, configPath, `version 1
+profiles {
+    source ./profiles
+}
+provider myrelay {
+    api_key k
+    url https://other.example.com/v1/chat/completions
+    model m
+}
+`)
+
+	cfg, err := Load(configPath, Options{})
+	if err != nil {
+		t.Fatalf("展开失败：%v", err)
+	}
+	provider := cfg.Providers[0]
+	if provider.Profile != "" {
+		t.Errorf("档案 id = %q，期望未命中时保持为空", provider.Profile)
+	}
+	if len(provider.Endpoints) != 1 || len(provider.Endpoints[0].Models) != 1 {
+		t.Fatalf("端点 = %+v，期望手写端点原样保留", provider.Endpoints)
+	}
+	if provider.Endpoints[0].Models[0].Price.Key != "" {
+		t.Errorf("手写模型不应被补上价格：%+v", provider.Endpoints[0].Models[0].Price)
+	}
+}
+
+// 手写模型与档案同名但上游名不同时报错，不静默选一边。
+func TestManualModelUpstreamConflictReportsError(t *testing.T) {
+	dir := localRelaySource(t, "  - { id: upstream-x, public: m }\n")
+	configPath := filepath.Join(dir, "Novafile")
+	writeFile(t, configPath, `version 1
+profiles {
+    source ./profiles
+}
+provider myrelay {
+    api_key k
+    url https://relay.example.com/v1/chat/completions
+    model m m
+}
+`)
+
+	_, err := Load(configPath, Options{})
+	if err == nil {
+		t.Fatal("同名模型指向上游不同名时应报错")
+	}
+	if !strings.Contains(err.Error(), "上游") {
+		t.Errorf("错误 = %v，期望指出上游模型名冲突", err)
+	}
+}
