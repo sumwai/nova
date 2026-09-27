@@ -186,6 +186,7 @@ func routesByModel(endpoints []effectiveEndpoint) map[string][]endpointRoute {
 					CredentialHeaderStyle: item.provider.CredentialHeaderStyle,
 					Headers:               item.provider.Headers,
 					PriceKey:              priceKey,
+					LimitsMapping:         item.provider.LimitsMapping,
 				},
 				pool: providerHasPlans(item.provider),
 			})

@@ -79,6 +79,10 @@
   渠道跳过。
 - 档案计划可写 `expires_at`（RFC3339，带时区）：到期后该账号的额度条目一律不可用，
   直到换一份带新到期时刻的档案。这是额度文档 `expires_at` 在静态声明侧的来源。
+- 档案的 `limits_mapping` 接入错误分类：按声明顺序取第一条「状态码相等且响应体命中
+  `match_body`（为空即只看状态码）」的规则，`transient-rate` / `window-exhausted` /
+  `permanent` 分别对应当前先重试不写状态、写窗口耗尽标记、不可重试的上游拒绝。
+  声明优先于状态码启发式；未声明时维持过渡期关键词表。
 - 上游返回 402、或 403 / 429 的响应体命中额度语义时归为新的可重试错误码
   `upstream_quota_exhausted`（客户端为 503；Anthropic 侧映射成 `rate_limit_error`，
   Gemini 侧映射成 `RESOURCE_EXHAUSTED`）。所有候选都因额度不可用时也回这个码，
@@ -112,8 +116,9 @@
 - `profiles.refresh` 只被解析，尚未据此自动刷新；远端源的更新仍由 `nova profiles update`
   显式触发。
 - 档案里多个 `plans` 时本版取第一个；按账号选 plan 需要的映射还没有配置语法承载。
-- 档案里的状态码与响应体到错误分类的映射尚未落地，额度判定暂用一组内置关键词
-  （`quota` / `balance` / `credit` / `billing` / `额度` / `配额` / `余额` / `欠费`）。
+- 内置档案不带 `limits_mapping`，未声明的状态码仍走过渡期关键词启发式
+  （`quota` / `balance` / `credit` / `billing` / `额度` / `配额` / `余额` / `欠费`）；
+  写了映射的档案以声明为准。
 - 跨币种价格不换算，`prefer price` 只保证同币种内的相对顺序；输出估计固定为 800 token。
 - 静态声明判为耗尽的账号没有运行期恢复入口：`nova limits` 命令尚未实现，
   `window: absolute` 且 `remaining: 0` 的条目只能手工改档案，或靠一次真实观测覆盖。

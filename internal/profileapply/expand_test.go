@@ -811,6 +811,45 @@ provider myrelay {
 	}
 }
 
+// 档案的 limits_mapping 写进渠道，随后随 route 交给上游客户端。
+func TestLimitsMappingExpandsToProvider(t *testing.T) {
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "profiles")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatalf("创建档案目录失败：%v", err)
+	}
+	writeFile(t, filepath.Join(profileDir, "mapped.yaml"), `
+schema: 1
+id: mapped
+auth: { header: authorization, scheme: Bearer, env: MAPPED_KEY }
+endpoints:
+  openai_chat: { url: https://mapped.example.com/v1/chat/completions, protocol: openai_chat }
+models:
+  - { id: m }
+limits_mapping:
+  - { status: 429, match_body: "quota|exhaust", class: window-exhausted }
+  - { status: 429, class: transient-rate }
+  - { status: 403, class: permanent }
+`)
+	configPath := filepath.Join(dir, "Novafile")
+	writeFile(t, configPath, "version 1\nprofiles {\n    source ./profiles\n}\nprovider mapped\n")
+
+	cfg, err := Load(configPath, Options{Getenv: envOf(map[string]string{"MAPPED_KEY": "k"})})
+	if err != nil {
+		t.Fatalf("展开失败：%v", err)
+	}
+	rules := cfg.Providers[0].LimitsMapping
+	if len(rules) != 3 {
+		t.Fatalf("映射规则 = %+v，期望三条", rules)
+	}
+	if rules[0].Status != 429 || rules[0].MatchBody != "quota|exhaust" || rules[0].Class != domain.LimitsWindowExhausted {
+		t.Errorf("首条规则 = %+v", rules[0])
+	}
+	if rules[2].Class != domain.LimitsPermanent {
+		t.Errorf("第三条规则 = %+v，期望 permanent", rules[2])
+	}
+}
+
 // 档案计划的到期时刻写进账号额度声明，供装配层剔除已到期的计划。
 func TestPlanExpiresAtExpandsToAccountLimits(t *testing.T) {
 	dir := t.TempDir()

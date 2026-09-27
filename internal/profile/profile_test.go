@@ -224,6 +224,16 @@ func TestLoadRejectsUncompilableAPIPattern(t *testing.T) {
 	requireLocatedError(t, path, err, "api_pattern", "正则")
 }
 
+// TestLoadRejectsUncompilableLimitsMappingRegex 守护 limits_mapping 的 match_body 可编译。
+//
+// 展开层与运行期都直接用这段文本匹配响应体，加载期不校验会在第一次上游失败时才暴露。
+func TestLoadRejectsUncompilableLimitsMappingRegex(t *testing.T) {
+	content := minimalProfile + "limits_mapping:\n  - status: 429\n    match_body: '(['\n    class: transient-rate\n"
+	path := writeProfile(t, content)
+	_, err := Load(path)
+	requireLocatedError(t, path, err, "limits_mapping", "正则")
+}
+
 // TestPlanExpiresAt 守护计划到期时刻是带时区的绝对时刻，且能被解析读出。
 func TestPlanExpiresAt(t *testing.T) {
 	content := minimalProfile + `plans:

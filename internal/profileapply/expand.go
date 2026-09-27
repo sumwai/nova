@@ -128,6 +128,7 @@ func expandProvider(
 		return err
 	}
 	attachPlanLimits(provider, loaded, cfg)
+	attachLimitsMapping(provider, loaded)
 	if err := fillChannelAuth(provider, loaded); err != nil {
 		return err
 	}
@@ -581,6 +582,25 @@ func indexOfDefault(entries []credentials.Entry) int {
 		}
 	}
 	return -1
+}
+
+// attachLimitsMapping 把档案声明的错误分类规则写进渠道。
+//
+// 取值为 schema 已校验的三类之一，这里只做形状搬运；运行期由上游客户端按
+// 「状态码相等且响应体命中 match_body（为空即只看状态码）」取第一条命中的。
+func attachLimitsMapping(provider *config.Provider, loaded *profile.Profile) {
+	if len(loaded.LimitsMapping) == 0 {
+		return
+	}
+	rules := make([]domain.LimitsRule, 0, len(loaded.LimitsMapping))
+	for _, rule := range loaded.LimitsMapping {
+		rules = append(rules, domain.LimitsRule{
+			Status:    rule.Status,
+			MatchBody: rule.MatchBody,
+			Class:     domain.LimitsClass(rule.Class),
+		})
+	}
+	provider.LimitsMapping = rules
 }
 
 // fillChannelAuth 把档案声明的凭据注入形态与静态请求头写进渠道。

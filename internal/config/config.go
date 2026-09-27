@@ -158,6 +158,10 @@ type Provider struct {
 	// 它与凭据头合并后交给适配器补协议内置必需头；nil 表示没有额外请求头。
 	Headers http.Header
 
+	// LimitsMapping 是渠道所属平台声明的错误分类规则，展开阶段从档案写入。
+	// 运行期按它把上游状态码与响应体映射成三类错误；为空时按状态码启发式分级。
+	LimitsMapping []domain.LimitsRule
+
 	// File / Line / Col 指向 provider 名字的位置，用于报错时指回块头。
 	File string
 	Line int

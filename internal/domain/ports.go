@@ -201,6 +201,9 @@ type Route struct {
 	// 选路层按它做 prefer price 排序，额度层按它把 token 用量折算成 usd；它只是查表键，
 	// 不携带单价，选路之外的地方不得由它反推价格。
 	PriceKey string
+	// LimitsMapping 是这条候选所属平台声明的错误分类规则，按声明顺序取第一条命中。
+	// 它由档案的 limits_mapping 经装配层写入；为空时上游客户端按状态码启发式分级。
+	LimitsMapping []LimitsRule
 }
 
 // BreakerKey 返回一次尝试在熔断与折叠口径下的渠道键。

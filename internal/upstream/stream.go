@@ -80,7 +80,7 @@ func (c *Client) Stream(ctx context.Context, route domain.Route, _ *domain.Reque
 		if readErr != nil {
 			return mapTransportError(ctx, readErr)
 		}
-		return classifyHTTPStatus(resp.StatusCode, resp.Header, respBody)
+		return classifyHTTPStatus(resp.StatusCode, resp.Header, respBody, route.LimitsMapping)
 	}
 
 	// 响应头在首帧之前到达，下沉目标拿到它才能做额度观测；分片解码器看不到响应头。

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -146,7 +147,7 @@ func (c *Client) Complete(ctx context.Context, route domain.Route, _ *domain.Req
 		return nil, responseTooLargeError()
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, classifyHTTPStatus(resp.StatusCode, resp.Header, respBody)
+		return nil, classifyHTTPStatus(resp.StatusCode, resp.Header, respBody, route.LimitsMapping)
 	}
 	decoded, err := adapter.DecodeResponse(respBody)
 	if err != nil {
@@ -275,15 +276,33 @@ func mapTransportError(ctx context.Context, err error) *domain.Error {
 // header 用于提取 Retry-After 提示：头缺失或取值非法时返回的错误不含该提示，
 // 调用方按自身退避策略处理。
 //
+// rules 是档案声明的错误分类映射（limits_mapping）。声明命中的分类优先于状态码启发式：
+// 平台事实不应被通用启发式盖过。未声明时维持过渡期启发式（见 upstreamQuotaKeywords），
+// 待各平台档案补齐映射后由那一条路径接管。
+//
 // 额度耗尽与上游限流都回 503 且可重试。额度耗尽在连续失败达到阈值后由额度层
 // （internal/gateway 的 limitRuntime）写入「至 until 不可用」标记，选路会跳过它；
 // 本层只负责把状态码分级并附带 Retry-After 提示，不做抑制，避免重试口径与额度层分叉。
-func classifyHTTPStatus(status int, header http.Header, body []byte) error {
+func classifyHTTPStatus(status int, header http.Header, body []byte, rules []domain.LimitsRule) error {
 	snippet := errorSnippet(body)
 	detail := fmt.Sprintf("上游 HTTP 状态码 %d", status)
 	if snippet != "" {
 		detail += "：" + snippet
 	}
+
+	if class, matched := matchLimitsRule(rules, status, snippet); matched {
+		var err *domain.Error
+		switch class {
+		case domain.LimitsWindowExhausted:
+			err = domain.NewError(domain.CodeUpstreamQuotaExhausted, "上游额度耗尽").WithDetail(detail)
+		case domain.LimitsPermanent:
+			err = domain.NewError(domain.CodeUpstreamRejected, "上游拒绝请求").WithDetail(detail)
+		default:
+			err = domain.NewError(domain.CodeUpstreamRateLimited, "上游限流").WithDetail(detail)
+		}
+		return withRetryAfter(err, header, time.Now())
+	}
+
 	var err *domain.Error
 	switch {
 	case status == http.StatusPaymentRequired:
@@ -307,6 +326,30 @@ func classifyHTTPStatus(status int, header http.Header, body []byte) error {
 		err = domain.NewError(domain.CodeUpstreamUnavailable, "上游不可用").WithDetail(detail)
 	}
 	return withRetryAfter(err, header, time.Now())
+}
+
+// matchLimitsRule 按声明顺序找第一条命中的档案规则。
+//
+// 匹配对象是排障用的截断片段而不是完整响应体：与过渡期启发式同一口径，
+// 避免一条长长的平台报文把匹配成本抬起来。MatchBody 在档案加载期已校验可编译，
+// 这里编译失败时跳过该条而不是改变分级。
+func matchLimitsRule(rules []domain.LimitsRule, status int, snippet string) (domain.LimitsClass, bool) {
+	for _, rule := range rules {
+		if rule.Status != status {
+			continue
+		}
+		if rule.MatchBody == "" {
+			return rule.Class, true
+		}
+		matched, err := regexp.MatchString(rule.MatchBody, snippet)
+		if err != nil {
+			continue
+		}
+		if matched {
+			return rule.Class, true
+		}
+	}
+	return "", false
 }
 
 // upstreamQuotaKeywords 是判定「上游声明本窗口额度或余额耗尽」的响应体关键词表。

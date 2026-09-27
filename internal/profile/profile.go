@@ -251,6 +251,15 @@ func (p *Profile) checkSemantics(path string, root *yaml.Node) *Error {
 				"计划 %s 的 expires_at 不是合法的 RFC3339 时刻：%v", plan.ID, err)
 		}
 	}
+	for i, mapping := range p.LimitsMapping {
+		if mapping.MatchBody == "" {
+			continue
+		}
+		if _, err := regexp.Compile(mapping.MatchBody); err != nil {
+			return pathAtNode(path, root, []string{"limits_mapping", strconv.Itoa(i), "match_body"},
+				"limits_mapping 的 match_body 不是合法正则：%v", err)
+		}
+	}
 	return nil
 }
 

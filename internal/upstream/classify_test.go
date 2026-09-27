@@ -63,7 +63,46 @@ func TestClassifyHTTPStatus(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := classifyHTTPStatus(tt.status, http.Header{}, []byte(tt.body))
+			err := classifyHTTPStatus(tt.status, http.Header{}, []byte(tt.body), nil)
+			domainErr := domain.AsError(err)
+			if domainErr == nil {
+				t.Fatalf("错误必须是 domain.Error，实际类型为 %T", err)
+			}
+			if domainErr.Code != tt.wantCode {
+				t.Errorf("错误码 = %q，期望 %q", domainErr.Code, tt.wantCode)
+			}
+			if got := domain.Retryable(err); got != tt.wantRetryable {
+				t.Errorf("domain.Retryable = %v，期望 %v", got, tt.wantRetryable)
+			}
+		})
+	}
+}
+
+// TestClassifyHTTPStatusHonorsProfileMapping 守护档案声明优先于状态码启发式。
+//
+// 声明命中时不再看关键词：平台写下的对应关系是事实，通用启发式不得盖过它。
+func TestClassifyHTTPStatusHonorsProfileMapping(t *testing.T) {
+	rules := []domain.LimitsRule{
+		{Status: http.StatusTooManyRequests, MatchBody: "quota|exhaust", Class: domain.LimitsWindowExhausted},
+		{Status: http.StatusTooManyRequests, Class: domain.LimitsTransientRate},
+		{Status: http.StatusForbidden, Class: domain.LimitsPermanent},
+	}
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		wantCode      domain.Code
+		wantRetryable bool
+	}{
+		{"429 命中额度正则归窗口耗尽", http.StatusTooManyRequests, `{"error":"quota exceeded"}`, domain.CodeUpstreamQuotaExhausted, true},
+		{"429 未命中正则归秒级限流", http.StatusTooManyRequests, `{"error":"slow down"}`, domain.CodeUpstreamRateLimited, true},
+		{"403 声明为永久拒绝时不再看关键词", http.StatusForbidden, `{"message":"账户余额不足"}`, domain.CodeUpstreamRejected, false},
+		{"未声明的 402 仍按过渡启发式", http.StatusPaymentRequired, ``, domain.CodeUpstreamQuotaExhausted, true},
+		{"未声明的 400 仍按过渡启发式", http.StatusBadRequest, `{"error":"bad"}`, domain.CodeUpstreamRejected, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := classifyHTTPStatus(tt.status, http.Header{}, []byte(tt.body), rules)
 			domainErr := domain.AsError(err)
 			if domainErr == nil {
 				t.Fatalf("错误必须是 domain.Error，实际类型为 %T", err)
@@ -82,7 +121,7 @@ func TestClassifyHTTPStatus(t *testing.T) {
 // retryAfterError 的包装不得改变新错误码的分级与可重试性，同时该提示要能被调用方取出。
 func TestClassifyQuotaExhaustedRetainsRetryAfter(t *testing.T) {
 	header := http.Header{"Retry-After": []string{"5"}}
-	err := classifyHTTPStatus(http.StatusPaymentRequired, header, []byte(`{"error":"payment required"}`))
+	err := classifyHTTPStatus(http.StatusPaymentRequired, header, []byte(`{"error":"payment required"}`), nil)
 	if got := domain.AsError(err); got == nil || got.Code != domain.CodeUpstreamQuotaExhausted {
 		t.Fatalf("错误码 = %v，期望 %q", got, domain.CodeUpstreamQuotaExhausted)
 	}
