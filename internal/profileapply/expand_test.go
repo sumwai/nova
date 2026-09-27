@@ -10,6 +10,7 @@ import (
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/domain"
+	"github.com/sumwai/nova/internal/price"
 )
 
 // envOf 把一张固定表包成 Getenv，供凭据用例使用。
@@ -918,6 +919,45 @@ usage: { exec: /tmp/probe.sh, interval: 90s, schema: limits-1 }
 	}
 	if usage.Exec != "/tmp/probe.sh" || usage.Interval != 90*time.Second || usage.Schema != "limits-1" {
 		t.Errorf("usage = %+v", usage)
+	}
+}
+
+// 内置档案的 price_from 都能在内置价格表里解析到。
+//
+// 内置档案随二进制发布，指向内置表的厂商键；一个拼错的键不会报错，只会让该模型
+// 静默变成「查不到价格」，prefer price 因此退化。
+func TestBuiltinProfilesPriceReferencesResolve(t *testing.T) {
+	envs := envOf(map[string]string{
+		"DEEPSEEK_API_KEY":  "k",
+		"OPENCODE_API_KEY":  "k",
+		"SENSENOVA_API_KEY": "k",
+	})
+	for _, id := range []string{"deepseek-official", "opencode-go", "sensenova"} {
+		t.Run(id, func(t *testing.T) {
+			cfg, err := config.Parse([]byte("version 1\nprovider "+id+"\n"), "Novafile")
+			if err != nil {
+				t.Fatalf("解析配置失败：%v", err)
+			}
+			if err := Apply(cfg, Options{Getenv: envs}); err != nil {
+				t.Fatalf("展开失败：%v", err)
+			}
+
+			var declared []price.Declared
+			for i := range cfg.Providers {
+				provider := &cfg.Providers[i]
+				for j := range provider.Endpoints {
+					for _, model := range provider.Endpoints[j].Models {
+						if model.Price.Key != "" {
+							declared = append(declared, model.Price)
+						}
+					}
+				}
+			}
+			table := price.Build(declared, nil, price.Options{})
+			if refs := table.UnresolvedReferences(); len(refs) != 0 {
+				t.Errorf("%s 的 price_from 悬空：%v", id, refs)
+			}
+		})
 	}
 }
 

@@ -142,12 +142,6 @@ type Table struct {
 	unresolved map[string]bool
 }
 
-// builtin 是内置价格表。
-//
-// 本版为空：价格数字必须有实测来源，凭空写进二进制的价格会变成一个看起来权威、
-// 实则无从核对的数。内置表落地后由档案或 prices.file 之外的那一份填入。
-var builtin = map[string]Unit{}
-
 // Build 由三处来源按优先级合成一张价格表。
 //
 // 优先级：档案里的 price/free/price_from > prices { file } > 内置表。查不到任何
@@ -168,12 +162,23 @@ func Build(declared []Declared, external map[string]Unit, opts Options) *Table {
 		declaredByKey[item.Key] = item
 	}
 
-	keys := make([]string, 0, len(declaredByKey)+len(external))
+	keys := make([]string, 0, len(declaredByKey)+len(external)+len(builtin))
 	for key := range declaredByKey {
 		keys = append(keys, key)
 	}
 	for key := range external {
 		if _, ok := declaredByKey[key]; ok {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	// 内置表单独走一遍：它是 price_from 的引用目标，直接查表也要能得到 Known，
+	// 不能因为没有被声明或文件提到就退化成 Unknown。
+	for key := range builtin {
+		if _, ok := declaredByKey[key]; ok {
+			continue
+		}
+		if _, ok := external[key]; ok {
 			continue
 		}
 		keys = append(keys, key)

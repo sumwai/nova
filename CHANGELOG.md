@@ -65,6 +65,10 @@
 
 **价格与选路**
 
+- 内置一份厂商基础价表（数据来源 genai-prices，抓取日期 2026-09-27，取基础档）：
+  `deepseek/deepseek-v4-flash`、`deepseek/deepseek-v4-pro`、`moonshotai/kimi-k3`、
+  `zai/GLM-5.2`、`zai/GLM-5.3`、`minimax/minimax-m3`，均为 USD。三条内置档案的模型用
+  `price_from` 指向这些键，默认部署下 `prefer price` 因此有真实单价可用。
 - 新增顶层 `prices { currency …; file … }`：声明价格层的缺省币种（缺省 USD）与本地
   价格表文件。文件是「条目键 → 单价」的 YAML，单位为每百万 token，键形如
   `<档案 id>/<模型 id>`。

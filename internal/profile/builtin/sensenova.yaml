@@ -9,8 +9,8 @@ endpoints:
   openai_chat: { url: https://token.sensenova.cn/v1/chat/completions, protocol: openai_chat }
   anthropic_messages: { url: https://token.sensenova.cn/v1/messages, protocol: anthropic_messages }
 models:
-  - { id: deepseek-flash, endpoints: [openai_chat, anthropic_messages] }
-  - { id: deepseek-v4-flash, endpoints: [openai_chat, anthropic_messages] }
-  - { id: glm-5.2, endpoints: [openai_chat] }
-  - { id: kimi-k3, endpoints: [openai_chat] }
+  - { id: deepseek-flash, endpoints: [openai_chat, anthropic_messages], price_from: deepseek/deepseek-v4-flash }
+  - { id: deepseek-v4-flash, endpoints: [openai_chat, anthropic_messages], price_from: deepseek/deepseek-v4-flash }
+  - { id: glm-5.2, endpoints: [openai_chat], price_from: zai/GLM-5.2 }
+  - { id: kimi-k3, endpoints: [openai_chat], price_from: moonshotai/kimi-k3 }
   - { id: sensenova-6.8-flash-lite, endpoints: [openai_chat] }

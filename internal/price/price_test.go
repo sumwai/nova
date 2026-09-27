@@ -93,13 +93,17 @@ func TestEstimateUsesInputAndOutput(t *testing.T) {
 // TestUnknownUsesNominalMedian 守护 Unknown 用已知按量档的中位数参与排序。
 //
 // 三条已知输入单价 1 / 3 / 10，中位数是 3：未知条目的估计等于 3（按百万输入计），
-// 因此它落在已知价之间，而不是被无条件排到最后。
+// 因此它落在已知价之间，而不是被无条件排到最后。币种取 EUR 是刻意的：内置表只有
+// USD，换一个币种才能把中位数机制单独拿出来看。
 func TestUnknownUsesNominalMedian(t *testing.T) {
+	known := func(key string, input float64) Declared {
+		return Declared{Key: key, Unit: &Unit{Currency: "EUR", InputMTok: input}}
+	}
 	table := Build([]Declared{
-		declaredOf("p/a", 1, 0),
-		declaredOf("p/b", 3, 0),
-		declaredOf("p/c", 10, 0),
-		{Key: "p/unknown"},
+		known("p/a", 1),
+		known("p/b", 3),
+		known("p/c", 10),
+		{Key: "p/unknown", Currency: "EUR"},
 	}, nil, Options{})
 
 	usage := Usage{Input: perMillion}
@@ -120,20 +124,23 @@ func TestUnknownUsesNominalMedian(t *testing.T) {
 }
 
 // TestNominalIsPerCurrency 守护名义价按币种分别取中位数：跨币种不互相参照。
+//
+// 币种取 EUR 与 CNY 是刻意的：内置表只有 USD，换两个币种才能把「按币种分桶」
+// 单独拿出来看，而不被内置的 USD 条目拉偏。
 func TestNominalIsPerCurrency(t *testing.T) {
 	table := Build([]Declared{
-		{Key: "p/usd", Unit: &Unit{Currency: "USD", InputMTok: 4}},
-		{Key: "p/eur", Unit: &Unit{Currency: "EUR", InputMTok: 100}},
-		{Key: "p/unknown-usd", Currency: "USD"},
+		{Key: "p/eur", Unit: &Unit{Currency: "EUR", InputMTok: 4}},
+		{Key: "p/cny", Unit: &Unit{Currency: "CNY", InputMTok: 100}},
 		{Key: "p/unknown-eur", Currency: "EUR"},
+		{Key: "p/unknown-cny", Currency: "CNY"},
 	}, nil, Options{})
 
 	usage := Usage{Input: perMillion}
-	if got := Estimate(table.Lookup("p/unknown-usd"), usage); got != 4 {
-		t.Errorf("USD 未知名义成本 = %v，期望 4", got)
+	if got := Estimate(table.Lookup("p/unknown-eur"), usage); got != 4 {
+		t.Errorf("EUR 未知名义成本 = %v，期望 4", got)
 	}
-	if got := Estimate(table.Lookup("p/unknown-eur"), usage); got != 100 {
-		t.Errorf("EUR 未知名义成本 = %v，期望 100", got)
+	if got := Estimate(table.Lookup("p/unknown-cny"), usage); got != 100 {
+		t.Errorf("CNY 未知名义成本 = %v，期望 100", got)
 	}
 }
 
@@ -233,6 +240,27 @@ vendor/empty:
 	}
 	if _, ok := loaded["vendor/empty"]; ok {
 		t.Error("全零条目不进表：它不是一条可用的价格")
+	}
+}
+
+// TestBuiltinTableProvidesVendorPrices 守护内置厂商价表覆盖档案引用到的键。
+//
+// 键写错不会报错，只会让该模型静默变成「查不到价格」，prefer price 因此退化；
+// 这里把内置表里必须存在的键固定下来。
+func TestBuiltinTableProvidesVendorPrices(t *testing.T) {
+	table := Build(nil, nil, Options{})
+	for _, key := range []string{
+		"deepseek/deepseek-v4-flash",
+		"deepseek/deepseek-v4-pro",
+		"moonshotai/kimi-k3",
+		"zai/GLM-5.2",
+		"zai/GLM-5.3",
+		"minimax/minimax-m3",
+	} {
+		entry := table.Lookup(key)
+		if entry.Kind != Known || entry.Source != "builtin" {
+			t.Errorf("%s = %+v，期望来自内置表的 Known", key, entry)
+		}
 	}
 }
 
