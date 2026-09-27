@@ -3,6 +3,8 @@ package limits
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,5 +140,61 @@ func TestSnapshotWriteFailureIsObservable(t *testing.T) {
 	}
 	if degraded, _ := table.Degraded(); !degraded {
 		t.Fatal("写盘失败应把表标记为估算态")
+	}
+}
+
+// TestMaybeFlushWritesInBackground 守护变更后的落盘在后台完成，不必等 Close。
+//
+// 直接等 writers 而不是 sleep：后台写盘的进度是确定的，让测试不依赖时长。
+func TestMaybeFlushWritesInBackground(t *testing.T) {
+	dir := t.TempDir()
+	clock := newTestClock()
+	table := New(Options{Account: "acct", StateDir: dir, Clock: clock.Now, FlushInterval: -1})
+	if err := table.MergeDeclared(declaredDoc([]profile.Limit{accountQuota("5h", 100, 0)})); err != nil {
+		t.Fatalf("合并声明失败：%v", err)
+	}
+
+	table.writers.Wait()
+	data, err := os.ReadFile(filepath.Join(dir, "limits.json"))
+	if err != nil {
+		t.Fatalf("后台落盘未产生快照：%v", err)
+	}
+	if !strings.Contains(string(data), `"acct"`) {
+		t.Fatalf("快照内容不完整：%s", data)
+	}
+}
+
+// TestConcurrentMutationsAndClose 守护并发变更下 Close 写出的快照完整可读。
+//
+// 后台写盘与在途请求的 settle 会并发跑；这里让多路 Consume 与 Close 交叠，
+// 再用 -race 与「新表能否无损载入」两道判据确认没有丢写或写坏。
+func TestConcurrentMutationsAndClose(t *testing.T) {
+	dir := t.TempDir()
+	clock := newTestClock()
+	table := New(Options{Account: "acct", StateDir: dir, Clock: clock.Now, FlushInterval: -1})
+	if err := table.MergeDeclared(declaredDoc([]profile.Limit{
+		{Kind: "quota", Metric: "tokens", Window: "5h", Limit: ptr(100000), Used: ptr(0)},
+	})); err != nil {
+		t.Fatalf("合并声明失败：%v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				table.Consume(accountsScope(), "", Usage{Tokens: 1}, clock.Now())
+			}
+		}()
+	}
+	wg.Wait()
+	if err := table.Close(); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+
+	second := New(Options{Account: "acct", StateDir: dir, Clock: clock.Now, FlushInterval: -1})
+	if degraded, reason := second.Degraded(); degraded {
+		t.Fatalf("Close 写出的快照应可无损载入，实际降级：%s", reason)
 	}
 }

@@ -110,52 +110,93 @@ func (t *Table) load() {
 	t.lastFlush = now
 }
 
-// maybeFlush 在节流间隔之外落盘；间隔为负表示每次变更都落盘。
+// maybeFlush 在节流间隔之外安排一次后台落盘；间隔为负表示每次变更都安排。
+//
+// 真正写盘在独立 goroutine 里做：序列化与 fsync 不再占着表的互斥锁，
+// 触发本次落盘的那个请求因此不必等磁盘。同一时刻只允许一个在途写盘（flushing），
+// 期间的变更照旧置 dirty，由下一次触发或 Close 收尾。
 //
 // Close 之后直接返回：旧装配换出后仍可能有在途请求调 Consume，它只能改内存状态，
 // 不得再把旧状态写回已被新装配接管的同一份快照。
 func (t *Table) maybeFlush(now time.Time) {
-	if t.closed || t.opts.StateDir == "" || !t.dirty {
+	if t.closed || t.opts.StateDir == "" || !t.dirty || t.flushing {
 		return
 	}
 	if t.opts.FlushInterval > 0 && now.Sub(t.lastFlush) < t.opts.FlushInterval {
 		return
 	}
-	t.flushLocked(now)
+	t.flushing = true
+	t.writers.Add(1)
+	go func() {
+		defer t.writers.Done()
+		_ = t.writeLatest()
+		t.mu.Lock()
+		t.flushing = false
+		t.mu.Unlock()
+	}()
 }
 
 // Flush 立即落盘，忽略节流；进程退出前调用它。
 //
 // 它不置 closed：Flush 是「把当前状态推到磁盘」，之后表仍可能继续记账。
 func (t *Table) Flush() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.flushLocked(t.now())
+	return t.writeLatest()
 }
 
 // Close 落盘并结束使用：落盘一次后置 closed，之后的变更不再落盘。
 //
 // 幂等：重复调用不重复落盘，也不报错——装配换出与进程退出可能各调一次。
+// 置 closed 后先等在途写盘结束，再写最终快照，因此不会出现旧快照覆盖新快照。
 func (t *Table) Close() error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.closed {
+		t.mu.Unlock()
 		return nil
 	}
-	err := t.flushLocked(t.now())
 	t.closed = true
+	t.mu.Unlock()
+
+	t.writers.Wait()
+	return t.writeLatest()
+}
+
+// writeLatest 取当前状态并写盘，全程串行化。
+//
+// 快照在持有 writeMu 时重建，因此最后一次写入一定是最新状态：多个写者不会
+// 让一份旧快照盖掉新快照。快照取出后立即清 dirty，写盘期间新到的变更会重新置位，
+// 写成功后不再碰它——这样“写盘期间发生的变更”不会被错误地当成已落盘。
+// writeMu 先于 t.mu 获取，全局只有这一个锁序，不存在与其他路径的反向嵌套。
+func (t *Table) writeLatest() error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+
+	t.mu.Lock()
+	if t.opts.StateDir == "" {
+		t.dirty = false
+		t.mu.Unlock()
+		return nil
+	}
+	now := t.now()
+	snap := t.snapshotLocked(now)
+	t.dirty = false
+	t.mu.Unlock()
+
+	err := writeSnapshot(t.opts.StateDir, t.snapshotPath(), &snap)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err != nil {
+		// 写盘失败即把表标记为估算态：下一次载入看到的可能是上一份旧状态，
+		// 静默继续会让剩余量偏乐观。变更仍未落盘，dirty 置回真，留给下一次触发。
+		t.degrade(err.Error())
+		t.dirty = true
+	}
+	t.lastFlush = now
 	return err
 }
 
-// flushLocked 以临时文件 + rename 写快照。
-//
-// 写盘失败即把表标记为估算态：下一次载入看到的可能是上一份旧状态，静默继续会让
-// 剩余量偏乐观。临时文件先 fsync 再 rename，掉电后不会留下半份文件。
-func (t *Table) flushLocked(now time.Time) error {
-	if t.opts.StateDir == "" {
-		t.dirty = false
-		return nil
-	}
+// snapshotLocked 把当前条目与标记复制成一份可离盘序列化的快照；调用方需持有 t.mu。
+func (t *Table) snapshotLocked(now time.Time) snapshot {
 	snap := snapshot{
 		Version:   snapshotVersion,
 		WrittenAt: now,
@@ -174,52 +215,47 @@ func (t *Table) flushLocked(now time.Time) error {
 			RequiresClear: item.requiresClear,
 		})
 	}
+	return snap
+}
 
-	data, err := json.MarshalIndent(&snap, "", "  ")
+// writeSnapshot 以临时文件 + rename 写一份快照。
+//
+// 临时文件先 fsync 再 rename，掉电后不会留下半份文件；rename 只保证目录项可见，
+// 目录项本身再 fsync 一次。错误已经带上了失败的步骤，调用方直接拿去标估算态。
+func writeSnapshot(stateDir, file string, snap *snapshot) error {
+	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		t.degrade(fmt.Sprintf("序列化额度快照失败：%v", err))
-		return err
+		return fmt.Errorf("序列化额度快照失败：%v", err)
 	}
-	if err := os.MkdirAll(t.opts.StateDir, 0o700); err != nil {
-		t.degrade(fmt.Sprintf("创建状态目录 %s 失败：%v", t.opts.StateDir, err))
-		return err
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return fmt.Errorf("创建状态目录 %s 失败：%v", stateDir, err)
 	}
 
-	file := t.snapshotPath()
-	tmp, err := os.CreateTemp(t.opts.StateDir, "limits.json.tmp-*")
+	tmp, err := os.CreateTemp(stateDir, "limits.json.tmp-*")
 	if err != nil {
-		t.degrade(fmt.Sprintf("创建临时快照文件失败：%v", err))
-		return err
+		return fmt.Errorf("创建临时快照文件失败：%v", err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		t.degrade(fmt.Sprintf("写入临时快照文件失败：%v", err))
-		return err
+		return fmt.Errorf("写入临时快照文件失败：%v", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		t.degrade(fmt.Sprintf("同步临时快照文件失败：%v", err))
-		return err
+		return fmt.Errorf("同步临时快照文件失败：%v", err)
 	}
 	if err := tmp.Close(); err != nil {
-		t.degrade(fmt.Sprintf("关闭临时快照文件失败：%v", err))
-		return err
+		return fmt.Errorf("关闭临时快照文件失败：%v", err)
 	}
 	if err := os.Rename(tmpName, file); err != nil {
-		t.degrade(fmt.Sprintf("替换额度快照失败：%v", err))
-		return err
+		return fmt.Errorf("替换额度快照失败：%v", err)
 	}
-	// rename 只保证目录项可见，目录项本身要 fsync 目录才会落盘。
-	if dir, err := os.Open(t.opts.StateDir); err == nil {
+	if dir, err := os.Open(stateDir); err == nil {
 		dir.Sync()
 		dir.Close()
 	}
-
-	t.dirty = false
-	t.lastFlush = now
 	return nil
 }
 

@@ -122,6 +122,13 @@ type Table struct {
 
 	dirty     bool
 	lastFlush time.Time
+	// writeMu 串行化磁盘写入。快照在持有它时从当前状态重建，因此最后一个写者
+	// 写入的一定是最新状态，不会出现旧快照覆盖新快照。锁序只有 writeMu → mu 一种。
+	writeMu sync.Mutex
+	// writers 统计在途的后台写盘，Close 等它全部结束后再写最终快照。
+	writers sync.WaitGroup
+	// flushing 表示已有一个后台写盘在途，用于避免请求路径按每次变更堆叠 goroutine。
+	flushing bool
 	// closed 在 Close 之后置位，之后的变更不再落盘。换入新装配后旧表仍可能被在途请求
 	// 持有（settle 时调 Consume），不挡住它会把旧状态写回同一份快照。
 	closed bool
