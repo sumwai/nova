@@ -90,8 +90,9 @@ func newLimitRuntime(providers []config.Provider, stateDir string, threshold int
 			}
 			scope := scopeName(provider.Name, ref)
 			table := limits.New(limits.Options{
-				StateDir: tableStateDir(stateDir, scope),
-				Account:  scope,
+				StateDir:   tableStateDir(stateDir, scope),
+				Account:    scope,
+				AsyncFlush: true,
 			})
 			if err := table.MergeDeclared(limits.DeclaredDoc(account.Limits)); err != nil {
 				return nil, fmt.Errorf("渠道 %s 的账号 %s 声明额度失败：%w", provider.Name, scope, err)

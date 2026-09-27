@@ -161,6 +161,7 @@ func attachPlanLimits(provider *config.Provider, loaded *profile.Profile, cfg *c
 		Source:    "profile",
 		ExpiresAt: loaded.Plans[0].ExpiresAt,
 		Account:   loaded.Plans[0].Limits,
+		Models:    loaded.Plans[0].Models,
 	})
 	if len(declared) == 0 {
 		return

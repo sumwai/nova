@@ -37,10 +37,10 @@ func TestFromDocRoundTrip(t *testing.T) {
 	}
 
 	declared := FromDoc(doc)
-	if len(declared) != 2 {
-		t.Fatalf("账号级声明应转换出 2 条，实际 %d 条", len(declared))
+	if len(declared) != 3 {
+		t.Fatalf("账号级 2 条加模型级 1 条应转换出 3 条，实际 %d 条", len(declared))
 	}
-	// 只取账号级条目：模型级条目由观测带入，不在档案声明这一层表达。
+	// 账号级在前、模型级在后；模型级带上它的模型名，还原时据此回到 models 段。
 	if declared[0].Pool != "shared" || declared[0].TZ != "+08:00" || declared[0].Anchor != "1h" {
 		t.Errorf("首条声明丢字段：%+v", declared[0])
 	}
@@ -50,6 +50,9 @@ func TestFromDocRoundTrip(t *testing.T) {
 	if !declared[0].Assumed {
 		t.Errorf("assumed 丢失")
 	}
+	if declared[2].Model != "glm-5.3" {
+		t.Errorf("模型级声明应带模型名，实际 %+v", declared[2])
+	}
 
 	back := DeclaredDoc(declared)
 	if back == nil || len(back.Account) != 2 {
@@ -57,6 +60,9 @@ func TestFromDocRoundTrip(t *testing.T) {
 	}
 	if back.Account[1].ResetsAt != "2026-09-26T15:00:00Z" {
 		t.Errorf("resets_at 丢失：%q", back.Account[1].ResetsAt)
+	}
+	if len(back.Models["glm-5.3"]) != 1 {
+		t.Errorf("还原后的模型级条目丢失：%+v", back.Models)
 	}
 }
 

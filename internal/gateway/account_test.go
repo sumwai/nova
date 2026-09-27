@@ -248,6 +248,28 @@ func TestAccountPoolAllExhaustedReportsQuota(t *testing.T) {
 	}
 }
 
+// TestModelScopedDeclaredLimitSkipsOnlyThatModel 守护模型级声明只影响它列出的模型。
+//
+// 模型级限额经 limits.Declared.Model → DeclaredDoc → LimitsDoc.Models 回到表里；
+// 这条链路断了时，模型级条目会变成账号级，把整个渠道都挡住。
+func TestModelScopedDeclaredLimitSkipsOnlyThatModel(t *testing.T) {
+	account := acct(1, 1)
+	account.Limits = []limits.Declared{{
+		Kind: "quota", Metric: "usd", Window: "5h", Model: "shared", Remaining: floatPtr(0),
+	}}
+	runtime, err := newLimitRuntime(accountConfig(false, account).Providers, "", 0, nil, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+
+	if runtime.available("relay", "", "shared") {
+		t.Fatal("模型级额度为 0 时该模型应不可用")
+	}
+	if !runtime.available("relay", "", "other") {
+		t.Fatal("模型级限额不应影响未列出的模型")
+	}
+}
+
 // floatPtr 返回浮点值的指针副本，供声明里的 remaining 使用。
 func floatPtr(value float64) *float64 { return &value }
 

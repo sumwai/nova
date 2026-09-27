@@ -110,19 +110,27 @@ func (t *Table) load() {
 	t.lastFlush = now
 }
 
-// maybeFlush 在节流间隔之外安排一次后台落盘；间隔为负表示每次变更都安排。
+// maybeFlush 在节流间隔之外落盘；间隔为负表示每次变更都落盘。
 //
-// 真正写盘在独立 goroutine 里做：序列化与 fsync 不再占着表的互斥锁，
-// 触发本次落盘的那个请求因此不必等磁盘。同一时刻只允许一个在途写盘（flushing），
-// 期间的变更照旧置 dirty，由下一次触发或 Close 收尾。
+// 是否在后台写盘由 Options.AsyncFlush 决定：开启时把序列化与 fsync 交给独立 goroutine，
+// 触发本次落盘的请求不必等磁盘；关闭时（零值）在调用方持锁期间同步写完，与引入
+// 后台写盘之前的行为逐字一致。
 //
 // Close 之后直接返回：旧装配换出后仍可能有在途请求调 Consume，它只能改内存状态，
 // 不得再把旧状态写回已被新装配接管的同一份快照。
 func (t *Table) maybeFlush(now time.Time) {
-	if t.closed || t.opts.StateDir == "" || !t.dirty || t.flushing {
+	if t.closed || t.opts.StateDir == "" || !t.dirty {
 		return
 	}
 	if t.opts.FlushInterval > 0 && now.Sub(t.lastFlush) < t.opts.FlushInterval {
+		return
+	}
+	if !t.opts.AsyncFlush {
+		// 同步路径：调用方本就持着 t.mu，因此直接写，不再回头取锁。
+		t.flushLocked(now)
+		return
+	}
+	if t.flushing {
 		return
 	}
 	t.flushing = true
@@ -134,6 +142,27 @@ func (t *Table) maybeFlush(now time.Time) {
 		t.flushing = false
 		t.mu.Unlock()
 	}()
+}
+
+// flushLocked 在调用方已持有 t.mu 时同步写一次盘。
+//
+// 它只额外取 writeMu（锁序同为 writeMu → t.mu 的写者不会与自己撞上：这里 t.mu 已在手，
+// writeMu 后取，且不在持有 writeMu 时再取 t.mu）。
+func (t *Table) flushLocked(now time.Time) {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+
+	if t.opts.StateDir == "" {
+		t.dirty = false
+		return
+	}
+	snap := t.snapshotLocked(now)
+	t.dirty = false
+	if err := writeSnapshot(t.opts.StateDir, t.snapshotPath(), &snap); err != nil {
+		t.degrade(err.Error())
+		t.dirty = true
+	}
+	t.lastFlush = now
 }
 
 // Flush 立即落盘，忽略节流；进程退出前调用它。

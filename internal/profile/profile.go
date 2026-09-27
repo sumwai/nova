@@ -113,6 +113,11 @@ type Plan struct {
 	// 都属于这一类，不需要等探测落地。
 	ExpiresAt string  `yaml:"expires_at"`
 	Limits    []Limit `yaml:"limits"`
+	// Models 是按模型细分的静态限额，键与模型 id（public 优先）一致。
+	//
+	// 它对应额度文档的 models 段，供既是按模型限额、又没有账号级总量的计划使用
+	// （如订阅制平台：每个模型各有月度上限，账号级汇总不是一项真实事实）。
+	Models map[string][]Limit `yaml:"models"`
 }
 
 // Paid 只作展示与顺序表达，不参与跨账号自动比价。

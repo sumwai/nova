@@ -91,6 +91,8 @@ func TestCorruptSnapshotDegrades(t *testing.T) {
 
 	clock := newTestClock()
 	table := New(Options{Account: "acct", StateDir: dir, Clock: clock.Now, FlushInterval: -1})
+	// 落盘是后台进行的：用例结束时必须关表，否则在途写盘会与 t.TempDir 的清理撞车。
+	t.Cleanup(func() { _ = table.Close() })
 	if degraded, reason := table.Degraded(); !degraded || reason == "" {
 		t.Fatal("损坏快照应把表标记为估算态并给出原因")
 	}
@@ -149,7 +151,7 @@ func TestSnapshotWriteFailureIsObservable(t *testing.T) {
 func TestMaybeFlushWritesInBackground(t *testing.T) {
 	dir := t.TempDir()
 	clock := newTestClock()
-	table := New(Options{Account: "acct", StateDir: dir, Clock: clock.Now, FlushInterval: -1})
+	table := New(Options{Account: "acct", StateDir: dir, Clock: clock.Now, FlushInterval: -1, AsyncFlush: true})
 	if err := table.MergeDeclared(declaredDoc([]profile.Limit{accountQuota("5h", 100, 0)})); err != nil {
 		t.Fatalf("合并声明失败：%v", err)
 	}
@@ -171,7 +173,7 @@ func TestMaybeFlushWritesInBackground(t *testing.T) {
 func TestConcurrentMutationsAndClose(t *testing.T) {
 	dir := t.TempDir()
 	clock := newTestClock()
-	table := New(Options{Account: "acct", StateDir: dir, Clock: clock.Now, FlushInterval: -1})
+	table := New(Options{Account: "acct", StateDir: dir, Clock: clock.Now, FlushInterval: -1, AsyncFlush: true})
 	if err := table.MergeDeclared(declaredDoc([]profile.Limit{
 		{Kind: "quota", Metric: "tokens", Window: "5h", Limit: ptr(100000), Used: ptr(0)},
 	})); err != nil {

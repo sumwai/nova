@@ -961,6 +961,32 @@ func TestBuiltinProfilesPriceReferencesResolve(t *testing.T) {
 	}
 }
 
+// 内置 opencode-go 的计划按模型给出限额，展开后带模型名。
+//
+// 它验证的是一条新链路：档案 plans[].models → 中性声明的 Model 字段 →
+// 装配层还原成额度文档的 models 段。
+func TestBuiltinPlanModelLimitsExpand(t *testing.T) {
+	cfg, err := config.Parse([]byte("version 1\nprovider opencode-go\n"), "Novafile")
+	if err != nil {
+		t.Fatalf("解析配置失败：%v", err)
+	}
+	if err := Apply(cfg, Options{Getenv: envOf(map[string]string{"OPENCODE_API_KEY": "k"})}); err != nil {
+		t.Fatalf("展开失败：%v", err)
+	}
+
+	found := map[string]int{}
+	for _, declared := range cfg.Providers[0].Accounts[0].Limits {
+		if declared.Model != "" {
+			found[declared.Model]++
+		}
+	}
+	for _, model := range []string{"deepseek-flash", "deepseek-v4-pro", "kimi-k3", "glm-5.3", "minimax-m3"} {
+		if found[model] != 3 {
+			t.Errorf("模型 %s 的限额 = %d 条，期望 5h/7d/30d 各一条", model, found[model])
+		}
+	}
+}
+
 // 手写模型与档案同名但上游名不同时报错，不静默选一边。
 func TestManualModelUpstreamConflictReportsError(t *testing.T) {
 	dir := localRelaySource(t, "  - { id: upstream-x, public: m }\n")

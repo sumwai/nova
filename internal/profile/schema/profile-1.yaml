@@ -153,6 +153,14 @@ $defs:
         # 静态声明的限制只给上限、窗口与口径，不要求 remaining；remaining 只在观测中出现。
         items:
           $ref: "limits-1.yaml#/$defs/limit"
+      # models 是按模型细分的静态限额，键与档案的模型 id（public 优先）一致。
+      # 它对应额度文档的 models 段：只影响所列模型，账号级与模型级条目相与生效。
+      models:
+        type: object
+        additionalProperties:
+          type: array
+          items:
+            $ref: "limits-1.yaml#/$defs/limit"
   paid:
     type: object
     additionalProperties: false

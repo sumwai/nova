@@ -97,6 +97,13 @@ type Options struct {
 	// FlushInterval 是快照写盘的节流间隔；零值用 5s，负数表示每次变更都写。
 	FlushInterval time.Duration
 
+	// AsyncFlush 表示变更触发的落盘在后台 goroutine 里做，不在调用方持锁期间写盘。
+	//
+	// 零值是同步：序列化与 fsync 占着表的互斥锁，行为与引入后台写盘之前完全一致。
+	// 服务路径开启它，让触发落盘的请求不必等磁盘；以「写完才返回」为语义的调用方
+	// （如测试、按需落盘的工具）保持零值即可。
+	AsyncFlush bool
+
 	// GapThreshold 是快照与本机时刻的最大可接受差；超过即认为记账有断档；零值用 1h。
 	GapThreshold time.Duration
 }

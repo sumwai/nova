@@ -16,3 +16,36 @@ models:
   - { id: kimi-k3, endpoints: [openai_chat], price_from: moonshotai/kimi-k3 }
   - { id: glm-5.3, endpoints: [openai_chat], price_from: zai/GLM-5.3 }
   - { id: minimax-m3, endpoints: [openai_chat], price_from: minimax/minimax-m3 }
+# 计划数据来源：https://opencode.ai/docs/go/（抓取 2026-09-27）。订阅 $10/月，
+# 每个模型各有月度用量上限，且 5 小时 = 月度的 20%、每周 = 50%。
+# 月度用 30d 滚动窗口近似订阅周期（文档只说 monthly，未给日历月起算点）；
+# 文档里按显示名列出的模型，只收录能与本档案模型 id 对应上的；
+# deepseek-v4.1-flash 在文档里没有对应条目，因此不声明限额。
+plans:
+  - id: go
+    paid: { amount: 10, currency: USD, period: month }
+    models:
+      deepseek-flash:
+        - { kind: quota, metric: usd, window: 5h, limit: 12 }
+        - { kind: quota, metric: usd, window: 7d, limit: 30 }
+        - { kind: quota, metric: usd, window: 30d, limit: 60 }
+      deepseek-v4-flash:
+        - { kind: quota, metric: usd, window: 5h, limit: 12 }
+        - { kind: quota, metric: usd, window: 7d, limit: 30 }
+        - { kind: quota, metric: usd, window: 30d, limit: 60 }
+      deepseek-v4-pro:
+        - { kind: quota, metric: usd, window: 5h, limit: 3 }
+        - { kind: quota, metric: usd, window: 7d, limit: 7.5 }
+        - { kind: quota, metric: usd, window: 30d, limit: 15 }
+      kimi-k3:
+        - { kind: quota, metric: usd, window: 5h, limit: 3 }
+        - { kind: quota, metric: usd, window: 7d, limit: 7.5 }
+        - { kind: quota, metric: usd, window: 30d, limit: 15 }
+      glm-5.3:
+        - { kind: quota, metric: usd, window: 5h, limit: 3 }
+        - { kind: quota, metric: usd, window: 7d, limit: 7.5 }
+        - { kind: quota, metric: usd, window: 30d, limit: 15 }
+      minimax-m3:
+        - { kind: quota, metric: usd, window: 5h, limit: 12 }
+        - { kind: quota, metric: usd, window: 7d, limit: 30 }
+        - { kind: quota, metric: usd, window: 30d, limit: 60 }
