@@ -518,6 +518,28 @@ func (rt *limitRuntime) usageForLimits(route domain.Route, usage domain.Usage) l
 	}
 }
 
+// Cost 实现 pipeline.CostEstimator：把一次成功尝试的用量按价格表折算成带币种的估算成本。
+//
+// 价格未登记或为名义值时返回 false：名义价只用于排序，不能当成真实费用；用量未知
+// （上游未给出计数）同样不折算，否则会得到一个看上去精确的零成本。
+func (rt *limitRuntime) Cost(route domain.Route, usage domain.Usage) (domain.Cost, bool) {
+	if rt.prices == nil || route.PriceKey == "" || !usage.Known() {
+		return domain.Cost{}, false
+	}
+	entry := rt.prices.Lookup(route.PriceKey)
+	if entry.Assumed {
+		return domain.Cost{}, false
+	}
+	amount := price.Estimate(entry, price.Usage{
+		Input:      usage.InputTokens,
+		Output:     usage.OutputTokens,
+		CacheRead:  usage.CacheReadTokens,
+		CacheWrite: usage.CacheWriteTokens,
+		Reasoning:  usage.ReasoningTokens,
+	})
+	return domain.Cost{Currency: entry.Unit.Currency, Amount: amount, Estimated: true}, true
+}
+
 // convertUSD 按本次路由的价格把一次用量折算成美元；价格未知时返回 0。
 func (rt *limitRuntime) convertUSD(route domain.Route, usage price.Usage) float64 {
 	if rt.prices == nil || route.PriceKey == "" {

@@ -48,12 +48,13 @@ type Accounting struct {
 // 只放标量：任何按维度拆开的东西都会随维度基数增长，而这里不裁剪，
 // 于是「不裁剪 + 高基数键」会变成一条没有上限的增长路径。
 type Lifetime struct {
-	Requests             int64     `json:"requests"`
-	Succeeded            int64     `json:"succeeded"`
-	Failed               int64     `json:"failed"`
-	RetriedRequests      int64     `json:"retried_requests"`
-	UsageUnknownRequests int64     `json:"usage_unknown_requests"`
-	Usage                UsageView `json:"usage"`
+	Requests             int64          `json:"requests"`
+	Succeeded            int64          `json:"succeeded"`
+	Failed               int64          `json:"failed"`
+	RetriedRequests      int64          `json:"retried_requests"`
+	UsageUnknownRequests int64          `json:"usage_unknown_requests"`
+	Usage                UsageView      `json:"usage"`
+	Costs                []CurrencyCost `json:"costs,omitempty"`
 }
 
 // Window 是保留期内的明细聚合与覆盖范围。
@@ -81,15 +82,24 @@ type Window struct {
 
 // Totals 是窗口内不分组的总计。
 type Totals struct {
-	Requests             int         `json:"requests"`
-	Succeeded            int         `json:"succeeded"`
-	Failed               int         `json:"failed"`
-	Stream               int         `json:"stream"`
-	Attempts             int         `json:"attempts"`
-	RetriedRequests      int         `json:"retried_requests"`
-	UsageUnknownRequests int         `json:"usage_unknown_requests"`
-	WrittenBytes         int64       `json:"written_bytes"`
-	DurationMS           LatencyView `json:"duration_ms"`
+	Requests             int            `json:"requests"`
+	Succeeded            int            `json:"succeeded"`
+	Failed               int            `json:"failed"`
+	Stream               int            `json:"stream"`
+	Attempts             int            `json:"attempts"`
+	RetriedRequests      int            `json:"retried_requests"`
+	UsageUnknownRequests int            `json:"usage_unknown_requests"`
+	WrittenBytes         int64          `json:"written_bytes"`
+	DurationMS           LatencyView    `json:"duration_ms"`
+	Costs                []CurrencyCost `json:"costs,omitempty"`
+}
+
+// CurrencyCost 是一种币种下的成本合计。
+//
+// 不同币种不做换算，因此按币种分列；金额是按价格表折算的估算值，不是上游账单。
+type CurrencyCost struct {
+	Currency string  `json:"currency"`
+	Amount   float64 `json:"amount"`
 }
 
 // UsageView 是 token 用量的输出形状。

@@ -218,6 +218,36 @@ func TestStorePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+// TestStoreLifetimeCostsPersist 守护按币种的成本累计能跨重启恢复。
+func TestStoreLifetimeCostsPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.db")
+	first, err := New(Options{Path: path})
+	if err != nil {
+		t.Fatalf("首次打开失败：%v", err)
+	}
+	rec := attemptRecord("r1", "relay-a", upstreamUsage(10, 20))
+	rec.Cost = &domain.Cost{Currency: "USD", Amount: 1.5, Estimated: true}
+	_ = first.RecordAttempt(context.Background(), rec)
+	first.LogAccess(accessRecord("r1", 200))
+	if err := first.Close(); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+
+	second, err := New(Options{Path: path})
+	if err != nil {
+		t.Fatalf("重开失败：%v", err)
+	}
+	defer func() { _ = second.Close() }()
+
+	report := mustReport(t, second, Query{})
+	if len(report.Lifetime.Costs) != 1 || report.Lifetime.Costs[0].Currency != "USD" || report.Lifetime.Costs[0].Amount != 1.5 {
+		t.Errorf("重启后累计成本 = %+v，期望 USD 1.5", report.Lifetime.Costs)
+	}
+	if len(report.Window.Totals.Costs) != 1 || report.Window.Totals.Costs[0].Amount != 1.5 {
+		t.Errorf("窗口成本 = %+v，期望 USD 1.5", report.Window.Totals.Costs)
+	}
+}
+
 // 裁剪只删明细，累计不变：这是 lifetime 与 requests 分表的唯一原因。
 func TestStorePrunesRecordsButKeepsLifetime(t *testing.T) {
 	clock := newTestClock()

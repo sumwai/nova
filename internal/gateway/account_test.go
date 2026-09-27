@@ -270,6 +270,28 @@ func TestModelScopedDeclaredLimitSkipsOnlyThatModel(t *testing.T) {
 	}
 }
 
+// TestCostUsesPriceTable 守护成本估算只对「有真实单价且用量已知」的尝试给出结果。
+func TestCostUsesPriceTable(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{pricedProvider("a", "m", "USD", 2)}}
+	runtime, err := newLimitRuntime(cfg.Providers, "", 0, nil, testPriceTable(t, cfg))
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	usage := domain.Usage{Source: domain.UsageSourceUpstream, OutputTokens: 1_000_000}
+
+	cost, ok := runtime.Cost(domain.Route{Provider: "a", PriceKey: "p/a"}, usage)
+	if !ok || cost.Currency != "USD" || cost.Amount != 2 || !cost.Estimated {
+		t.Fatalf("成本 = %+v ok=%v，期望 USD 2（估算）", cost, ok)
+	}
+
+	if _, ok := runtime.Cost(domain.Route{Provider: "a", PriceKey: "nope"}, usage); ok {
+		t.Error("没有价格声明的键不应给出成本")
+	}
+	if _, ok := runtime.Cost(domain.Route{Provider: "a", PriceKey: "p/a"}, domain.Usage{}); ok {
+		t.Error("用量未知时不应给出成本")
+	}
+}
+
 // floatPtr 返回浮点值的指针副本，供声明里的 remaining 使用。
 func floatPtr(value float64) *float64 { return &value }
 

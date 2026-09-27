@@ -40,6 +40,16 @@ type LimitRuntime interface {
 	LearnExhausted(route domain.Route, model string, err error)
 }
 
+// CostEstimator 按路由与用量估算一次尝试的成本。
+//
+// 它是可选能力：第二个返回值为假表示这次尝试没有可用价格（模型无价格声明，或只有
+// 名义价），统计侧因此把该条尝试记成「成本未知」而不是零。
+//
+// 价格知识只在装配层，流水线不引入它：这里只约定「拿路由与用量换一个带币种的估算值」。
+type CostEstimator interface {
+	Cost(route domain.Route, usage domain.Usage) (domain.Cost, bool)
+}
+
 // quotaExhausted 报告错误是否为上游额度耗尽。
 func quotaExhausted(err error) bool {
 	domainErr := domain.AsError(err)

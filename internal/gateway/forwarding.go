@@ -981,10 +981,24 @@ func forwarderOptions(
 		Observer: observer,
 		// Limits 在选路之后再做一次原子准入与预留，并采集响应头观测、学习额度耗尽。
 		Limits: limitRuntime,
+		// Costs 用同一份价格表把成功尝试的用量折算成带币种的估算成本，仅供统计。
+		// 没有额度层时（limitRuntime 为 nil）也没有价格表，统计不记成本。
+		Costs: costEstimatorOrNil(limitRuntime),
 		// Breaker 留零值：本版不做熔断，候选按声明顺序逐个尝试。
 		// 上游那份实现（internal/router）在生产装配里本来就没生效过，没有搬过来。
 		MaxAttempts: resolver.maxCandidates(),
 	}
+}
+
+// costEstimatorOrNil 把额度层作为成本估算器返回；nil 原样返回 nil。
+//
+// 写成函数而不是在 Options 字面量里判空：nil 的 *limitRuntime 直接赋给接口会得到
+// 一个「非 nil 接口、nil 底层指针」，调用时崩溃；先判空再赋给接口才安全。
+func costEstimatorOrNil(runtime *limitRuntime) pipeline.CostEstimator {
+	if runtime == nil {
+		return nil
+	}
+	return runtime
 }
 
 // upstreamAdapterLookup 供上游客户端与流水线按上游协议取适配器。

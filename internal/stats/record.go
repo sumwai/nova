@@ -60,4 +60,6 @@ type AttemptSummary struct {
 	ErrorCode  string
 	DurationMS int64
 	Usage      domain.Usage
+	// Cost 是这次尝试的估算成本；nil 表示价格未知。
+	Cost *domain.Cost
 }

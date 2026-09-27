@@ -51,6 +51,41 @@ func failedAttempt(provider string, durationMS int64) AttemptSummary {
 	}
 }
 
+// TestCostsAggregateByCurrency 守护成本按币种分组，且无价格的尝试不产生零成本。
+func TestCostsAggregateByCurrency(t *testing.T) {
+	usd := okAttempt("a", upstreamUsage(1000, 2000))
+	usd.Cost = &domain.Cost{Currency: "USD", Amount: 0.5, Estimated: true}
+	eur := okAttempt("b", upstreamUsage(10, 20))
+	eur.Cost = &domain.Cost{Currency: "EUR", Amount: 1.25, Estimated: true}
+	noPrice := okAttempt("c", upstreamUsage(1, 2))
+
+	meta := testMeta()
+	meta.lifetime.costs = costTotals{"USD": 3, "EUR": 4}
+
+	report := buildReport([]Request{
+		requestWith("m", 200, "", usd, eur),
+		requestWith("m2", 200, "", noPrice),
+	}, meta, Query{})
+
+	window := report.Window.Totals.Costs
+	if len(window) != 2 {
+		t.Fatalf("窗口成本 = %+v，期望两种币种", window)
+	}
+	if window[0].Currency != "EUR" || window[0].Amount != 1.25 {
+		t.Errorf("窗口首项 = %+v，期望 EUR 1.25（按币种字典序）", window[0])
+	}
+	if window[1].Currency != "USD" || window[1].Amount != 0.5 {
+		t.Errorf("窗口次项 = %+v，期望 USD 0.5", window[1])
+	}
+
+	if len(report.Lifetime.Costs) != 2 {
+		t.Fatalf("累计成本 = %+v，期望两种币种", report.Lifetime.Costs)
+	}
+	if report.Lifetime.Costs[1].Currency != "USD" || report.Lifetime.Costs[1].Amount != 3 {
+		t.Errorf("累计 USD = %+v，期望 3", report.Lifetime.Costs[1])
+	}
+}
+
 // 回退跨渠道时：一次请求进多个 provider 桶，因此各桶 requests 之和大于窗口请求数；
 // 而 attempts 之和恒等于窗口尝试数。两条不变量都要成立。
 func TestProviderBreakdownIsAttemptScoped(t *testing.T) {

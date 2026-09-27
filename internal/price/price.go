@@ -86,8 +86,11 @@ type Declared struct {
 //
 // 排序用固定估计（输出取缺省值），真实用量在请求路径上另有来源，本类型只服务排序。
 type Usage struct {
-	Input  int
-	Output int
+	Input      int
+	Output     int
+	CacheRead  int
+	CacheWrite int
+	Reasoning  int
 }
 
 // Entry 是解析后的三态条目。
@@ -412,7 +415,10 @@ func Estimate(entry Entry, usage Usage) float64 {
 // unitCost 按单价折算一次用量的成本。
 func unitCost(unit Unit, usage Usage) float64 {
 	return float64(usage.Input)*unit.InputMTok/perMillion +
-		float64(usage.Output)*unit.OutputMTok/perMillion
+		float64(usage.Output)*unit.OutputMTok/perMillion +
+		float64(usage.CacheRead)*unit.CacheReadMTok/perMillion +
+		float64(usage.CacheWrite)*unit.CacheWriteMTok/perMillion +
+		float64(usage.Reasoning)*unit.ReasoningMTok/perMillion
 }
 
 // FormatKey 把档案 id 与模型 id 拼成价格条目的键。

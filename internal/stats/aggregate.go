@@ -121,6 +121,36 @@ func (u usageTotals) view() UsageView {
 	}
 }
 
+// costTotals 是按币种的成本累加器。
+//
+// 不同币种不可相加，因此按币种分桶；币种数量有界（只会出现声明过的几个），
+// 不会像按模型/客户端那样随基数增长。
+type costTotals map[string]float64
+
+// add 累加一条尝试的成本；nil 与未登记价格的尝试不参与。
+func (c *costTotals) add(cost *domain.Cost) {
+	if cost == nil {
+		return
+	}
+	if *c == nil {
+		*c = costTotals{}
+	}
+	(*c)[cost.Currency] += cost.Amount
+}
+
+// view 排成按币种字典序的列表，让输出稳定。
+func (c costTotals) view() []CurrencyCost {
+	if len(c) == 0 {
+		return nil
+	}
+	out := make([]CurrencyCost, 0, len(c))
+	for currency, amount := range c {
+		out = append(out, CurrencyCost{Currency: currency, Amount: amount})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Currency < out[j].Currency })
+	return out
+}
+
 // totalsAcc 是窗口内的总计累加器。
 type totalsAcc struct {
 	requests     int
@@ -133,6 +163,7 @@ type totalsAcc struct {
 	writtenBytes int64
 	latency      histogram
 	usage        usageTotals
+	costs        costTotals
 }
 
 func (a *totalsAcc) add(req Request) {
@@ -155,6 +186,9 @@ func (a *totalsAcc) add(req Request) {
 	a.writtenBytes += int64(req.WrittenBytes)
 	a.latency.add(req.DurationMS)
 	a.usage.add(req.Usage)
+	for i := range req.Attempts {
+		a.costs.add(req.Attempts[i].Cost)
+	}
 }
 
 func (a totalsAcc) view() Totals {
@@ -168,6 +202,7 @@ func (a totalsAcc) view() Totals {
 		UsageUnknownRequests: a.usageUnknown,
 		WrittenBytes:         a.writtenBytes,
 		DurationMS:           a.latency.view(),
+		Costs:                a.costs.view(),
 	}
 }
 
@@ -233,6 +268,7 @@ func buildReport(records []Request, meta reportMeta, q Query) Report {
 			RetriedRequests:      meta.lifetime.retriedRequests,
 			UsageUnknownRequests: meta.lifetime.usageUnknownRequests,
 			Usage:                meta.lifetime.usage.view(),
+			Costs:                meta.lifetime.costs.view(),
 		},
 	}
 

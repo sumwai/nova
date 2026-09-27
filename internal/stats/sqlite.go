@@ -82,6 +82,14 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 
 CREATE INDEX IF NOT EXISTS requests_time ON requests(time_ns);
+
+-- lifetime_costs 是跨重启的成本累计，按币种一行。
+-- 单独一张表而不是往 lifetime 加一列：一张表只能放一种币种，而不同币种不换算。
+-- 新增这张表是兼容的：建表语句幂等，旧库打开时自动补上，历史成本从 0 起算。
+CREATE TABLE IF NOT EXISTS lifetime_costs (
+    currency TEXT PRIMARY KEY,
+    amount   REAL NOT NULL
+);
 `
 
 // openDB 打开（必要时创建）状态库并确认表结构可用。
@@ -239,6 +247,20 @@ func insertRequest(tx *sql.Tx, req Request) error {
 	if err != nil {
 		return fmt.Errorf("累加用失败：%w", err)
 	}
+
+	// 成本按币种累加。同一次请求的多条尝试通常只有一条成功，但重试链上可能不止一条，
+	// 因此全部累加；未登记价格的尝试（Cost 为 nil）不参与。
+	costs := costTotals{}
+	for i := range req.Attempts {
+		costs.add(req.Attempts[i].Cost)
+	}
+	for currency, amount := range costs {
+		if _, err := tx.Exec(`INSERT INTO lifetime_costs (currency, amount) VALUES (?, ?)
+            ON CONFLICT(currency) DO UPDATE SET amount = amount + excluded.amount`,
+			currency, amount); err != nil {
+			return fmt.Errorf("累加成本失败：%w", err)
+		}
+	}
 	return nil
 }
 
@@ -334,6 +356,26 @@ func readLifetime(db *sql.DB) (lifetimeCounters, error) {
 		return lifetimeCounters{}, fmt.Errorf("读取累计用量失败：%w", err)
 	}
 	counters.usage = usage
+
+	rows, err := db.Query(`SELECT currency, amount FROM lifetime_costs`)
+	if err != nil {
+		return lifetimeCounters{}, fmt.Errorf("读取累计成本失败：%w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	counters.costs = costTotals{}
+	for rows.Next() {
+		var (
+			currency string
+			amount   float64
+		)
+		if err := rows.Scan(&currency, &amount); err != nil {
+			return lifetimeCounters{}, fmt.Errorf("读取累计成本失败：%w", err)
+		}
+		counters.costs[currency] = amount
+	}
+	if err := rows.Err(); err != nil {
+		return lifetimeCounters{}, fmt.Errorf("读取累计成本失败：%w", err)
+	}
 	return counters, nil
 }
 
@@ -404,6 +446,32 @@ type attemptDTO struct {
 	ErrorCode  string   `json:"error_code,omitempty"`
 	DurationMS int64    `json:"duration_ms"`
 	Usage      usageDTO `json:"usage"`
+	Cost       *costDTO `json:"cost,omitempty"`
+}
+
+// costDTO 是估算成本在磁盘上的形状。
+//
+// 与内存的 domain.Cost 分开定义：磁盘格式是长期契约，内存结构可以重构。
+type costDTO struct {
+	Currency  string  `json:"currency"`
+	Amount    float64 `json:"amount"`
+	Estimated bool    `json:"estimated,omitempty"`
+}
+
+// encodeCost 把内存成本转成磁盘形状；nil 原样返回 nil。
+func encodeCost(cost *domain.Cost) *costDTO {
+	if cost == nil {
+		return nil
+	}
+	return &costDTO{Currency: cost.Currency, Amount: cost.Amount, Estimated: cost.Estimated}
+}
+
+// decodeCost 把磁盘上的成本还原成内存形状；nil 原样返回 nil。
+func decodeCost(item *costDTO) *domain.Cost {
+	if item == nil {
+		return nil
+	}
+	return &domain.Cost{Currency: item.Currency, Amount: item.Amount, Estimated: item.Estimated}
 }
 
 func encodeAttempts(attempts []AttemptSummary) []attemptDTO {
@@ -428,6 +496,7 @@ func encodeAttempts(attempts []AttemptSummary) []attemptDTO {
 				ReasoningTokens:  attempt.Usage.ReasoningTokens,
 				ServerToolUses:   attempt.Usage.ServerToolUses,
 			},
+			Cost: encodeCost(attempt.Cost),
 		})
 	}
 	return encoded
@@ -455,6 +524,7 @@ func decodeAttempts(encoded []attemptDTO) []AttemptSummary {
 				ReasoningTokens:  item.Usage.ReasoningTokens,
 				ServerToolUses:   item.Usage.ServerToolUses,
 			},
+			Cost: decodeCost(item.Cost),
 		})
 	}
 	return decoded

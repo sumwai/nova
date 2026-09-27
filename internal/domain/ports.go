@@ -457,6 +457,8 @@ type AttemptRecord struct {
 	Outcome    AttemptOutcome
 	// Usage 是上游本次尝试陈述的用量；未取得时为来源未知的零值（见 Usage.Known）。
 	Usage Usage
+	// Cost 是本次尝试的估算成本；nil 表示没有可用价格（模型无价格声明，或价格是名义值）。
+	Cost *Cost
 	// ErrorCode 是本次失败尝试的错误码；成功时为空串。
 	ErrorCode string
 	// ErrorDetail 是本次失败尝试的排障细节：上游返回的 HTTP 状态码与响应体片段，

@@ -43,6 +43,8 @@ type Options struct {
 	Breaker Breaker
 	// Limits 是额度层在转发路径上的实现；可为 nil（不做额度准入、观测与学习）。
 	Limits LimitRuntime
+	// Costs 估算每次尝试的成本；可为 nil（统计侧不记成本）。
+	Costs CostEstimator
 	// MaxAttempts 是单请求最多发起的上游尝试次数；<= 0 时取 maxAttemptsDefault。
 	MaxAttempts int
 	// Backoff 是换下一候选前的退避策略；零值字段取对应默认值。
@@ -57,6 +59,7 @@ type Pipeline struct {
 	observer    domain.Observer
 	breaker     Breaker
 	limits      LimitRuntime
+	costs       CostEstimator
 	maxAttempts int
 	backoff     backoff
 }
@@ -105,6 +108,7 @@ func New(opts Options) (*Pipeline, error) {
 		observer:    opts.Observer,
 		breaker:     opts.Breaker,
 		limits:      opts.Limits,
+		costs:       opts.Costs,
 		maxAttempts: maxAttempts,
 		backoff:     newBackoff(opts.Backoff),
 	}, nil
@@ -450,6 +454,11 @@ func (p *Pipeline) recordAttempt(
 		StartedAt:        result.StartedAt,
 		EndedAt:          result.EndedAt,
 		RewrittenParts:   result.ResponseParts,
+	}
+	if p.costs != nil {
+		if cost, ok := p.costs.Cost(route, result.Usage); ok {
+			rec.Cost = &cost
+		}
 	}
 	_ = p.observer.RecordAttempt(ctx, rec)
 }

@@ -94,6 +94,8 @@ type lifetimeCounters struct {
 	retriedRequests      int64
 	usageUnknownRequests int64
 	usage                usageTotals
+	// costs 是唯一的按维度拆开的东西：币种数量有界，见 Lifetime 的说明。
+	costs costTotals
 }
 
 // New 打开统计库、恢复累计并做一次启动裁剪。
@@ -238,6 +240,7 @@ func (s *Store) RecordAttempt(_ context.Context, rec domain.AttemptRecord) error
 		ErrorCode:  rec.ErrorCode,
 		DurationMS: rec.EndedAt.Sub(rec.StartedAt).Milliseconds(),
 		Usage:      rec.Usage,
+		Cost:       rec.Cost,
 	})
 	s.evictPendingLocked()
 	return nil

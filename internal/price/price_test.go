@@ -316,6 +316,27 @@ func TestUnresolvedReferences(t *testing.T) {
 	}
 }
 
+// TestEstimateIncludesCacheAndReasoning 守护估算覆盖全部五个价格分量。
+//
+// 排序只用输入/输出，但统计口径要算真实花费；少了缓存与推理分量会把成本算低。
+func TestEstimateIncludesCacheAndReasoning(t *testing.T) {
+	table := Build([]Declared{{
+		Key: "p/m",
+		Unit: &Unit{
+			Currency: "USD", InputMTok: 1, OutputMTok: 2,
+			CacheReadMTok: 0.5, CacheWriteMTok: 3, ReasoningMTok: 4,
+		},
+	}}, nil, Options{})
+
+	got := Estimate(table.Lookup("p/m"), Usage{
+		Input: perMillion, Output: perMillion, CacheRead: perMillion,
+		CacheWrite: perMillion, Reasoning: perMillion,
+	})
+	if want := 1.0 + 2.0 + 0.5 + 3.0 + 4.0; got != want {
+		t.Errorf("成本 = %v，期望 %v", got, want)
+	}
+}
+
 // TestDefaultUsage 守护排序用的固定输出估计。
 func TestDefaultUsage(t *testing.T) {
 	table := Build(nil, nil, Options{})
