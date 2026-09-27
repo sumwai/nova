@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sumwai/nova/internal/profile"
 )
 
 // writeProfileFile 把一个合法档案写进目录。
@@ -204,4 +206,147 @@ func writeStateFile(t *testing.T, path, content string) {
 // jsonQuote 把路径安全地嵌进 JSON 字符串，避免 Windows 风格反斜杠破坏文档。
 func jsonQuote(s string) string {
 	return `"` + strings.ReplaceAll(s, `\`, `\\`) + `"`
+}
+
+// verify 不写状态、不动已装快照：本地源与内置源都能反复校验。
+func TestProfilesVerifyBuiltinAndLocal(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	path := writeConfig(t, "version 1\nprofiles {\n    source builtin\n    source ./profiles.local\n}\n")
+	local := filepath.Join(filepath.Dir(path), "profiles.local")
+	writeProfileFile(t, local, "b.yaml", "bbb")
+	writeProfileFile(t, local, "a.yaml", "aaa")
+
+	var stdout, stderr bytes.Buffer
+	if got := execute([]string{"profiles", "verify", "-c", path}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("退出码 = %d，期望 %d\n--- stdout ---\n%s--- stderr ---\n%s",
+			got, exitOK, stdout.String(), stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"内置源 校验通过", "本地源 " + local, "校验通过", "档案 2 份：aaa、bbb"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout = %q，期望含 %q", out, want)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q，期望干净", stderr.String())
+	}
+	// verify 不得写出状态：它用临时目录承载远端安装，本地与内置源不经过同步路径。
+	if _, err := os.Stat(filepath.Join(base, "nova", "state.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("verify 不应写状态文件，实际 err = %v", err)
+	}
+}
+
+// 给出 <源> 时只校验那一个；匹配不到的源报错并列出已声明的源。
+func TestProfilesVerifySelectsOneSource(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	path := writeConfig(t, "version 1\nprofiles {\n    source builtin\n    source ./profiles.local\n}\n")
+	local := filepath.Join(filepath.Dir(path), "profiles.local")
+	writeProfileFile(t, local, "a.yaml", "aaa")
+
+	var stdout, stderr bytes.Buffer
+	if got := execute([]string{"profiles", "verify", "builtin", "-c", path}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("退出码 = %d，期望 %d\n--- stderr ---\n%s", got, exitOK, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "本地源") {
+		t.Errorf("stdout = %q，指定 builtin 时不应校验本地源", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if got := execute([]string{"profiles", "verify", "nope", "-c", path}, &stdout, &stderr); got != exitError {
+		t.Fatalf("退出码 = %d，期望 %d\n--- stderr ---\n%s", got, exitError, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "配置里没有源") || !strings.Contains(stderr.String(), "内置源") {
+		t.Errorf("stderr = %q，期望列出已声明的源", stderr.String())
+	}
+}
+
+// 远端源不可达时 verify 报失败并非 0 退出，而不是静默通过。
+func TestProfilesVerifyRemoteFailure(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	remote := unreachableRemote(t)
+	path := writeConfig(t, "version 1\nprofiles {\n    source "+remote+"\n}\n")
+
+	var stdout, stderr bytes.Buffer
+	if got := execute([]string{"profiles", "verify", "-c", path}, &stdout, &stderr); got != exitError {
+		t.Fatalf("退出码 = %d，期望 %d\n--- stderr ---\n%s", got, exitError, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "校验失败") {
+		t.Errorf("stdout = %q，期望报校验失败", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "失败 "+remote) {
+		t.Errorf("stderr = %q，期望含源地址", stderr.String())
+	}
+}
+
+// 本地源没有「已装 vs 待装」，diff 直接说明并跳过。
+func TestProfilesDiffSkipsNonRemote(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	path := writeConfig(t, "version 1\nprofiles {\n    source builtin\n    source ./profiles.local\n}\n")
+	writeProfileFile(t, filepath.Join(filepath.Dir(path), "profiles.local"), "a.yaml", "aaa")
+
+	var stdout, stderr bytes.Buffer
+	if got := execute([]string{"profiles", "diff", "-c", path}, &stdout, &stderr); got != exitOK {
+		t.Fatalf("退出码 = %d，期望 %d\n--- stderr ---\n%s", got, exitOK, stderr.String())
+	}
+	if strings.Count(stdout.String(), "没有「已装 vs 待装」可对比") != 2 {
+		t.Errorf("stdout = %q，期望两个非远端源各说明一次", stdout.String())
+	}
+}
+
+// diff 只列端点、认证、静态头与探测命令的变化，不把模型集合的日常变动拌进来。
+func TestDiffProfilesReportsShapeChanges(t *testing.T) {
+	before := &profile.Profile{
+		ID:      "relay",
+		Auth:    profile.Auth{Header: "authorization", Scheme: "Bearer", Env: "OLD_KEY"},
+		Headers: map[string]string{"x-stale": "1"},
+		Endpoints: map[string]profile.Endpoint{
+			"openai_chat": {URL: "https://old.example.com/v1/chat/completions", Protocol: "openai_chat"},
+			"gone":        {URL: "https://old.example.com/v1/gone", Protocol: "openai_chat"},
+		},
+		Usage: &profile.Usage{Probe: "old-probe"},
+	}
+	after := &profile.Profile{
+		ID:   "relay",
+		Auth: profile.Auth{Header: "x-api-key", Env: "NEW_KEY"},
+		Headers: map[string]string{
+			"x-fresh": "2",
+		},
+		Endpoints: map[string]profile.Endpoint{
+			"openai_chat": {URL: "https://new.example.com/v1/chat/completions", Protocol: "openai_chat"},
+			"added":       {URL: "https://new.example.com/v1/added", Protocol: "anthropic_messages"},
+		},
+		Usage: &profile.Usage{Exec: "/usr/local/bin/probe"},
+	}
+
+	lines := diffProfiles([]*profile.Profile{before}, []*profile.Profile{after})
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"端点 openai_chat 地址：https://old.example.com/v1/chat/completions → https://new.example.com/v1/chat/completions",
+		"新增端点 added",
+		"删除端点 gone",
+		"认证头：authorization → x-api-key",
+		"认证环境变量：OLD_KEY → NEW_KEY",
+		"新增静态头 x-fresh：2",
+		"删除静态头 x-stale",
+		"探测命令：probe old-probe → exec /usr/local/bin/probe",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("diff = %q，期望含 %q", joined, want)
+		}
+	}
+}
+
+// 新增与删除的档案整体列出，不逐字段展开。
+func TestDiffProfilesReportsAddedAndRemoved(t *testing.T) {
+	previous := []*profile.Profile{{ID: "gone"}}
+	next := []*profile.Profile{{ID: "fresh"}}
+	lines := diffProfiles(previous, next)
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{"删除档案 gone", "新增档案 fresh"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("diff = %q，期望含 %q", joined, want)
+		}
+	}
 }
