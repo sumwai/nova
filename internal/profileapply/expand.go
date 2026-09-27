@@ -154,9 +154,10 @@ func attachPlanLimits(provider *config.Provider, loaded *profile.Profile, cfg *c
 			provider.Name, loaded.ID, len(loaded.Plans), loaded.Plans[0].ID))
 	}
 	declared := limits.FromDoc(&profile.LimitsDoc{
-		Schema:  profile.CurrentSchema,
-		Source:  "profile",
-		Account: loaded.Plans[0].Limits,
+		Schema:    profile.CurrentSchema,
+		Source:    "profile",
+		ExpiresAt: loaded.Plans[0].ExpiresAt,
+		Account:   loaded.Plans[0].Limits,
 	})
 	if len(declared) == 0 {
 		return

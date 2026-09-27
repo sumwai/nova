@@ -811,6 +811,43 @@ provider myrelay {
 	}
 }
 
+// 档案计划的到期时刻写进账号额度声明，供装配层剔除已到期的计划。
+func TestPlanExpiresAtExpandsToAccountLimits(t *testing.T) {
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "profiles")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatalf("创建档案目录失败：%v", err)
+	}
+	writeFile(t, filepath.Join(profileDir, "trial.yaml"), `
+schema: 1
+id: trial
+auth: { header: authorization, scheme: Bearer, env: TRIAL_KEY }
+endpoints:
+  openai_chat: { url: https://trial.example.com/v1/chat/completions, protocol: openai_chat }
+models:
+  - { id: m }
+plans:
+  - id: trial
+    expires_at: 2026-10-03T00:00:00Z
+    limits:
+      - { kind: quota, metric: usd, window: 5h, limit: 10 }
+`)
+	configPath := filepath.Join(dir, "Novafile")
+	writeFile(t, configPath, "version 1\nprofiles {\n    source ./profiles\n}\nprovider trial\n")
+
+	cfg, err := Load(configPath, Options{Getenv: envOf(map[string]string{"TRIAL_KEY": "k"})})
+	if err != nil {
+		t.Fatalf("展开失败：%v", err)
+	}
+	declared := cfg.Providers[0].Accounts[0].Limits
+	if len(declared) != 1 {
+		t.Fatalf("额度声明 = %+v，期望一条", declared)
+	}
+	if declared[0].ExpiresAt != "2026-10-03T00:00:00Z" {
+		t.Errorf("expires_at = %q，期望随计划写入账号额度", declared[0].ExpiresAt)
+	}
+}
+
 // 手写模型与档案同名但上游名不同时报错，不静默选一边。
 func TestManualModelUpstreamConflictReportsError(t *testing.T) {
 	dir := localRelaySource(t, "  - { id: upstream-x, public: m }\n")

@@ -224,6 +224,40 @@ func TestLoadRejectsUncompilableAPIPattern(t *testing.T) {
 	requireLocatedError(t, path, err, "api_pattern", "正则")
 }
 
+// TestPlanExpiresAt 守护计划到期时刻是带时区的绝对时刻，且能被解析读出。
+func TestPlanExpiresAt(t *testing.T) {
+	content := minimalProfile + `plans:
+  - id: trial
+    expires_at: 2026-10-03T00:00:00Z
+    limits:
+      - kind: quota
+        metric: usd
+        window: 5h
+        limit: 10
+`
+	path := writeProfile(t, content)
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("带 expires_at 的计划应通过，实际失败：%v", err)
+	}
+	if got := loaded.Plans[0].ExpiresAt; got != "2026-10-03T00:00:00Z" {
+		t.Errorf("expires_at = %q，期望原样保留", got)
+	}
+
+	bad := minimalProfile + `plans:
+  - id: trial
+    expires_at: 明天
+    limits:
+      - kind: quota
+        metric: usd
+        window: 5h
+        limit: 10
+`
+	badPath := writeProfile(t, bad)
+	_, err = Load(badPath)
+	requireLocatedError(t, badPath, err, "expires_at", "RFC3339")
+}
+
 // TestSchemasCompile 守护三份嵌入 schema 本身可编译：它们随代码进版本历史，
 // 手改一处 typo 应在测试期就暴露，而不是等到加载档案时。
 func TestSchemasCompile(t *testing.T) {

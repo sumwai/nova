@@ -13,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -103,9 +104,15 @@ type Usage struct {
 
 // Plan 是一条计划形态：付费信息与静态限制。
 type Plan struct {
-	ID     string  `yaml:"id"`
-	Paid   *Paid   `yaml:"paid"`
-	Limits []Limit `yaml:"limits"`
+	ID   string `yaml:"id"`
+	Paid *Paid  `yaml:"paid"`
+	// ExpiresAt 是计划到期时刻（RFC3339，带时区）；空表示不过期。
+	//
+	// 它是额度文档的 expires_at 在静态声明侧的来源：计划到期后该账号的额度条目
+	// 一律不可用，直到换一份带新到期时刻的档案。订阅制平台的周期结束、试用期结束
+	// 都属于这一类，不需要等探测落地。
+	ExpiresAt string  `yaml:"expires_at"`
+	Limits    []Limit `yaml:"limits"`
 }
 
 // Paid 只作展示与顺序表达，不参与跨账号自动比价。
@@ -233,6 +240,15 @@ func (p *Profile) checkSemantics(path string, root *yaml.Node) *Error {
 				where := append(append([]string{}, base...), "endpoints", strconv.Itoa(j))
 				return pathAtNode(path, root, where, "模型 %q 引用了不存在的端点 %q", model.ID, name)
 			}
+		}
+	}
+	for i, plan := range p.Plans {
+		if plan.ExpiresAt == "" {
+			continue
+		}
+		if _, err := time.Parse(time.RFC3339, plan.ExpiresAt); err != nil {
+			return pathAtNode(path, root, []string{"plans", strconv.Itoa(i), "expires_at"},
+				"计划 %s 的 expires_at 不是合法的 RFC3339 时刻：%v", plan.ID, err)
 		}
 	}
 	return nil

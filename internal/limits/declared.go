@@ -21,12 +21,19 @@ type Declared struct {
 	Unbounded bool
 	Assumed   bool
 	Pool      string
+	// ExpiresAt 是这份声明所属额度文档的到期时刻（RFC3339，带时区）；空表示不过期。
+	//
+	// 它是文档级字段，这里随每条声明携带一份：中性声明的载体是 config.Account.Limits，
+	// 而账号与文档一一对应，逐条携带与另开一个字段承载在装配层是同一件事，
+	// 后者的代价是 config.Account 多一个与 limits 平行的字段。
+	ExpiresAt string
 }
 
 // FromDoc 把一份额度文档的账号级条目转换成中性声明列表。
 //
 // 只取 Account 段：档案计划里写下的静态限制是账号级事实，模型级条目由探测或观测带入，
 // 不在档案声明这一层表达。数值字段复制一份，避免调用方之间共享同一批指针。
+// 文档级的 expires_at 随每条声明复制一份，还原时再由 DeclaredDoc 取回。
 func FromDoc(doc *profile.LimitsDoc) []Declared {
 	if doc == nil || len(doc.Account) == 0 {
 		return nil
@@ -46,6 +53,7 @@ func FromDoc(doc *profile.LimitsDoc) []Declared {
 			Unbounded: limit.Unbounded,
 			Assumed:   limit.Assumed,
 			Pool:      limit.Pool,
+			ExpiresAt: doc.ExpiresAt,
 		})
 	}
 	return out
@@ -61,6 +69,9 @@ func DeclaredDoc(declared []Declared) *profile.LimitsDoc {
 	}
 	doc := &profile.LimitsDoc{Schema: profile.CurrentSchema, Source: "profile"}
 	for _, item := range declared {
+		if doc.ExpiresAt == "" {
+			doc.ExpiresAt = item.ExpiresAt
+		}
 		doc.Account = append(doc.Account, profile.Limit{
 			Kind:      item.Kind,
 			Metric:    item.Metric,

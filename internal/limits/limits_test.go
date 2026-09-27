@@ -315,6 +315,36 @@ func TestNaturalWindowBoundaries(t *testing.T) {
 	}
 }
 
+// TestExpiredDeclaredDocIsUnavailable 守护到期的静态声明被剔除。
+//
+// expires_at 来自档案计划的到期时刻；未接上时该分支永远不可达，
+// 到期的计划会继续被选中。
+func TestExpiredDeclaredDocIsUnavailable(t *testing.T) {
+	clock := newTestClock()
+
+	expired := declaredDoc([]profile.Limit{accountQuota("5h", 70, 0)})
+	expired.ExpiresAt = clock.Now().Add(-time.Hour).Format(time.RFC3339)
+	table := newTable(clock, Options{})
+	if err := table.MergeDeclared(expired); err != nil {
+		t.Fatalf("合并声明失败：%v", err)
+	}
+	ok, reason := table.Available(accountsScope(), "", clock.Now())
+	if ok || reason.Verdict != VerdictExpired {
+		t.Fatalf("已到期的计划应不可用，ok=%v reason=%+v", ok, reason)
+	}
+
+	// 同一份限制，到期时刻在未来：额度充足时应可用。
+	future := declaredDoc([]profile.Limit{accountQuota("5h", 70, 0)})
+	future.ExpiresAt = clock.Now().Add(time.Hour).Format(time.RFC3339)
+	later := newTable(clock, Options{})
+	if err := later.MergeDeclared(future); err != nil {
+		t.Fatalf("合并声明失败：%v", err)
+	}
+	if ok, reason := later.Available(accountsScope(), "", clock.Now()); !ok {
+		t.Fatalf("未到期的计划应可用，reason=%+v", reason)
+	}
+}
+
 func TestParseWindowForms(t *testing.T) {
 	duration, err := parseWindow("5h", "", "")
 	if err != nil || duration.kind != windowDuration || duration.length != 5*time.Hour {

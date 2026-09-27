@@ -84,3 +84,27 @@ func TestFromDocEmpty(t *testing.T) {
 		t.Errorf("空声明应返回 nil 文档，实际 %+v", got)
 	}
 }
+
+// TestDeclaredCarriesExpiresAt 守护文档级 expires_at 往返不丢。
+//
+// 它是「计划到期」在静态声明侧的载体，丢了会让到期的计划在装配后不再被剔除。
+func TestDeclaredCarriesExpiresAt(t *testing.T) {
+	doc := &profile.LimitsDoc{
+		Schema:    profile.CurrentSchema,
+		ExpiresAt: "2026-10-03T00:00:00Z",
+		Account: []profile.Limit{
+			{Kind: "quota", Metric: "usd", Window: "5h", Limit: ptr(10)},
+			{Kind: "quota", Metric: "requests", Window: "5h", Limit: ptr(100)},
+		},
+	}
+
+	declared := FromDoc(doc)
+	for i, item := range declared {
+		if item.ExpiresAt != doc.ExpiresAt {
+			t.Errorf("第 %d 条声明的 expires_at = %q，期望 %q", i+1, item.ExpiresAt, doc.ExpiresAt)
+		}
+	}
+	if back := DeclaredDoc(declared); back.ExpiresAt != doc.ExpiresAt {
+		t.Errorf("还原后的 expires_at = %q，期望 %q", back.ExpiresAt, doc.ExpiresAt)
+	}
+}
