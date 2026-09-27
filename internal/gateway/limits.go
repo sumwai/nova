@@ -22,6 +22,14 @@ import (
 // 同码失败且期间无成功才升级为窗口耗尽。它可经 AssembleOptions 覆盖，不是写死的常量。
 const defaultLimitFailureThreshold = 5
 
+// defaultLimitFailureWindow 是自适应规则里「连续」的时间上界：同一账号的失败计数
+// 只在这个窗口内累加。
+//
+// 没有这个上界时，几小时内零星出现的同码失败会攒够 N 次并升级为窗口耗尽，而它们
+// 并不是「连续」失败。窗口只约束累加，不限制升级后标记的存活时长（那由 until 与
+// 保守上限决定）。
+const defaultLimitFailureWindow = 10 * time.Minute
+
 // limitRuntime 把逐账号的额度表接到转发路径上。
 //
 // 每个（渠道，账号）一张表：额度作用域是账号级事实，渠道内多个账号各有各的剩余量。
@@ -36,15 +44,19 @@ type limitRuntime struct {
 
 	mu       sync.Mutex
 	failures map[string]failureState // 账号标识 → 连续失败状态
+	// now 取当前时刻，供失败计数窗口与不可用标记的 until 使用。
+	// 注入让「连续」的时间上界能在测试里定死，而不依赖真实等待。
+	now func() time.Time
 	// warned 记录已输出过的观测拒绝提醒，键是账号与缺失键的组合。
 	// 同一份档案会对每个请求产出同一组被拒绝的键；逐请求重复输出只会刷屏。
 	warned map[string]bool
 }
 
-// failureState 记录一个账号上连续同码失败的码与次数。
+// failureState 记录一个账号上连续同码失败的码、次数与最近一次失败时刻。
 type failureState struct {
-	code  string
-	count int
+	code      string
+	count     int
+	lastError time.Time
 }
 
 // newLimitRuntime 按配置里的渠道与账号建额度表，并把档案写入的声明合并进去。
@@ -61,6 +73,7 @@ func newLimitRuntime(providers []config.Provider, stateDir string, threshold int
 		log:       log,
 		prices:    prices,
 		failures:  make(map[string]failureState),
+		now:       time.Now,
 		warned:    make(map[string]bool),
 	}
 	for i := range providers {
@@ -177,7 +190,7 @@ func (rt *limitRuntime) availability(provider, ref, model string) availability {
 	if table == nil {
 		return availability{ok: true, reason: limits.Reason{Verdict: limits.VerdictOK}}
 	}
-	ok, reason := table.Available(limits.Scope{Account: scopeName(provider, ref)}, model, time.Now())
+	ok, reason := table.Available(limits.Scope{Account: scopeName(provider, ref)}, model, rt.now())
 	return availability{ok: ok, reason: reason}
 }
 
@@ -227,13 +240,13 @@ func (rt *limitRuntime) Reserve(route domain.Route, model string, est pipeline.C
 		return nil, true
 	}
 	scope := rt.scopeOf(route)
-	release, ok := table.Reserve(scope, model, rt.estimate(route, est), time.Now())
+	release, ok := table.Reserve(scope, model, rt.estimate(route, est), rt.now())
 	if !ok {
 		return nil, false
 	}
 	return func(actual domain.Usage, err error) {
 		if err == nil {
-			table.Consume(scope, model, rt.usageForLimits(route, actual), time.Now())
+			table.Consume(scope, model, rt.usageForLimits(route, actual), rt.now())
 		}
 		release()
 	}, true
@@ -289,9 +302,9 @@ func (rt *limitRuntime) LearnExhausted(route domain.Route, model string, err err
 	}
 	// until 取「保守上限」与「上游 Retry-After」的较小值：直接采信上游头会让一条
 	// 写坏的（或恶意的）Retry-After 把渠道停用任意长，而任何标记都不得无期限。
-	until := time.Now().Add(table.DefaultBlockCap())
+	until := rt.now().Add(table.DefaultBlockCap())
 	if delay, ok := retryAfter(err); ok && delay > 0 {
-		if hinted := time.Now().Add(delay); hinted.Before(until) {
+		if hinted := rt.now().Add(delay); hinted.Before(until) {
 			until = hinted
 		}
 	}
@@ -299,21 +312,32 @@ func (rt *limitRuntime) LearnExhausted(route domain.Route, model string, err err
 }
 
 // recordFailure 累计一次同码失败，返回是否已达到升级阈值。
+//
+// 计数只在 defaultLimitFailureWindow 内累加：超过窗口的旧失败不再算「连续」。
+// 达到阈值时计数被清掉——标记已经写下，下一次要重新攒够 threshold 次连续失败，
+// 否则计数会无上界增长，且窗口一过就会用旧计数立即重写标记。
 func (rt *limitRuntime) recordFailure(account string, err error) bool {
 	code := ""
 	if domainErr := domain.AsError(err); domainErr != nil {
 		code = string(domainErr.Code)
 	}
+	now := rt.now()
+
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	state := rt.failures[account]
-	if state.code == code {
-		state.count++
+	if state.code != code || now.Sub(state.lastError) > defaultLimitFailureWindow {
+		state = failureState{code: code, count: 1, lastError: now}
 	} else {
-		state = failureState{code: code, count: 1}
+		state.count++
+		state.lastError = now
+	}
+	if state.count >= rt.threshold {
+		delete(rt.failures, account)
+		return true
 	}
 	rt.failures[account] = state
-	return state.count >= rt.threshold
+	return false
 }
 
 // resetFailures 清掉一个账号的连续失败状态。

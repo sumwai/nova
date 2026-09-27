@@ -124,6 +124,79 @@ func TestAdaptiveEscalationNeedsThreshold(t *testing.T) {
 	}
 }
 
+// TestAdaptiveFailureWindowBoundsConsecutive 守护失败计数只在窗口内累加。
+//
+// 跨过窗口的旧失败不再算「连续」：否则几小时内零星出现的同码失败会攒够 N 次
+// 并升级为窗口耗尽，而那并不是连续失败。
+func TestAdaptiveFailureWindowBoundsConsecutive(t *testing.T) {
+	cfg := limitedConfig()
+	runtime, err := newLimitRuntime(cfg.Providers, "", 3, nil, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	at := time.Now()
+	runtime.now = func() time.Time { return at }
+	route := domain.Route{Provider: "relay"}
+
+	runtime.LearnExhausted(route, "shared", quotaErr())
+	runtime.LearnExhausted(route, "shared", quotaErr())
+
+	// 跨过窗口后再失败一次：前两次不再算连续，计数从 1 重新开始，未达阈值。
+	at = at.Add(defaultLimitFailureWindow + time.Minute)
+	runtime.LearnExhausted(route, "shared", quotaErr())
+	if !runtime.available("relay", "", "shared") {
+		t.Fatal("超过窗口的旧失败不应计入连续次数")
+	}
+
+	// 窗口内再攒两次达到阈值 3。
+	at = at.Add(time.Minute)
+	runtime.LearnExhausted(route, "shared", quotaErr())
+	at = at.Add(time.Minute)
+	runtime.LearnExhausted(route, "shared", quotaErr())
+	if runtime.available("relay", "", "shared") {
+		t.Fatal("窗口内连续三次同码失败应标记不可用")
+	}
+}
+
+// TestAdaptiveDifferentCodeRestartsCount 守护错误码变化时计数重新起算。
+func TestAdaptiveDifferentCodeRestartsCount(t *testing.T) {
+	cfg := limitedConfig()
+	runtime, err := newLimitRuntime(cfg.Providers, "", 3, nil, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	at := time.Now()
+	runtime.now = func() time.Time { return at }
+	route := domain.Route{Provider: "relay"}
+
+	runtime.LearnExhausted(route, "shared", quotaErr())
+	runtime.LearnExhausted(route, "shared", domain.NewError(domain.CodeUpstreamRateLimited, "限流"))
+	runtime.LearnExhausted(route, "shared", quotaErr())
+	if !runtime.available("relay", "", "shared") {
+		t.Fatal("错误码交替出现时不应累加成连续同码失败")
+	}
+}
+
+// TestAdaptiveEscalationClearsCounter 守护升级写标记后计数归零。
+//
+// 不归零时计数会无上界增长，且窗口一过就会用旧计数立即重写标记。
+func TestAdaptiveEscalationClearsCounter(t *testing.T) {
+	cfg := limitedConfig()
+	runtime, err := newLimitRuntime(cfg.Providers, "", 2, nil, nil)
+	if err != nil {
+		t.Fatalf("建额度表失败：%v", err)
+	}
+	at := time.Now()
+	runtime.now = func() time.Time { return at }
+	route := domain.Route{Provider: "relay"}
+
+	runtime.LearnExhausted(route, "shared", quotaErr())
+	runtime.LearnExhausted(route, "shared", quotaErr())
+	if state, ok := runtime.failures["relay"]; ok {
+		t.Fatalf("升级后应清掉失败计数，实际留下 %+v", state)
+	}
+}
+
 // TestSuccessResetsAdaptiveState 守护「出现成功立即降级并 Clear」。
 func TestSuccessResetsAdaptiveState(t *testing.T) {
 	cfg := limitedConfig()
