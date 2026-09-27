@@ -340,6 +340,38 @@ func TestResolveRejectsSerialRollback(t *testing.T) {
 	})
 }
 
+// TestUpToDateMarksNoChangeOutcomes 守护「无需重载」的两种情况被标记出来。
+//
+// 自动刷新按这个标记区分「远端没有更新的东西」与「刷新真失败」：前者不重载、
+// 不计失败，后者才需要记一条并保留旧快照。
+func TestUpToDateMarksNoChangeOutcomes(t *testing.T) {
+	key := newTestKey(t, "main")
+	fixture := newFixture()
+	server := httptest.NewTLSServer(fixture)
+	defer server.Close()
+
+	syncer := &Syncer{StateDir: t.TempDir(), Client: server.Client()}
+	src := Source{Kind: SourceRemote, URL: server.URL, Keys: []PublicKey{key.public()}}
+	publish(t, fixture, key, 3, futureTime, []fixtureProfile{
+		{id: "sample", path: "providers/sample.yaml", data: sampleProfile("sample")},
+	})
+	if _, _, err := syncer.Resolve(context.Background(), src); err != nil {
+		t.Fatalf("首次同步应成功：%v", err)
+	}
+
+	_, _, err := syncer.Resolve(context.Background(), src)
+	if err == nil || !UpToDate(err) {
+		t.Fatalf("同 serial 应标记为无需重载，实际 %v", err)
+	}
+
+	// 真正的失败（验签过不了）不得被标记为无需重载。
+	unsigned := src
+	unsigned.Keys = nil
+	if _, _, err := syncer.Resolve(context.Background(), unsigned); err == nil || UpToDate(err) {
+		t.Fatalf("验签失败不应标记为无需重载，实际 %v", err)
+	}
+}
+
 func TestResolveRejectsExpiredIndexKeepsInstalled(t *testing.T) {
 	key := newTestKey(t, "main")
 	fixture := newFixture()

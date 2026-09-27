@@ -83,8 +83,8 @@ type Profiles struct {
 
 	// Refresh 是远端源的刷新周期，缺省 24h，只接受正时长。
 	//
-	// 当前只做到解析与校验：nova profiles update 是显式拉取，list 也不看它，
-	// 因此这个取值暂时没有消费者。
+	// 进程运行期间按它周期性地拉取远端源；启动后立即先做一次，不阻塞启动，
+	// 拿到更新的快照后再重载。`nova profiles update` 仍是显式拉取的入口。
 	Refresh time.Duration
 }
 

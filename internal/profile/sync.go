@@ -234,7 +234,7 @@ func (s *Syncer) resolveRemote(ctx context.Context, src Source) (*Snapshot, []Wa
 		return nil, nil, stateErr
 	}
 	if seen := state.Sources[key].Serial; index.Serial <= seen {
-		return nil, nil, &Error{Msg: fmt.Sprintf(
+		return nil, nil, &Error{upToDate: true, Msg: fmt.Sprintf(
 			"源 %s 的索引 serial %d 不大于已见的最大值 %d，拒绝回滚", key, index.Serial, seen)}
 	}
 
@@ -247,7 +247,7 @@ func (s *Syncer) resolveRemote(ctx context.Context, src Source) (*Snapshot, []Wa
 	if !time.Now().Before(notAfter) {
 		warning := Warning{Source: key, Msg: fmt.Sprintf(
 			"索引 not_after %s 已过，本次更新被拒；已装快照保持可用", index.NotAfter)}
-		return nil, []Warning{warning}, &Error{Msg: fmt.Sprintf(
+		return nil, []Warning{warning}, &Error{upToDate: true, Msg: fmt.Sprintf(
 			"源 %s 的索引 not_after %s 已过，本次更新被拒（源并非不可用，已装快照继续生效）",
 			key, index.NotAfter)}
 	}

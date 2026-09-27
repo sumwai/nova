@@ -1,6 +1,7 @@
 package profile
 
 import (
+	"errors"
 	"fmt"
 
 	"gopkg.in/yaml.v3"
@@ -19,6 +20,21 @@ type Error struct {
 	Line int
 	Col  int
 	Msg  string
+
+	// upToDate 表示这次「失败」其实是「远端索引不比已装的新」。
+	//
+	// 它默认不对外表现：报告与退出码仍按错误处理（使用者要知道本次更新被拒）；
+	// 只有自动刷新这类以「要不要重载」为目的的调用方会用它区分「无需重载」与「真失败」。
+	upToDate bool
+}
+
+// UpToDate 报告错误是否表示「源已是最新、无需重载」。
+func UpToDate(err error) bool {
+	var located *Error
+	if errors.As(err, &located) {
+		return located.upToDate
+	}
+	return false
 }
 
 // Error 按「有多少位置信息就说多少」排版，位置在前、消息在后，用冒号分隔，

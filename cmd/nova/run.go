@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/gateway"
+	"github.com/sumwai/nova/internal/profile"
 	"github.com/sumwai/nova/internal/profileapply"
 )
 
@@ -71,6 +73,9 @@ func newRunCmd() *cobra.Command {
 						Getenv:    os.Getenv,
 					})
 				},
+				RefreshProfiles: func(ctx context.Context, cfg *config.Config) (bool, error) {
+					return refreshProfileSources(ctx, cfg, stateDir, cmd.ErrOrStderr())
+				},
 			})
 		},
 	}
@@ -78,8 +83,7 @@ func newRunCmd() *cobra.Command {
 	return cmd
 }
 
-// notifyShutdown 把 INT 与 TERM 转成 ctx 的取消，并就地报出收到的是哪个信号。
-//
+// notifyShutdown 把 INT 与 TERM 转成 ctx 的取消，并就地报出收到的是哪个信号。//
 // 不用 signal.NotifyContext：它取消 ctx 时会丢掉信号身份，于是日志里只会留下
 // 一句「context canceled」，而「是被 INT 打断还是被 systemd 的 TERM 停下」
 // 正是排查「服务为什么退出」时首先要分清的一件事。
@@ -178,4 +182,46 @@ func defaultConfigPath() (string, error) {
 		return "", fmt.Errorf("无法确定用户配置目录（%w）；请用 -c 指定配置文件路径", err)
 	}
 	return filepath.Join(dir, "nova", "Novafile"), nil
+}
+
+// refreshProfileSources 同步配置里的远端档案源，返回是否有新快照装上。
+//
+// 只处理远端源：builtin 随二进制发布，本地源就在磁盘上，两者都没有可拉取的东西。
+// 「远端索引不比已装的新」与「not_after 已过」都归入「无需重载」，不算失败：
+// 它们不是刷新出了问题，而是没有要装的东西。
+// 单源失败不中断其余源，最后以汇总错误返回；失败只让本次同步算失败，
+// 已装快照与正在服务的装配都不受影响。
+func refreshProfileSources(ctx context.Context, cfg *config.Config, stateDir string, out io.Writer) (bool, error) {
+	syncer := &profile.Syncer{StateDir: stateDir}
+	changed := false
+	failed := 0
+	var firstErr error
+
+	for _, src := range profileapply.ToSources(cfg.Profiles.Sources) {
+		if src.Kind != profile.SourceRemote {
+			continue
+		}
+		_, warnings, err := syncer.Resolve(ctx, src)
+		for _, warning := range warnings {
+			_, _ = fmt.Fprintf(out, "提醒 %s\n", warning.String())
+		}
+		switch {
+		case err == nil:
+			// Resolve 在远端源上只有装上更好的快照才返回 nil。
+			changed = true
+		case profile.UpToDate(err):
+			// 远端没有比已装更新的东西，无需重载。
+		default:
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			_, _ = fmt.Fprintf(out, "失败 %s：%v\n", sourceAddress(src), err)
+		}
+	}
+
+	if failed > 0 {
+		return changed, fmt.Errorf("%d 个档案源刷新失败：%w", failed, firstErr)
+	}
+	return changed, nil
 }

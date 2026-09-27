@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sumwai/nova/internal/config"
@@ -52,6 +53,13 @@ type Options struct {
 	// gateway 本身不认识档案：展开要读状态目录、要碰档案源，那是调用方的知识。
 	// 以函数注入，让同一段服务逻辑既能被真实展开驱动，也能被测试直接调用。
 	PrepareConfig func(*config.Config) error
+
+	// RefreshProfiles 在 refresh 周期到达时被调用，用来同步远端档案源；返回真
+	// 表示拿到的快照有变，需要重载。为 nil 时不做自动刷新。
+	//
+	// 同步本身不属于 gateway：它要碰网络与档案包。这里只约定「什么时候做、
+	// 做完要不要重载」，具体的拉取、验签与安装留在调用方。
+	RefreshProfiles func(ctx context.Context, cfg *config.Config) (bool, error)
 }
 
 // Run 装配配置并开始服务，直到 ctx 结束或某个监听器失败。
@@ -89,11 +97,16 @@ func Run(ctx context.Context, opt Options) error {
 		out:                   opt.LogOutput,
 		stats:                 store,
 		prepare:               opt.PrepareConfig,
+		refreshProfiles:       opt.RefreshProfiles,
+		configPath:            opt.ConfigPath,
 		stateDir:              opt.StateDir,
 		limitFailureThreshold: opt.LimitFailureThreshold,
 	}
 	reportWarnings(first.Logger, cfg)
 	first.Logger.startup(cfg, first.Stats, false)
+	if s.refreshProfiles != nil && cfg.Profiles.Refresh > 0 {
+		go s.refreshLoop(ctx, cfg.Profiles.Refresh)
+	}
 	serveErr := s.serve(ctx)
 	// 退出前关掉当前装配：额度层把本地累计与学习到的标记落在快照里，
 	// 不 Close 就会丢掉最后一个 FlushInterval 窗口内的状态。
@@ -114,11 +127,18 @@ func Run(ctx context.Context, opt Options) error {
 type server struct {
 	holder *Holder
 	out    io.Writer
+	// reloadMu 串行化 reload：管理端点的显式重载与自动刷新都会走到这里，
+	// 两个并发重载会重复关闭/装配同一份状态。
+	reloadMu sync.Mutex
 	// stats 是进程级统计存储，跨 reload 复用；每次装配共用它，因此累计不会因换配置归零。
 	stats *stats.Store
 	// prepare 是启动时注入的配置展开钩子，reload 复用同一份，
 	// 因此热重载与启动对同一份配置的理解一致。
 	prepare func(*config.Config) error
+	// refreshProfiles 是远端档案源的同步钩子；nil 表示不自动刷新。
+	refreshProfiles func(ctx context.Context, cfg *config.Config) (bool, error)
+	// configPath 是本次运行读的配置文件路径，自动刷新后的重载沿用它。
+	configPath string
 	// stateDir 与 limitFailureThreshold 是装配期额度层的依赖，reload 复用同一份。
 	stateDir              string
 	limitFailureThreshold int
@@ -218,6 +238,9 @@ func shutdownAll(servers ...*http.Server) error {
 // ctx 用于装配期的模型发现：启动与重载都把各自的 context 传下去，
 // 重载路径上客户端断开即取消这次发现。
 func (s *server) reload(ctx context.Context, path string) error {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -259,6 +282,44 @@ func (s *server) reload(ctx context.Context, path string) error {
 		assembled.Logger.failure("旧装配释放失败", err)
 	}
 	return nil
+}
+
+// refreshLoop 按 refresh 周期同步远端档案源，有变更就重载。
+//
+// 启动后立即做一次：进程可能已停了很久，磁盘上的快照未必还新；启动本身不被它阻塞，
+// 先在已装快照上服务，拿到新快照后再换入。任何一次同步或重载失败都只记一条，
+// 不影响正在服务的装配。
+func (s *server) refreshLoop(ctx context.Context, interval time.Duration) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.refreshOnce(ctx)
+			timer.Reset(interval)
+		}
+	}
+}
+
+// refreshOnce 做一次同步与必要的重载。
+func (s *server) refreshOnce(ctx context.Context) {
+	current := s.holder.Current()
+	if current == nil {
+		return
+	}
+	changed, err := s.refreshProfiles(ctx, current.Config)
+	if err != nil {
+		current.Logger.failure("档案源自动刷新失败", err)
+	}
+	if !changed {
+		return
+	}
+	if err := s.reload(ctx, s.configPath); err != nil {
+		current.Logger.failure("档案源更新后重载失败", err)
+	}
 }
 
 // prepareConfig 调用非空的展开钩子。
