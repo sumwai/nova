@@ -7,6 +7,7 @@ import (
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/domain"
+	"github.com/sumwai/nova/internal/limits"
 	"github.com/sumwai/nova/internal/price"
 )
 
@@ -271,6 +272,90 @@ func freeProvider(name, model string) config.Provider {
 	provider := routeProvider(name, model)
 	provider.Endpoints[0].Models[0].Price = price.Declared{Key: "p/" + name, Free: true, Currency: "USD"}
 	return provider
+}
+
+// poolProvider 造一条声明了计划额度的渠道，即 prefer price 里的「池类」。
+func poolProvider(name, model, currency string, rate float64) config.Provider {
+	provider := pricedProvider(name, model, currency, rate)
+	provider.Accounts[0].Limits = []limits.Declared{{
+		Kind:   "quota",
+		Metric: "requests",
+		Window: "1m",
+		Limit:  floatPtr(100),
+	}}
+	return provider
+}
+
+// TestPreferPriceKeepsPoolAheadOfCheaperPayg 守护池类按声明顺序在前，不按单价。
+//
+// 设计第七节：`price` 是「先花已付费的，再按单价挑按量」。池类若按单价排，
+// 一条贵的订阅渠道会排到便宜很多的按量渠道之后，与「先花已付费的」相反。
+func TestPreferPriceKeepsPoolAheadOfCheaperPayg(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		poolProvider("pool", "m", "USD", 100),
+		pricedProvider("cheap", "m", "USD", 1),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern: "m",
+		Prefer:  config.PreferPrice,
+		Candidates: []config.RouteCandidate{
+			{Provider: "pool", Weight: 1},
+			{Provider: "cheap", Weight: 1},
+		},
+	}}
+
+	resolver, _ := routeResolver(t, cfg)
+	if got := providerOrder(candidatesOf(t, resolver, "m")); !equalStrings(got, []string{"pool", "cheap"}) {
+		t.Errorf("price 顺序 = %v，期望池类 pool 在按量 cheap 之前", got)
+	}
+}
+
+// TestPreferPricePoolKeepsDeclarationOrder 守护多个池类之间保持声明顺序。
+func TestPreferPricePoolKeepsDeclarationOrder(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		poolProvider("p2", "m", "USD", 50),
+		poolProvider("p1", "m", "USD", 1),
+		pricedProvider("payg", "m", "USD", 0.1),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern: "m",
+		Prefer:  config.PreferPrice,
+		Candidates: []config.RouteCandidate{
+			{Provider: "p2", Weight: 1},
+			{Provider: "p1", Weight: 1},
+			{Provider: "payg", Weight: 1},
+		},
+	}}
+
+	resolver, _ := routeResolver(t, cfg)
+	if got := providerOrder(candidatesOf(t, resolver, "m")); !equalStrings(got, []string{"p2", "p1", "payg"}) {
+		t.Errorf("price 顺序 = %v，期望池类按声明顺序 p2 p1，按量 payg 在后", got)
+	}
+}
+
+// TestPreferPricePoolSkipsNominalWarning 守护池类不因价格未知而被报「名义价参与排序」。
+//
+// 池类不按单价排序，那条提醒对它不成立；报了会让人以为顺序来自名义价。
+func TestPreferPricePoolSkipsNominalWarning(t *testing.T) {
+	cfg := &config.Config{Providers: []config.Provider{
+		poolProvider("pool", "m", "", 0),
+		pricedProvider("cheap", "m", "USD", 1),
+	}}
+	cfg.ModelRoutes = []config.ModelRoute{{
+		Pattern: "m",
+		Prefer:  config.PreferPrice,
+		Candidates: []config.RouteCandidate{
+			{Provider: "pool", Weight: 1},
+			{Provider: "cheap", Weight: 1},
+		},
+	}}
+
+	_, warnings := routeResolver(t, cfg)
+	for _, warning := range warnings {
+		if strings.Contains(warning.Msg, "名义价") {
+			t.Errorf("提醒 = %q，池类不应产生名义价提醒", warning.Msg)
+		}
+	}
 }
 
 // TestPreferOrderIgnoresPrices 守护 order 不受价格影响：即使带上单价，顺序仍是声明顺序。

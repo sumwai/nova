@@ -187,10 +187,21 @@ func routesByModel(endpoints []effectiveEndpoint) map[string][]endpointRoute {
 					Headers:               item.provider.Headers,
 					PriceKey:              priceKey,
 				},
+				pool: providerHasPlans(item.provider),
 			})
 		}
 	}
 	return table
+}
+
+// providerHasPlans 报告一条渠道是否声明了计划额度（账号级 limits 非空）。
+func providerHasPlans(provider *config.Provider) bool {
+	for i := range provider.Accounts {
+		if len(provider.Accounts[i].Limits) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // modelEntries 由生效端点集合构造对外目录，按首次出现的顺序去重。
@@ -331,6 +342,12 @@ type modelRouteResolver struct {
 // 渠道名不再单独存一份，由嵌入的 Route.Provider 承载：存两份会随时间漂移。
 type endpointRoute struct {
 	domain.Route
+	// pool 表示这条候选所属渠道声明了计划额度（账号级 limits 非空）。
+	//
+	// 它只服务 prefer price 的分段：设计第七节把「池类」与「免费」一起放在声明顺序段，
+	// 不按单价排序。耗尽与否不在这里判定：不可用的账号已在选路前被剔除，
+	// 能走到排序的候选都已经过额度闸门。
+	pool bool
 }
 
 // accountPool 是一个渠道的账号池及其轮转状态。
@@ -553,8 +570,11 @@ type candidateGroup struct {
 // sortCandidateGroups 按规则的 prefer 重排候选组。
 //
 // order（含未写 prefer）原样返回：这就是声明顺序，与 prefer 引入之前逐字一致。
-// price 先按免费在前，再把其余组按币种分组、组内按估计成本升序。不同币种只分组、
+// price 先按免费与池类在前，再把其余组按币种分组、组内按估计成本升序。不同币种只分组、
 // 不互相比较；组内用稳定排序，同价与同币种内沿用声明顺序。
+//
+// 池类（声明了计划额度的渠道）与免费一样不按单价排：设计第七节把「先花已付费的」
+// 放在声明顺序段，池与池之间、池与免费之间的相对顺序由书写顺序表达，不交给自动求值。
 func sortCandidateGroups(groups []candidateGroup, rule *config.ModelRoute, prices *price.Table) []candidateGroup {
 	if !rule.PreferPrice() || prices == nil || len(groups) < 2 {
 		return groups
@@ -568,7 +588,7 @@ func sortCandidateGroups(groups []candidateGroup, rule *config.ModelRoute, price
 	out := make([]candidateGroup, 0, len(groups))
 	priced := make([]int, 0, len(groups))
 	for i, cost := range costs {
-		if cost.free {
+		if cost.free || cost.pool {
 			out = append(out, groups[i])
 			continue
 		}
@@ -603,6 +623,7 @@ func sortCandidateGroups(groups []candidateGroup, rule *config.ModelRoute, price
 // priceCost 是一条候选组在排序口径下的价格事实。
 type priceCost struct {
 	free     bool
+	pool     bool
 	currency string
 	estimate float64
 }
@@ -618,6 +639,7 @@ func groupCost(table *price.Table, usage price.Usage, routes []endpointRoute) pr
 	entry := table.Lookup(routes[0].PriceKey)
 	return priceCost{
 		free:     entry.Kind == price.Free,
+		pool:     routes[0].pool,
 		currency: entry.Unit.Currency,
 		estimate: price.Estimate(entry, usage),
 	}
@@ -643,6 +665,10 @@ func assumedPriceWarnings(
 				continue
 			}
 			route := group.routes[0]
+			// 池类不按单价排序，因此「用名义价参与排序」对它不成立。
+			if route.pool {
+				continue
+			}
 			if seen[route.Provider] {
 				continue
 			}
