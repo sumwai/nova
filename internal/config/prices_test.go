@@ -30,6 +30,21 @@ func TestPricesDefaultsWhenBlockOmitted(t *testing.T) {
 	if cfg.Prices.Path != "" || cfg.Prices.PathDeclared {
 		t.Errorf("缺省价格文件 = %+v，期望无文件", cfg.Prices)
 	}
+	if cfg.Prices.NominalDeclared {
+		t.Errorf("缺省不应有名义价 = %+v", cfg.Prices)
+	}
+}
+
+// TestParsePricesNominal 守护名义价的两个分量被解析，且未写时不填缺省。
+func TestParsePricesNominal(t *testing.T) {
+	cfg := mustParse(t, "version 1\nprices {\n    currency CNY\n    nominal 1.5 4\n}\n")
+
+	if !cfg.Prices.NominalDeclared {
+		t.Fatal("写了 nominal 应标记 NominalDeclared")
+	}
+	if cfg.Prices.NominalInputMTok != 1.5 || cfg.Prices.NominalOutputMTok != 4 {
+		t.Errorf("名义价 = %v/%v，期望 1.5/4", cfg.Prices.NominalInputMTok, cfg.Prices.NominalOutputMTok)
+	}
 }
 
 // 只写 currency 时不带文件，配置仍然合法。
@@ -70,6 +85,26 @@ func TestPricesErrors(t *testing.T) {
 			wantMsg: []string{"file", "不能写两次"},
 		},
 		{
+			name:    "nominal 只给一个取值",
+			src:     "prices {\n    nominal 1.5\n}\n",
+			wantMsg: []string{"两个取值"},
+		},
+		{
+			name:    "nominal 取值不是数字",
+			src:     "prices {\n    nominal 1.5 abc\n}\n",
+			wantMsg: []string{"非负数字"},
+		},
+		{
+			name:    "nominal 取值为负数",
+			src:     "prices {\n    nominal -1 2\n}\n",
+			wantMsg: []string{"非负数字"},
+		},
+		{
+			name:    "nominal 写两次",
+			src:     "prices {\n    nominal 1 2\n    nominal 3 4\n}\n",
+			wantMsg: []string{"nominal", "不能写两次"},
+		},
+		{
 			name:    "币种含空白",
 			src:     "prices {\n    currency \"US D\"\n}\n",
 			wantMsg: []string{"不能含空白"},
@@ -105,7 +140,7 @@ func TestPricesErrors(t *testing.T) {
 // prices / currency / file 都在指令清单里：二进制自己回答「认哪些写法」。
 func TestPricesListedAsInstructions(t *testing.T) {
 	names := InstructionNames()
-	for _, want := range []string{directivePrices, directiveCurrency, directiveFile} {
+	for _, want := range []string{directivePrices, directiveCurrency, directiveFile, directiveNominal} {
 		found := false
 		for _, name := range names {
 			if name == want {

@@ -36,7 +36,15 @@ func buildPriceTable(cfg *config.Config) (*price.Table, error) {
 		external = loaded
 	}
 
-	return price.Build(declared, external, price.Options{Currency: cfg.Prices.Currency}), nil
+	opts := price.Options{Currency: cfg.Prices.Currency}
+	if cfg.Prices.NominalDeclared {
+		opts.Nominal = &price.Unit{
+			Currency:   cfg.Prices.Currency,
+			InputMTok:  cfg.Prices.NominalInputMTok,
+			OutputMTok: cfg.Prices.NominalOutputMTok,
+		}
+	}
+	return price.Build(declared, external, opts), nil
 }
 
 // priceReferenceWarnings 报告 price_from 指向了不存在条目的模型。

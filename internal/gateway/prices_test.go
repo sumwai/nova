@@ -69,6 +69,34 @@ func TestBuildPriceTableLoadsFile(t *testing.T) {
 	}
 }
 
+// TestBuildPriceTableUsesConfiguredNominal 守护 prices 块的名义价被用于未知价条目。
+func TestBuildPriceTableUsesConfiguredNominal(t *testing.T) {
+	cfg := &config.Config{
+		Providers: []config.Provider{pricedProvider("a", "m", "USD", 1)},
+		Prices: config.Prices{
+			Currency:          "USD",
+			NominalInputMTok:  42,
+			NominalOutputMTok: 84,
+			NominalDeclared:   true,
+		},
+	}
+
+	table, err := buildPriceTable(cfg)
+	if err != nil {
+		t.Fatalf("构造价格表失败：%v", err)
+	}
+	entry := table.Lookup("nothing/here")
+	if entry.Kind != price.Unknown || !entry.Assumed {
+		t.Fatalf("未登记的键 = %+v，期望 Unknown 且标 assumed", entry)
+	}
+	if got := price.Estimate(entry, price.Usage{Input: 1_000_000}); got != 42 {
+		t.Errorf("输入名义成本 = %v，期望 42", got)
+	}
+	if got := price.Estimate(entry, price.Usage{Output: 1_000_000}); got != 84 {
+		t.Errorf("输出名义成本 = %v，期望 84", got)
+	}
+}
+
 // TestBuildPriceTableReportsBadFile 守护价格文件读取失败是装配失败，并指回 prices 块。
 func TestBuildPriceTableReportsBadFile(t *testing.T) {
 	cfg := &config.Config{

@@ -306,6 +306,8 @@ provider relay {
 # prices {
 #     currency USD        # 条目未写币种时用它，缺省 USD
 #     file ./prices.yaml  # 相对路径相对于写下这一行的文件解析
+#     nominal 1.5 4       # 可选：prefer price 给「查不到价格」的候选用的名义单价
+#                         # （输入与输出，每百万 token）；不写则取已知单价的中位数
 # }
 #
 # prices.yaml 是「条目键 → 单价」的 YAML，键形如 <档案 id>/<模型 id>，与档案里
@@ -321,7 +323,7 @@ provider relay {
 # 不会被当成「免费」；全零单价同理按「查不到价格」处理。免费必须显式在档案里写 free。
 #
 # 文件在装配时读取（`nova run` 与 `nova reload`），路径写错即装配失败；
-# `nova config check` 只解析配置，不读这个文件。
+# `nova config check` 也会读它，路径写错不必等到启动才发现。
 
 # ── 模型自动发现与过滤 ─────────────────────────────────────────────
 #

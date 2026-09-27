@@ -33,6 +33,7 @@ const (
 const (
 	directiveCurrency = "currency"
 	directiveFile     = "file"
+	directiveNominal  = "nominal"
 )
 
 // provider 与 endpoint 两级的指令名。
@@ -102,8 +103,8 @@ var (
 
 	// pricesDirectives 是 prices 块的合法指令名。
 	//
-	// 与 profilesDirectives 同理：currency 与 file 只在 prices 块内有意义。
-	pricesDirectives = []string{directiveCurrency, directiveFile}
+	// 与 profilesDirectives 同理：currency / file / nominal 只在 prices 块内有意义。
+	pricesDirectives = []string{directiveCurrency, directiveFile, directiveNominal}
 
 	// blockDirectives 是能开启一个块的指令名，只为对外声明能力清单而存在。
 	blockDirectives = []string{directiveProvider, directiveEndpoint, directiveRoute, directiveProfiles, directivePrices}

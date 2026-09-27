@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -23,6 +24,15 @@ type Prices struct {
 
 	// PathDeclared 表示配置里确实写了一条 file。
 	PathDeclared bool
+
+	// NominalInputMTok / NominalOutputMTok 是 `prefer price` 给「查不到价格」的
+	// 候选使用的名义单价（每百万 token）。
+	//
+	// 两个分量一起给：排序只看输入与输出，给一个数会把「输出比输入贵若干倍」的
+	// 常见形状抹平。NominalDeclared 为假时不用这两个值，由价格层取已知单价的中位数。
+	NominalInputMTok  float64
+	NominalOutputMTok float64
+	NominalDeclared   bool
 
 	// File / Line / Col 指向 prices 块头，用于装配期读取文件失败时定位。
 	File string
@@ -146,7 +156,43 @@ func (p *parser) applyPricesLine(ln line, prices *Prices) error {
 			return nil
 		})
 
+	case directiveNominal:
+		if len(ln.tokens) != 3 {
+			return errorf(ln.file, head.line, head.col,
+				"%s 需要两个取值（输入与输出单价，单位是每百万 token），形如 `%s 1.5 4`",
+				directiveNominal, directiveNominal)
+		}
+		input, err := p.nominalAmount(ln, ln.tokens[1])
+		if err != nil {
+			return err
+		}
+		output, err := p.nominalAmount(ln, ln.tokens[2])
+		if err != nil {
+			return err
+		}
+		prices.NominalInputMTok = input
+		prices.NominalOutputMTok = output
+		prices.NominalDeclared = true
+		return nil
+
 	default:
 		return p.unknownDirective(head, pricesDirectives)
 	}
+}
+
+// nominalAmount 解析一个名义价取值：先展开占位符，再按非负浮点数解析。
+//
+// 名义价只用于 `prefer price` 的排序挡位，不是一条真实单价；负值会让一条未知价
+// 候选排在所有已知价之前，与「未知不等于免费」相矛盾，因此在解析期就拒掉。
+func (p *parser) nominalAmount(ln line, tok token) (float64, error) {
+	raw, err := p.expand(tok, ln)
+	if err != nil {
+		return 0, err
+	}
+	value, parseErr := strconv.ParseFloat(raw, 64)
+	if parseErr != nil || value < 0 {
+		return 0, errorf(ln.file, tok.line, tok.col,
+			"名义单价 %q 不是非负数字（形如 `%s 1.5 4`）", raw, directiveNominal)
+	}
+	return value, nil
 }
