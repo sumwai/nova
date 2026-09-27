@@ -298,10 +298,18 @@ func (t *Table) degrade(reason string) {
 }
 
 // Degraded 报告本表是否处于估算态，以及原因。
+//
+// 两个来源合并：快照层降级（载入/写盘失败、时间断档）与本地记账缺口。
 func (t *Table) Degraded() (bool, string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.degraded, t.degradedReason
+	if t.degraded {
+		return true, t.degradedReason
+	}
+	if t.accountingGap {
+		return true, t.accountingReason
+	}
+	return false, ""
 }
 
 // DefaultBlockCap 返回 quota 条目在 resets_at 缺席时的不可用上限。

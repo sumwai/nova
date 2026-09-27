@@ -162,6 +162,8 @@ const (
 	metaSchemaVersion = "schema_version"
 	metaSince         = "accounting_since"
 	metaRestarts      = "restarts"
+	// metaAccountingGap 记录「上次运行期间记账失败过」；空串表示无缺口。
+	metaAccountingGap = "accounting_gap"
 )
 
 func readMetaInt(db *sql.DB, key string) (int, bool, error) {

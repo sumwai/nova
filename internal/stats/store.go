@@ -78,6 +78,10 @@ type Store struct {
 	// 而不是只能翻日志。
 	writeErrors    int64
 	lastWriteError string
+	// accountingGap 记录「本地记账不完整」这一事实：首次落库失败时置位并写入 meta，
+	// 成功落库一次后清除。跨重启保留，供装配层把额度剩余量判为估算态。
+	accountingGap    bool
+	accountingReason string
 }
 
 // pendingRequest 是一个请求尚未与访问记录合并的上游尝试。
@@ -179,6 +183,12 @@ func (s *Store) loadMeta() error {
 	}
 	if err := writeMeta(s.db, metaSince, s.since.Format(time.RFC3339Nano)); err != nil {
 		return err
+	}
+	if gap, ok, err := readMeta(s.db, metaAccountingGap); err != nil {
+		return err
+	} else if ok && gap != "" {
+		s.accountingGap = true
+		s.accountingReason = gap
 	}
 	return writeMeta(s.db, metaRestarts, strconv.FormatInt(s.restarts, 10))
 }
@@ -316,15 +326,41 @@ func (s *Store) persistLocked(req Request) error {
 		s.lifetime.usageUnknownRequests++
 	}
 	s.lifetime.usage.add(req.Usage)
+	// 一次成功落库就说明记账重新完整：清掉缺口标记，避免重启后仍按估算态运行。
+	if s.accountingGap {
+		s.accountingGap = false
+		s.accountingReason = ""
+		_ = writeMeta(s.db, metaAccountingGap, "")
+	}
 	return nil
 }
 
 // noteWriteErrorLocked 记下落库失败；第一条例外是唯一一次值得报的消息。
+//
+// 首次失败还把它写进 meta：缺口影响的是额度剩余量的可信度，下一个进程也要知道。
+// meta 写入本身失败只忽略：那说明磁盘已经不可靠，再报一次也没有新的处置。
 func (s *Store) noteWriteErrorLocked(err error) {
 	s.writeErrors++
 	if s.lastWriteError == "" {
 		s.lastWriteError = err.Error()
 	}
+	if !s.accountingGap {
+		s.accountingGap = true
+		s.accountingReason = err.Error()
+		_ = writeMeta(s.db, metaAccountingGap, s.accountingReason)
+	}
+}
+
+// AccountingGap 报告本地记账是否被判定为不完整，以及原因。
+//
+// nil 接收者安全（未配置统计时返回「无缺口」）：调用方不必先判空。
+func (s *Store) AccountingGap() (bool, string) {
+	if s == nil {
+		return false, ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accountingGap, s.accountingReason
 }
 
 // pruneLocked 按保留期裁剪请求记录，最多每小时做一次。

@@ -457,6 +457,18 @@ func (rt *limitRuntime) runProbe(provider, execPath string, runner *probe.Runner
 	}
 }
 
+// markAccountingGap 把全部额度表标为「本地记账不完整」。
+//
+// 统计侧的落库失败没有账号归属（失败发生在写整条请求记录时），因此这里按最保守的
+// 做法把全部表都标上：偏保守只会少发请求，而漏标会让未记上的用量把剩余量算得偏乐观。
+func (rt *limitRuntime) markAccountingGap(reason string) {
+	for _, byRef := range rt.tables {
+		for _, table := range byRef {
+			table.MarkAccountingGap(reason)
+		}
+	}
+}
+
 // Close 落盘并关闭全部额度表。
 func (rt *limitRuntime) Close() error {
 	rt.probeStopOnce.Do(func() { close(rt.probeStop) })

@@ -123,6 +123,11 @@ type Table struct {
 	// 它让 Available 给出估算态，而不是一个看似准确的剩余值。
 	degraded       bool
 	degradedReason string
+	// accountingGap 表示本地记账被判定为不完整（统计落库失败）。它与 degraded 分开：
+	// 一次上游真实观测就能把它清掉（观测值已包含此前的实际用量），而快照损坏这类
+	// degraded 不会被观测清除。
+	accountingGap    bool
+	accountingReason string
 
 	// pending 是快照里载入、尚未与声明对齐的状态；键在声明出现时被应用。
 	pending map[Key]snapshotEntry
@@ -370,6 +375,9 @@ func (t *Table) observe(item *entry, limit profile.Limit, observedAt time.Time, 
 	}
 	if value > 0 {
 		t.clearBlockLocked(item.key.Scope, item.key.Model)
+		// 上游给出的剩余量已包含此前的实际用量，本地记账缺口因此不再影响判断。
+		t.accountingGap = false
+		t.accountingReason = ""
 	}
 
 	item.applyObservation(value)
@@ -435,6 +443,26 @@ func (t *Table) LearnExhausted(scope Scope, model string, until time.Time) {
 	t.blocks[key] = block{until: until, verdict: VerdictQuotaExhausted}
 	t.dirty = true
 	t.maybeFlush(now)
+}
+
+// MarkAccountingGap 把本表标记为「本地记账不完整」。
+//
+// 它只由装配层在统计报出记账缺口时调用；估算态下 Available 会对剩余量施加保守
+// 系数，且 Reason.Estimated 为真。一次真实观测（Observe 成功）会清掉它：那时上游
+// 给出的剩余量已经把此前未记上的用量包含在里面。
+func (t *Table) MarkAccountingGap(reason string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.accountingGap {
+		return
+	}
+	t.accountingGap = true
+	t.accountingReason = reason
+}
+
+// incomplete 报告本表的状态是否不完整：快照层降级或本地记账缺口，任一成立即是。
+func (t *Table) incomplete() bool {
+	return t.degraded || t.accountingGap
 }
 
 // Clear 显式清除某个作用域上学习到的不可用标记，并撤销静态声明的 absolute 判定。
@@ -519,7 +547,7 @@ func (t *Table) Reserve(scope Scope, model string, est Usage, now time.Time) (fu
 		if !known {
 			continue
 		}
-		if conservative || t.degraded {
+		if conservative || t.incomplete() {
 			remaining = t.conservative(remaining)
 		}
 		need := est.amount(item.key.Metric)
@@ -566,7 +594,7 @@ func (t *Table) Available(scope Scope, model string, now time.Time) (bool, Reaso
 	model = effectiveModel(scope, model)
 	matched := t.matchLocked(scope, model)
 
-	reason := Reason{Verdict: VerdictOK, Estimated: t.degraded, Model: model}
+	reason := Reason{Verdict: VerdictOK, Estimated: t.incomplete(), Model: model}
 	if len(matched) == 0 {
 		return true, reason
 	}
@@ -601,7 +629,7 @@ func (t *Table) Available(scope Scope, model string, now time.Time) (bool, Reaso
 		if !known {
 			continue
 		}
-		if conservative || t.degraded {
+		if conservative || t.incomplete() {
 			remaining = t.conservative(remaining)
 			reason.Estimated = true
 		}

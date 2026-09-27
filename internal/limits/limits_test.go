@@ -368,6 +368,41 @@ func TestClearReleasesDeclaredAbsoluteExhaustion(t *testing.T) {
 	}
 }
 
+// TestAccountingGapDegradesUntilObservation 守护记账缺口→估算态，且一次真实观测能清掉它。
+func TestAccountingGapDegradesUntilObservation(t *testing.T) {
+	clock := newTestClock()
+	table := newTable(clock, Options{})
+	if err := table.MergeDeclared(declaredDoc([]profile.Limit{accountQuota("5h", 100, 0)})); err != nil {
+		t.Fatalf("合并声明失败：%v", err)
+	}
+
+	table.MarkAccountingGap("统计落库失败")
+	ok, reason := table.Available(accountsScope(), "", clock.Now())
+	if !ok {
+		t.Fatalf("缺口下剩余量 100 经保守系数后仍应可用，reason=%+v", reason)
+	}
+	if !reason.Estimated {
+		t.Fatal("记账缺口必须在 Reason 里体现为估算态")
+	}
+	if degraded, _ := table.Degraded(); !degraded {
+		t.Fatal("记账缺口应让表报告降级")
+	}
+
+	observed := observedDoc(clock.Now(), []profile.Limit{
+		{Kind: "quota", Metric: "usd", Window: "5h", Limit: ptr(100), Remaining: ptr(80)},
+	})
+	if err := table.MergeObserved(observed); err != nil {
+		t.Fatalf("合并观测失败：%v", err)
+	}
+	ok, reason = table.Available(accountsScope(), "", clock.Now())
+	if !ok || reason.Estimated {
+		t.Fatalf("真实观测到达后应退出估算态，ok=%v reason=%+v", ok, reason)
+	}
+	if degraded, _ := table.Degraded(); degraded {
+		t.Fatal("真实观测到达后不应再报告降级")
+	}
+}
+
 // TestClearKeepsObservedBaseline 守护清除不动权威观测得到的基准。
 //
 // 观测代表上游实测，清除只针对「静态声明判为耗尽」；把观测也抹掉会把一个

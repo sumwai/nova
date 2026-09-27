@@ -233,6 +233,11 @@ func Assemble(ctx context.Context, cfg *config.Config, opts AssembleOptions) (*A
 	if opts.ProbeDataDir != "" {
 		limitRuntime.startProbes(cfg.Providers, &probe.Runner{DataDir: opts.ProbeDataDir})
 	}
+	// 上次运行或本次启动阶段出现过落库失败时，本地记账不可信：把额度表标为估算态，
+	// 按保守系数给剩余量，直到一次真实观测覆盖它。
+	if gap, reason := opts.Stats.AccountingGap(); gap {
+		limitRuntime.markAccountingGap("本地记账不完整：" + reason)
+	}
 	// 估算态不会自己浮到日志里：快照读失败、记账断档都只让 Available 给一个偏保守的值。
 	// 装配完成时把它一次说清，运行期就不再重复。
 	for _, warning := range limitRuntime.degradedWarnings() {

@@ -2,6 +2,7 @@ package stats
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -215,6 +216,48 @@ func TestStorePersistsAcrossReopen(t *testing.T) {
 	}
 	if len(providers) != 1 || providers[0] != "relay-a" {
 		t.Errorf("重启后渠道分组 = %v，期望 [relay-a]", providers)
+	}
+}
+
+// TestStoreAccountingGapPersistsUntilRecovery 守护记账缺口跨重启保留、成功落库后清除。
+func TestStoreAccountingGapPersistsUntilRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.db")
+	first, err := New(Options{Path: path})
+	if err != nil {
+		t.Fatalf("首次打开失败：%v", err)
+	}
+	first.mu.Lock()
+	first.noteWriteErrorLocked(errors.New("磁盘写失败"))
+	first.mu.Unlock()
+	if gap, reason := first.AccountingGap(); !gap || reason == "" {
+		t.Fatalf("落库失败后应报告缺口，实际 gap=%v reason=%q", gap, reason)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+
+	second, err := New(Options{Path: path})
+	if err != nil {
+		t.Fatalf("重开失败：%v", err)
+	}
+	if gap, _ := second.AccountingGap(); !gap {
+		t.Fatal("缺口应跨重启保留")
+	}
+	second.LogAccess(accessRecord("r1", 200))
+	if gap, _ := second.AccountingGap(); gap {
+		t.Fatal("一次成功落库后应清掉缺口")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+
+	third, err := New(Options{Path: path})
+	if err != nil {
+		t.Fatalf("再次打开失败：%v", err)
+	}
+	defer func() { _ = third.Close() }()
+	if gap, _ := third.AccountingGap(); gap {
+		t.Fatal("清除过的缺口不应再跨重启保留")
 	}
 }
 
