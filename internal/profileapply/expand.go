@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/credentials"
@@ -129,6 +130,7 @@ func expandProvider(
 	}
 	attachPlanLimits(provider, loaded, cfg)
 	attachLimitsMapping(provider, loaded)
+	attachUsage(provider, loaded)
 	if err := fillChannelAuth(provider, loaded); err != nil {
 		return err
 	}
@@ -601,6 +603,27 @@ func attachLimitsMapping(provider *config.Provider, loaded *profile.Profile) {
 		})
 	}
 	provider.LimitsMapping = rules
+}
+
+// attachUsage 把档案声明的用量探测配置写进渠道。
+//
+// interval 在档案加载期已校验为正的时间长度，这里再解析一次只是取它的时长形态；
+// 解析失败时留零值（表示未声明），不阻断展开。
+func attachUsage(provider *config.Provider, loaded *profile.Profile) {
+	if loaded.Usage == nil {
+		return
+	}
+	usage := &config.Usage{
+		Probe:  loaded.Usage.Probe,
+		Exec:   loaded.Usage.Exec,
+		Schema: loaded.Usage.Schema,
+	}
+	if loaded.Usage.Interval != "" {
+		if interval, err := time.ParseDuration(loaded.Usage.Interval); err == nil {
+			usage.Interval = interval
+		}
+	}
+	provider.Usage = usage
 }
 
 // fillChannelAuth 把档案声明的凭据注入形态与静态请求头写进渠道。

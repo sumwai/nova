@@ -260,6 +260,13 @@ func (p *Profile) checkSemantics(path string, root *yaml.Node) *Error {
 				"limits_mapping 的 match_body 不是合法正则：%v", err)
 		}
 	}
+	if p.Usage != nil && p.Usage.Interval != "" {
+		interval, err := time.ParseDuration(p.Usage.Interval)
+		if err != nil || interval <= 0 {
+			return pathAtNode(path, root, []string{"usage", "interval"},
+				"usage.interval 不是正的时间长度：%q", p.Usage.Interval)
+		}
+	}
 	return nil
 }
 

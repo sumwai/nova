@@ -234,6 +234,14 @@ func TestLoadRejectsUncompilableLimitsMappingRegex(t *testing.T) {
 	requireLocatedError(t, path, err, "limits_mapping", "正则")
 }
 
+// TestLoadRejectsBadUsageInterval 守护 usage.interval 是正的时间长度。
+func TestLoadRejectsBadUsageInterval(t *testing.T) {
+	content := minimalProfile + "usage: { exec: /tmp/probe, interval: 一会儿 }\n"
+	path := writeProfile(t, content)
+	_, err := Load(path)
+	requireLocatedError(t, path, err, "usage", "interval")
+}
+
 // TestPlanExpiresAt 守护计划到期时刻是带时区的绝对时刻，且能被解析读出。
 func TestPlanExpiresAt(t *testing.T) {
 	content := minimalProfile + `plans:

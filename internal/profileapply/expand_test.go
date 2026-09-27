@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/domain"
@@ -884,6 +885,39 @@ plans:
 	}
 	if declared[0].ExpiresAt != "2026-10-03T00:00:00Z" {
 		t.Errorf("expires_at = %q，期望随计划写入账号额度", declared[0].ExpiresAt)
+	}
+}
+
+// 档案的 usage 写进渠道，供 nova limits check 读取。
+func TestUsageExpandsToProvider(t *testing.T) {
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "profiles")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatalf("创建档案目录失败：%v", err)
+	}
+	writeFile(t, filepath.Join(profileDir, "probed.yaml"), `
+schema: 1
+id: probed
+auth: { header: authorization, scheme: Bearer, env: PROBED_KEY }
+endpoints:
+  openai_chat: { url: https://probed.example.com/v1/chat/completions, protocol: openai_chat }
+models:
+  - { id: m }
+usage: { exec: /tmp/probe.sh, interval: 90s, schema: limits-1 }
+`)
+	configPath := filepath.Join(dir, "Novafile")
+	writeFile(t, configPath, "version 1\nprofiles {\n    source ./profiles\n}\nprovider probed\n")
+
+	cfg, err := Load(configPath, Options{Getenv: envOf(map[string]string{"PROBED_KEY": "k"})})
+	if err != nil {
+		t.Fatalf("展开失败：%v", err)
+	}
+	usage := cfg.Providers[0].Usage
+	if usage == nil {
+		t.Fatal("usage 未写进渠道")
+	}
+	if usage.Exec != "/tmp/probe.sh" || usage.Interval != 90*time.Second || usage.Schema != "limits-1" {
+		t.Errorf("usage = %+v", usage)
 	}
 }
 

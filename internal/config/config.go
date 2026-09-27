@@ -162,10 +162,32 @@ type Provider struct {
 	// 运行期按它把上游状态码与响应体映射成三类错误；为空时按状态码启发式分级。
 	LimitsMapping []domain.LimitsRule
 
+	// Usage 是渠道所属平台声明的用量探测配置，展开阶段从档案写入。
+	// nil 表示没有声明探测；运行期不自动跑它，只有显式命令（nova limits check）会。
+	Usage *Usage
+
 	// File / Line / Col 指向 provider 名字的位置，用于报错时指回块头。
 	File string
 	Line int
 	Col  int
+}
+
+// Usage 是渠道所属平台声明的用量探测配置。
+//
+// 两种探测二选一：内置 probe 名由 nova 自带；exec 是绝对路径。运行期只由显式命令
+// 触发，不随启动或请求自动跑。
+type Usage struct {
+	// Probe 是内置探测名；非空时 Exec 必为空。
+	Probe string
+
+	// Exec 是外部探测的可执行文件绝对路径。
+	Exec string
+
+	// Interval 是建议的探测间隔；为零表示未声明。
+	Interval time.Duration
+
+	// Schema 是探测输出的文档 schema 名，仅作标注。
+	Schema string
 }
 
 // Account 是渠道里的一份凭据。
