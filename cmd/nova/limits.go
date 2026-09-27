@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/sumwai/nova/internal/config"
+	"github.com/sumwai/nova/internal/gateway"
 	"github.com/sumwai/nova/internal/probe"
 	"github.com/sumwai/nova/internal/profile"
 )
@@ -28,7 +33,7 @@ func newLimitsCmd() *cobra.Command {
 		Args:  rejectExtraArgs,
 		RunE:  func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
-	cmd.AddCommand(newLimitsCheckCmd())
+	cmd.AddCommand(newLimitsCheckCmd(), newLimitsClearCmd())
 	return cmd
 }
 
@@ -188,4 +193,77 @@ func sortedLimitModels(models map[string][]profile.Limit) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func newLimitsClearCmd() *cobra.Command {
+	var configPath string
+	var model string
+	cmd := &cobra.Command{
+		Use:   "clear <provider>",
+		Short: "清除运行中网关的额度标记与静态 absolute 判定",
+		Long: `按配置里的 admin 地址找到运行中的网关，投递一次显式清除：
+
+- 清掉该渠道账号上学习到的不可用标记与连续失败计数；
+- 撤销由档案静态声明推算出的 absolute 判定，让「已耗尽」的账号重新参与选路。
+
+它服务于 window: absolute 且 remaining: 0 这类没有自动恢复点的条目；
+其他窗口会在窗口切换时自行恢复，不需要这个入口。清除是显式动作，会让一个
+其实已耗尽的账号重新被选中，因此只在明确知道余额已恢复时使用。
+
+不带 --model 时清账号级判定；带上时额外限定到该模型的模型级条目。`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path, err := resolveConfigPath(configPath, os.Getenv)
+			if err != nil {
+				return err
+			}
+			return requestLimitsClear(cmd.Context(), path, args[0], model, cmd.OutOrStdout())
+		},
+	}
+	registerConfigFlag(cmd, &configPath)
+	cmd.Flags().StringVar(&model, "model", "", "额外限定到该模型的模型级条目")
+	return cmd
+}
+
+// requestLimitsClear 把显式清除请求投递给运行中的网关。
+func requestLimitsClear(ctx context.Context, path, provider, model string, stdout io.Writer) error {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+
+	payload, err := json.Marshal(map[string]string{"provider": provider, "model": model})
+	if err != nil {
+		return fmt.Errorf("构造清除请求失败：%w", err)
+	}
+	endpoint := "http://" + dialAddress(cfg.Admin) + gateway.LimitsClearPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("构造清除请求失败：%w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: reloadClientTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("连不上管理端点 %s（%w）；网关在跑吗？它读的是同一份配置吗？", cfg.Admin, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, reloadErrorLimit))
+	if resp.StatusCode != http.StatusOK {
+		detail := strings.TrimSpace(string(body))
+		if detail == "" {
+			detail = resp.Status
+		}
+		return fmt.Errorf("网关拒绝了这次清除：%s", detail)
+	}
+
+	var result struct {
+		Cleared int `json:"cleared"`
+	}
+	_ = json.Unmarshal(body, &result)
+	_, _ = fmt.Fprintf(stdout, "已清除渠道 %s 的额度标记（管理端点 %s，涉及 %d 个账号）\n",
+		provider, cfg.Admin, result.Cleared)
+	return nil
 }

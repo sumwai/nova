@@ -347,6 +347,25 @@ func (rt *limitRuntime) resetFailures(account string) {
 	delete(rt.failures, account)
 }
 
+// ClearProvider 清除一条渠道全部账号上学习到的标记与静态 absolute 判定，返回涉及的账号数。
+//
+// 这是「absolute 触顶没有自动恢复点」的运行期出口：管理端点收到显式清除请求时调它。
+// 它同时把该账号的连续失败计数清零，否则一次清除后紧接着的失败会沿用旧计数。
+func (rt *limitRuntime) ClearProvider(provider, model string) int {
+	byRef := rt.tables[provider]
+	if byRef == nil {
+		return 0
+	}
+	cleared := 0
+	for ref, table := range byRef {
+		scope := limits.Scope{Account: scopeName(provider, ref)}
+		table.Clear(scope, model)
+		rt.resetFailures(scopeName(provider, ref))
+		cleared++
+	}
+	return cleared
+}
+
 // Close 落盘并关闭全部额度表。
 func (rt *limitRuntime) Close() error {
 	var errs []error

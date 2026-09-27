@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,11 @@ import (
 // 两者都要翻源码才能定位。
 const AdminPath = "/load"
 
+// LimitsClearPath 是管理端点接受显式清除额度标记的路径。
+//
+// 它的公开路径与 /load 同属管理端点：两条都是本机运维动作，认证边界一致。
+const LimitsClearPath = "/limits/clear"
+
 // reloadPathLimit 是管理端点请求体的字节上限。
 //
 // 请求体只承载一个配置文件路径，用不到更长。设上限是为了不让一个不设防的
@@ -28,7 +34,7 @@ type adminHandler struct {
 	holder *Holder
 	reload func(ctx context.Context, path string) error
 
-	// mu 串行化重载。后到的请求等前一个做完，不做合并也不排队：
+	// mu 串行化管理动作。后到的请求等前一个做完，不做合并也不排队：
 	// 两次装配并发跑会同时读文件、同时连上游，而它们换入的先后无法由
 	// 请求到达顺序决定，最终生效的是哪一份就成了竞态。
 	mu sync.Mutex
@@ -48,10 +54,22 @@ func newAdminHandler(holder *Holder, reload func(context.Context, string) error)
 // 若改成「把内容传过来」，调用方与服务端就各解析一遍，两份理解迟早分叉，
 // 而分叉的那一刻表现为「reload 报成功、行为却没变」——最难查的一类故障。
 func (h *adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != AdminPath {
+	switch r.URL.Path {
+	case AdminPath:
+		h.serveReload(w, r)
+	case LimitsClearPath:
+		h.serveLimitsClear(w, r)
+	default:
 		http.Error(w, "未知管理路径", http.StatusNotFound)
-		return
 	}
+}
+
+// serveReload 实现 POST /load：请求体是配置文件路径，成功即 200 空体。
+//
+// 请求体传路径而不是配置内容，是为了让服务端走与启动期完全同一个 config.Load。
+// 若改成「把内容传过来」，调用方与服务端就各解析一遍，两份理解迟早分叉，
+// 而分叉的那一刻表现为「reload 报成功、行为却没变」——最难查的一类故障。
+func (h *adminHandler) serveReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "管理端点只接受 POST", http.StatusMethodNotAllowed)
@@ -80,6 +98,50 @@ func (h *adminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.reloadApplied(path)
 	w.WriteHeader(http.StatusOK)
+}
+
+// limitsClearRequest 是显式清除请求的 JSON 形状。
+//
+// model 可省：省略时清账号级判定；给出时只清该模型的模型级条目（账号级照样清，
+// 因为账号级标记与具体模型无关）。
+type limitsClearRequest struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+}
+
+// serveLimitsClear 实现 POST /limits/clear：清除一条渠道的额度标记与静态 absolute 判定。
+//
+// 这是 `window: absolute` 且 `remaining: 0` 这类「无自动恢复点」条目的运行期出口。
+// 清除是显式动作，因此可能让一个其实已耗尽的账号重新被选中——风险由调用方承担，
+// 接口只把「清了几张表」如实报回。
+func (h *adminHandler) serveLimitsClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "管理端点只接受 POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req limitsClearRequest
+	decoder := json.NewDecoder(io.LimitReader(r.Body, reloadPathLimit))
+	if err := decoder.Decode(&req); err != nil {
+		http.Error(w, "请求体不是合法的 JSON："+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Provider) == "" {
+		http.Error(w, "请求体缺少 provider", http.StatusBadRequest)
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	assembly := h.holder.Current()
+	cleared := 0
+	if assembly != nil && assembly.limits != nil {
+		cleared = assembly.limits.ClearProvider(req.Provider, req.Model)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int{"cleared": cleared})
 }
 
 // readReloadPath 从请求体读出配置文件路径。

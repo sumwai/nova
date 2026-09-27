@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/sumwai/nova/internal/limits"
 )
 
 func noopReload(context.Context, string) error { return nil }
@@ -164,4 +166,53 @@ func TestAdminHandlerSerializesReloads(t *testing.T) {
 	close(release)
 	<-done
 	<-done
+}
+
+// TestAdminLimitsClearReleasesAbsoluteExhaustion 守护管理端点的显式清除能撤销 absolute 判定。
+func TestAdminLimitsClearReleasesAbsoluteExhaustion(t *testing.T) {
+	account := acct(1, 1)
+	account.Limits = []limits.Declared{{
+		Kind: "quota", Metric: "credits", Window: "absolute", Remaining: floatPtr(0),
+	}}
+	assembly := testAssembly(t, accountConfig(false, account))
+	if assembly.limits.available("relay", "", "shared") {
+		t.Fatal("remaining: 0 的 absolute 声明应先判为不可用")
+	}
+
+	handler := newAdminHandler(NewHolder(assembly), noopReload)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, LimitsClearPath, strings.NewReader(`{"provider":"relay"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（体：%s）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"cleared":1`) {
+		t.Errorf("响应 = %q，期望 cleared=1", rec.Body.String())
+	}
+	if !assembly.limits.available("relay", "", "shared") {
+		t.Fatal("清除后 absolute 判定应被撤销")
+	}
+}
+
+// TestAdminLimitsClearRejectsBadRequest 守护清除接口的入参校验。
+func TestAdminLimitsClearRejectsBadRequest(t *testing.T) {
+	handler := newTestAdminHandler(t, noopReload)
+
+	for name, body := range map[string]string{
+		"缺少 provider": `{"model":"m"}`,
+		"不是 JSON":     "not-json",
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, LimitsClearPath, strings.NewReader(body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("状态码 = %d，期望 400", rec.Code)
+			}
+		})
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, LimitsClearPath, nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET 状态码 = %d，期望 405", rec.Code)
+	}
 }

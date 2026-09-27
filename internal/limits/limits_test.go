@@ -345,6 +345,58 @@ func TestExpiredDeclaredDocIsUnavailable(t *testing.T) {
 	}
 }
 
+// TestClearReleasesDeclaredAbsoluteExhaustion 守护显式清除能撤销 absolute 的静态判定。
+//
+// absolute 没有窗口可等，静态写的 remaining: 0 会一直挡住该账号；这正是
+// 「没有自动恢复点」的那一类，必须有显式出口。
+func TestClearReleasesDeclaredAbsoluteExhaustion(t *testing.T) {
+	clock := newTestClock()
+	table := newTable(clock, Options{})
+	doc := declaredDoc([]profile.Limit{
+		{Kind: "quota", Metric: "credits", Window: "absolute", Remaining: ptr(0)},
+	})
+	if err := table.MergeDeclared(doc); err != nil {
+		t.Fatalf("合并声明失败：%v", err)
+	}
+	if ok, _ := table.Available(accountsScope(), "", clock.Now()); ok {
+		t.Fatal("remaining: 0 的 absolute 声明应判为不可用")
+	}
+
+	table.Clear(accountsScope(), "")
+	if ok, reason := table.Available(accountsScope(), "", clock.Now()); !ok {
+		t.Fatalf("清除后应重新可用，reason=%+v", reason)
+	}
+}
+
+// TestClearKeepsObservedBaseline 守护清除不动权威观测得到的基准。
+//
+// 观测代表上游实测，清除只针对「静态声明判为耗尽」；把观测也抹掉会把一个
+// 的确实测到余额为 0 的账号重新放出去。
+func TestClearKeepsObservedBaseline(t *testing.T) {
+	clock := newTestClock()
+	table := newTable(clock, Options{})
+	doc := declaredDoc([]profile.Limit{
+		{Kind: "quota", Metric: "credits", Window: "absolute", Limit: ptr(10)},
+	})
+	if err := table.MergeDeclared(doc); err != nil {
+		t.Fatalf("合并声明失败：%v", err)
+	}
+	observed := observedDoc(clock.Now(), []profile.Limit{
+		{Kind: "quota", Metric: "credits", Window: "absolute", Limit: ptr(10), Remaining: ptr(0)},
+	})
+	if err := table.MergeObserved(observed); err != nil {
+		t.Fatalf("合并观测失败：%v", err)
+	}
+	if ok, _ := table.Available(accountsScope(), "", clock.Now()); ok {
+		t.Fatal("观测到 remaining: 0 时应判为不可用")
+	}
+
+	table.Clear(accountsScope(), "")
+	if ok, _ := table.Available(accountsScope(), "", clock.Now()); ok {
+		t.Fatal("清除不得抹掉权威观测得到的基准")
+	}
+}
+
 func TestParseWindowForms(t *testing.T) {
 	duration, err := parseWindow("5h", "", "")
 	if err != nil || duration.kind != windowDuration || duration.length != 5*time.Hour {

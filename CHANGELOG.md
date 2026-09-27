@@ -40,6 +40,11 @@
   `exec` 只允许放在 `${XDG_DATA_HOME:-~/.local/share}/nova/probes/` 下的绝对路径、
   组或其他人不可写；命令以 argv 直接执行、不经 shell、清空环境、固定工作目录、超时后强杀。
   内置 `usage.probe` 本版未实现（各平台用量接口属于需实测确认的平台事实），会明确报错。
+- 新增 `nova limits clear <provider> [--model <模型>]`：向运行中的网关投递一次显式清除，
+  清掉该渠道账号上学习到的不可用标记与连续失败计数，并撤销由档案静态声明推算出的
+  `absolute` 判定。管理端点新增 `POST /limits/clear`（JSON `{provider, model}`）。
+  它服务于 `window: absolute` 且 `remaining: 0` 这类没有自动恢复点的条目；清除不动
+  权威观测得到的基准。
 
 **凭据库与登录**
 
@@ -127,9 +132,6 @@
   （`quota` / `balance` / `credit` / `billing` / `额度` / `配额` / `余额` / `欠费`）；
   写了映射的档案以声明为准。
 - 跨币种价格不换算，`prefer price` 只保证同币种内的相对顺序；输出估计固定为 800 token。
-- 静态声明判为耗尽的账号没有运行期恢复入口：`nova limits` 只有 `check`（跑一次探测并回显），
-  尚缺清除/刷新运行中额度状态的入口，`window: absolute` 且 `remaining: 0` 的条目仍只能
-  手工改档案，或靠一次真实观测覆盖。
 - `usage` 探测只有 `exec` 路径，且只由 `nova limits check` 显式触发：人工确认与
   「档案 id ↔ 命令」绑定持久化、源可信度判定、按 TTL 自动调度均未实现。
 - 内置档案不带 `plans`，默认部署下额度层空转。

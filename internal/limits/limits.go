@@ -430,18 +430,37 @@ func (t *Table) LearnExhausted(scope Scope, model string, until time.Time) {
 	t.maybeFlush(now)
 }
 
-// Clear 显式清除某个作用域上学习到的不可用标记。
+// Clear 显式清除某个作用域上学习到的不可用标记，并撤销静态声明的 absolute 判定。
 //
-// absolute 类条目触顶没有 until，只能靠显式清除或一次真实观测覆盖；这个入口给脚本与
-// 人工用。它不清除 remaining <= 0 本身：那是上游事实，只能由新的观测改写。
+// absolute 类条目触顶没有 until，只能靠显式清除或一次真实观测覆盖。上游成功返回时
+// 也会走到这里：一次成功就是「静态声明说耗尽、实际不是」的证据，静态声明因此自愈。
+// 撤销只作用于由声明推算出的基准（assumed 为真）；观测得到的基准不动，那是上游事实。
+// 下次重新合并声明（reload）会重新应用静态值。
 func (t *Table) Clear(scope Scope, model string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	scope = t.normalizeScope(scope)
 	model = effectiveModel(scope, model)
 	t.clearBlockLocked(scope, model)
+	t.invalidateDeclaredLocked(scope, model)
 	t.dirty = true
 	t.maybeFlush(t.now())
+}
+
+// invalidateDeclaredLocked 撤销静态声明对 absolute 条目的判定。
+//
+// 只处理由声明推算出的基准（assumed 为真）：观测得到的基准代表上游实测，不得被
+// 「显式清除」抹掉。基准置空后 remaining() 报「未知」，账号因此重新可用，
+// 直到一次真实观测或下一次声明合并改写它。
+func (t *Table) invalidateDeclaredLocked(scope Scope, model string) {
+	for _, item := range t.matchLocked(scope, model) {
+		if item.spec.kind != windowAbsolute || !item.assumed || item.baseline == nil {
+			continue
+		}
+		item.baseline = nil
+		item.assumed = false
+		item.stale = false
+	}
 }
 
 // Consume 记一次成功请求的用量，进入本地累计。
