@@ -51,8 +51,11 @@ const (
 // 额度层接入后改为合并观测，理由是条目自身的「恶化立即生效、改善需一次实测确认」
 // 已经吸收了响应头造成的选路抖动。合并只落在已声明的键上：没有对应声明时
 // MergeObserved 会拒绝该键并保留其余，因此它不会凭响应头新建条目。
-func ParseHeaders(h http.Header) (*profile.LimitsDoc, error) {
-	now := time.Now().UTC()
+//
+// now 由调用方给出，而不是就地取 time.Now：观测时刻必须与额度表用于新鲜度判定的
+// 那个时钟同源，否则注入假时钟的测试里，刚收到的观测会被当成源自未来或早已过期。
+func ParseHeaders(h http.Header, now time.Time) (*profile.LimitsDoc, error) {
+	now = now.UTC()
 	doc := &profile.LimitsDoc{
 		Schema:     profile.CurrentSchema,
 		Source:     "headers",

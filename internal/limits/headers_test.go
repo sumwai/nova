@@ -28,7 +28,7 @@ func TestParseHeadersOpenAI(t *testing.T) {
 	h.Set("x-ratelimit-remaining-tokens", "90000")
 	h.Set("x-ratelimit-reset-tokens", "6m0s")
 
-	doc, err := ParseHeaders(h)
+	doc, err := ParseHeaders(h, time.Now())
 	if err != nil {
 		t.Fatalf("OpenAI 响应头应完整解析：%v", err)
 	}
@@ -67,7 +67,7 @@ func TestParseHeadersAnthropic(t *testing.T) {
 	h.Set("anthropic-ratelimit-requests-reset", reset)
 	h.Set("anthropic-ratelimit-tokens-remaining", "500")
 
-	doc, err := ParseHeaders(h)
+	doc, err := ParseHeaders(h, time.Now())
 	if err != nil {
 		t.Fatalf("Anthropic 响应头应完整解析：%v", err)
 	}
@@ -92,7 +92,7 @@ func TestParseHeadersRetryAfter(t *testing.T) {
 	h.Set("x-ratelimit-remaining-requests", "10")
 	h.Set("retry-after", "30")
 
-	doc, err := ParseHeaders(h)
+	doc, err := ParseHeaders(h, time.Now())
 	if err != nil {
 		t.Fatalf("retry-after 应能解析：%v", err)
 	}
@@ -116,7 +116,7 @@ func TestParseHeadersRetryAfterHTTPDate(t *testing.T) {
 	h := http.Header{}
 	h.Set("retry-after", time.Now().Add(40*time.Second).UTC().Format(http.TimeFormat))
 
-	doc, err := ParseHeaders(h)
+	doc, err := ParseHeaders(h, time.Now())
 	if err != nil {
 		t.Fatalf("HTTP 日期形态的 retry-after 应能解析：%v", err)
 	}
@@ -136,7 +136,7 @@ func TestParseHeadersBadValueWarnsButKeepsRest(t *testing.T) {
 	h.Set("x-ratelimit-remaining-requests", "5")
 	h.Set("x-ratelimit-reset-requests", "一会儿")
 
-	doc, err := ParseHeaders(h)
+	doc, err := ParseHeaders(h, time.Now())
 	var warn *Warn
 	if !errors.As(err, &warn) {
 		t.Fatalf("解析失败应返回 Warn，得到 %v", err)
@@ -153,7 +153,7 @@ func TestParseHeadersBadValueWarnsButKeepsRest(t *testing.T) {
 func TestParseHeadersIgnoresUnknownHeaders(t *testing.T) {
 	h := http.Header{}
 	h.Set("x-some-unknown-header", "1")
-	doc, err := ParseHeaders(h)
+	doc, err := ParseHeaders(h, time.Now())
 	if err != nil {
 		t.Fatalf("认不出的头应忽略：%v", err)
 	}

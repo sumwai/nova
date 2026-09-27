@@ -269,7 +269,7 @@ func (rt *limitRuntime) Observe(route domain.Route, model string, header http.He
 	if header == nil {
 		return
 	}
-	doc, err := limits.ParseHeaders(header)
+	doc, err := limits.ParseHeaders(header, rt.now())
 	if doc == nil {
 		return
 	}
