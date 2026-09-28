@@ -42,13 +42,18 @@ func newRunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			lookup, err := credentialLookup()
+			if err != nil {
+				return err
+			}
 			ctx, stop := notifyShutdown(cmd)
 			defer stop()
 
 			return gateway.Run(ctx, gateway.Options{
-				ConfigPath: path,
-				StatePath:  statePath,
-				LogOutput:  cmd.ErrOrStderr(),
+				ConfigPath:    path,
+				StatePath:     statePath,
+				LogOutput:     cmd.ErrOrStderr(),
+				LookupAccount: lookup,
 			})
 		},
 	}

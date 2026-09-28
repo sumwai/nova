@@ -24,6 +24,7 @@ const (
 // provider 与 endpoint 两级的指令名。
 const (
 	directiveAPIKey   = "api_key"
+	directiveAccount  = "account"
 	directiveURL      = "url"
 	directiveProtocol = "protocol"
 	directiveTimeout  = "timeout"
@@ -49,9 +50,9 @@ var (
 	}
 
 	providerDirectives = []string{
-		directiveAPIKey, directiveBalance, directiveURL, directiveProtocol, directiveTimeout,
-		directiveModel, directiveEndpoint, directiveDiscover, directiveAllow, directiveDeny,
-		directiveExpose,
+		directiveAPIKey, directiveAccount, directiveBalance, directiveURL, directiveProtocol,
+		directiveTimeout, directiveModel, directiveEndpoint, directiveDiscover, directiveAllow,
+		directiveDeny, directiveExpose,
 	}
 
 	// endpointDirectives 是 endpoint 子块的合法指令名。
@@ -111,6 +112,11 @@ type parser struct {
 
 	// getenv 用于展开 {env.NAME} 占位符。
 	getenv func(string) string
+
+	// ignoreMissingEnv 让 {env.NAME} 未设置时不报错，取值留空。
+	// 供只读配置结构的调用方使用（例如 nova login 列出渠道）：
+	// 登录时配置里的 {env.NAME} 未导出是常态。
+	ignoreMissingEnv bool
 
 	// seen 记下当前作用域里每条「只能写一次」的指令第一次出现的位置，
 	// 用于报「不能写两次」时指出前一次在哪。进入 provider 块时换一张新表，
@@ -286,6 +292,12 @@ func (p *parser) applyGlobal(ln line) error {
 			if err != nil {
 				return err
 			}
+			if value == "" && p.ignoreMissingEnv && v.kind == tokenPlaceholder {
+				// 宽松口径下（nova login 列渠道）未导出的 {env.NAME} 展开为空，
+				// 这里直接跳过：那条路径不启动服务，client_key 的取值用不上，
+				// 它不该拦住「列出可选的渠道」。
+				return nil
+			}
 			if value == "" || strings.ContainsAny(value, " \t") {
 				return errorf(ln.file, v.line, v.col,
 					"client_key 的取值不能为空、也不能含空白")
@@ -398,6 +410,9 @@ func (p *parser) expand(tok token, ln line) (string, error) {
 	}
 	value := p.getenv(name)
 	if value == "" {
+		if p.ignoreMissingEnv {
+			return "", nil
+		}
 		return "", errorf(tok.file, tok.line, tok.col,
 			"环境变量 %s 未设置或为空（占位符 %s 无法展开）", name, tok.text)
 	}

@@ -31,9 +31,15 @@ func newModelsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := config.Load(path)
+			// 宽松加载：本命令的定位是「给出报告」，而没有凭据时显式声明的模型仍然列得出来。
+			// account 取不到的渠道由加载期记一条提醒，发现过程在报告里逐条给出失败原因，
+			// 两者合起来回答「为什么少了一批模型」；让整条命令在这里退出就看不到这些了。
+			cfg, err := loadConfigForInspection(path)
 			if err != nil {
 				return err
+			}
+			for _, warn := range cfg.Warnings {
+				fmt.Fprintf(cmd.ErrOrStderr(), "提醒 %s\n", warn.String())
 			}
 			// 名字先校验：过滤到一个不存在的渠道时，静默给一份空报告会让人以为
 			// 「这条渠道一个模型都没有」，而真相是名字写错了。

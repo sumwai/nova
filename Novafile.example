@@ -201,6 +201,28 @@ provider relay {
 #     api_key {env.OPENAI_KEY_1}
 #     api_key {env.OPENAI_KEY_2}
 
+# ── 凭据库 ───────────────────────────────────────────────────
+#
+# 密钥也可以不写进配置文件，存进凭据库后用 account 引用：
+#
+# provider commandcode {
+#     url https://api.commandcode.ai/v1/chat/completions
+#     model gpt-5
+#     account default        # 取凭据库里 commandcode 的 default 账号
+#     account work 3         # 第二个账号，权重 3
+# }
+#
+# account 的取值是 [<命名空间>.]<账号名>，省略命名空间时用本渠道名；
+# 写 account opencode-go.work 可以让本渠道引用另一份凭据。
+# api_key 与 account 都是账号声明，可以混排，按书写顺序进入同一个账号池。
+#
+#   nova login                    列出配置里的渠道，选一个再输入密钥
+#   nova login commandcode work   直接给渠道名与账号名
+#   nova account                  列出已存的账号（缺省给脱敏后的密钥）
+#   nova logout                   列出已存账号，选一个删除
+#
+# 凭据库落在 ${XDG_CONFIG_HOME:-$HOME/.config}/nova/credentials.json。
+
 # ── 跨渠道分摊与回退 ──────────────────────────────────
 #
 # 同一个对外名落在多条渠道上时，缺省按渠道的声明顺序回退：前面那条失败且可重试，

@@ -38,6 +38,11 @@ type Options struct {
 	// 它与命令行结果输出分开：日志走 stderr 时，`nova version --json | jq`
 	// 才不会被日志行污染。
 	LogOutput io.Writer
+
+	// LookupAccount 按命名空间与账号名取明文密钥，供配置里的 account 指令取值。
+	// 由命令行注入而不是在这里读凭据库：gateway 只消费「取哪份密钥」的结果，
+	// 凭据库的位置与权限是命令行侧的事实。为零值时 account 指令按加载失败报出。
+	LookupAccount func(namespace, name string) (string, bool)
 }
 
 // Run 装配配置并开始服务，直到 ctx 结束或某个监听器失败。
@@ -46,7 +51,7 @@ type Options struct {
 // 而 Run 只需要知道「什么时候该停」。这让同一段服务逻辑能被测试用
 // context.WithCancel 驱动，不必给测试进程发真的信号。
 func Run(ctx context.Context, opt Options) error {
-	cfg, err := config.Load(opt.ConfigPath)
+	cfg, err := config.LoadWith(opt.ConfigPath, config.Options{LookupAccount: opt.LookupAccount})
 	if err != nil {
 		return err
 	}
@@ -62,7 +67,12 @@ func Run(ctx context.Context, opt Options) error {
 		first.Logger.failure("统计库不可用，本次运行不记录统计", storeErr)
 	}
 
-	s := &server{holder: NewHolder(first), out: opt.LogOutput, stats: store}
+	s := &server{
+		holder:        NewHolder(first),
+		out:           opt.LogOutput,
+		stats:         store,
+		lookupAccount: opt.LookupAccount,
+	}
 	reportWarnings(first.Logger, cfg)
 	first.Logger.startup(cfg, first.Stats, false)
 	serveErr := s.serve(ctx)
@@ -80,6 +90,8 @@ type server struct {
 	out    io.Writer
 	// stats 是进程级统计存储，跨 reload 复用；每次装配共用它，因此累计不会因换配置归零。
 	stats *stats.Store
+	// lookupAccount 供 reload 重新加载配置时展开 account 指令；与启动时同一个来源。
+	lookupAccount func(namespace, name string) (string, bool)
 }
 
 // serve 建立两个监听器并等它们结束。
@@ -179,7 +191,7 @@ func (s *server) reload(ctx context.Context, path string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	next, err := config.Load(path)
+	next, err := config.LoadWith(path, config.Options{LookupAccount: s.lookupAccount})
 	if err != nil {
 		return err
 	}
