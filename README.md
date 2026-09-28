@@ -97,7 +97,8 @@ provider openai {
 ### 上游渠道
 
 `provider <名>` 描述一条上游渠道。名字只用于日志与错误定位，不参与选路。
-凭据 `api_key` 写在 provider 一级，本块的**所有端点共用它**；写多条就是多个账号，
+凭据写在 provider 一级，本块的**所有端点共用它**：可以写 `api_key <密钥>` 直接给出，
+也可以写 `account <账号名>` 从凭据库取（见「凭据库」）。写多条就是多个账号，
 见下面的「一个渠道多个账号」。
 
 一条端点由三件事构成：**地址、协议、它提供哪些模型**。
@@ -216,6 +217,70 @@ api_key {env.OPENAI_KEY_2}
 顺序决定账号顺序。账号池是渠道级的，`import` 写在 provider 块内即可，与端点无关。
 
 `config check` 与启动横幅在多账号时多输出一行账号池摘要（账号数与调度口径）。
+
+### 凭据库
+
+密钥不必写进配置文件：`nova login` 把它存进凭据库，provider 用 `account <账号名>` 引用。
+
+```
+provider commandcode {
+    url https://api.commandcode.ai/v1/chat/completions
+    model gpt-5
+
+    account default       # 取凭据库里 commandcode 的 default 账号
+    account work 3        # 第二个账号，权重 3
+}
+```
+
+`account` 的取值是 `[<命名空间>.]<账号名>`，省略命名空间时用本渠道名。命名空间写出来，
+是为了让一条渠道引用另一份凭据：`account opencode-go.work` 取的是 `opencode-go` 名下的账号，
+而本渠道可以叫别的名字。`api_key` 与 `account` 都是账号声明，可以混排，按书写顺序进入
+同一个账号池；`balance` 与权重对两者一视同仁。
+
+凭据库落在 `${XDG_CONFIG_HOME:-$HOME/.config}/nova/credentials.json`：目录 `0700`、
+文件 `0600`，明文存密钥，写入走临时文件加 rename 并 fsync。键是「命名空间 + 账号名」，
+与配置文件里的 provider 名可以不同——同一份凭据因此能被多条渠道共用。
+
+```
+nova login                       # 列出配置里的渠道，选一个；再给账号名
+nova login commandcode           # 直接给渠道名，用 default（该渠道已有 default 时报错）
+nova login commandcode work      # 指定账号名
+nova account                     # 列出已存的账号（缺省给脱敏后的密钥）
+nova account --show              # 连完整密钥一起列出
+nova logout                      # 列出已存账号，选一个删除
+nova logout commandcode work     # 直接删指定账号
+```
+
+省略 provider 时进入一个向导，三步在一个界面里走完：选渠道 → 选账号（或「添加新账号」）
+→ 输入密钥。上下键选择（`↑`/`↓`）、回车确认、`Esc` 取消；标准输入不是终端（管道、
+脚本、CI）时退回逐段提问的编号列表，两条路径都可用脚本驱动。
+
+选完渠道后，若该渠道在凭据库里已有账号，会列出它们（带脱敏后的密钥：长密钥给前 12 位
+与后 8 位，较短的给前 6 位与后 6 位，中间都是 `****`）并在末尾给出
+「添加新账号」：选一个已有账号就是更新它的密钥，选「添加新账号」才问名字；
+没有账号时直接问名字，缺省 `default`。
+
+账号名只收字母、数字、下划线、连字符，且不得与已有账号重名（重名的下一步是从列表里
+选它去更新）。只给渠道名、不给账号名的形式（`nova login commandcode`）在该渠道已有
+`default` 时会报错，要覆盖必须显式写出 `nova login commandcode default`。多账号因此
+写成两条 `account`，分别用 `nova login commandcode` 与 `nova login commandcode work` 存。
+
+密钥有三种取法：终端上无回显读入（缺省）、`--key-stdin` 从标准输入读、`--key-env VAR`
+读环境变量；标准输入不是终端、又没给来源标志时报错，而不是静默读到一个空值。
+交互式的 `nova login` 与 `nova logout` 读配置列出可选渠道与账号，因此它们要在能读到
+配置文件的前提下运行。
+
+**登录流程不联网，也不校验密钥是否有效**：一次被拒绝的 401 会推迟到第一次请求。这一点
+是有意的——登录要在没有网络的机器上也能用，而密钥是否可用只有上游能回答。
+
+`nova run` 在装配期从凭据库取密钥；`nova reload` 每次都重新读凭据库，因此「先 `nova login`
+再 `nova reload`」拿得到新账号，`nova logout` 之后的重载也会真地丢掉已删的密钥。
+配置里的 `account` 引用的账号不在凭据库里时，两条命令都以 `文件:行:列` 报出，并给出
+补登录的命令。
+
+`nova config check` 与 `nova models` 不因凭据缺失失败：前者只校验写法，适合放进 CI；
+后者要在没有凭据的机器上也给出报告，显式声明的模型照常列出。两者都会为尚未登录的
+账号打一条提醒，`models` 里那条渠道的发现则会在报告里逐条给出失败原因。
 
 ### 跨渠道分摊与回退
 
@@ -482,6 +547,9 @@ nova run [-c PATH]              启动网关
 nova reload [-c PATH]           让运行中的网关重新加载配置
 nova config check [-c PATH]     只校验配置，不启动
 nova models [-c PATH]           列出网关会认哪些模型（会连上游）
+nova login [PROVIDER] [账号名]   把 API Key 存进凭据库
+nova logout [PROVIDER] [账号名]  从凭据库删除账号
+nova account [--show]           列出凭据库里的账号
 nova version [--json]           打印版本信息
 nova help [COMMAND]             帮助
 ```
@@ -500,6 +568,10 @@ nova config check -c Novafile || exit 1
 
 配置里有发现型端点（写了 `discover`）时，它额外说明「清单内容由上游决定、本次校验没有连上游」：
 不联网是这条命令的定位，而清单里的模型是否真的可用，只有 `nova models` 或启动日志能回答。
+
+它也不读凭据库：`account` 引用的账号是否存在属于本机登录状态，不由这条命令回答，
+CI 里没有凭据库也能校验写法；尚未登录的账号会以一条提醒出现。凭据是否存在由
+`nova run` 与 `nova reload` 在装配期回答。
 
 ### 热重载
 

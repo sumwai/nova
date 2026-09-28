@@ -12,7 +12,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/sumwai/nova/internal/config"
 	"github.com/sumwai/nova/internal/gateway"
 )
 
@@ -56,7 +55,7 @@ func newReloadCmd() *cobra.Command {
 // 运行、并读到同一份文件。这个前提写进错误消息里：它是「reload 连不上」时
 // 唯一需要检查的东西，写出来能省掉一轮「哪一步不对」的排查。
 func requestReload(ctx context.Context, path string, stdout io.Writer) error {
-	cfg, err := config.Load(path)
+	cfg, err := loadConfigWithCredentials(path)
 	if err != nil {
 		return err
 	}

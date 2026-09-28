@@ -134,11 +134,18 @@ type Account struct {
 	// APIKey 是明文密钥，由 api_key 指令给出，{env.NAME} 已在解析期展开。
 	APIKey string
 
+	// Namespace 是 account 指令引用的凭据命名空间；api_key 指令产生的账号为空。
+	Namespace string
+
+	// Name 是 account 指令引用的账号名；api_key 指令产生的账号为空。
+	// 非空表示这份凭据要在解析完成后从凭据库取出。
+	Name string
+
 	// Weight 是 balance 下的分摊权重，缺省 1。
 	// 未写 balance 时它没有作用，加载期会记一条提醒。
 	Weight int
 
-	// Index 是声明序号，从 1 起，按 api_key 行的出现顺序。
+	// Index 是声明序号，从 1 起，按 api_key 与 account 行的出现顺序。
 	// 日志、凭据引用与轮转顺序都用它定位账号。
 	Index int
 
@@ -498,6 +505,20 @@ func (w Warning) String() string {
 type Options struct {
 	// Getenv 读环境变量，用于展开 {env.NAME}。为零值时用 os.Getenv。
 	Getenv func(string) string
+
+	// LookupAccount 按命名空间与账号名取明文密钥，供 account 指令取值。
+	// 为零值、且 IgnoreMissingAccount 未打开时，account 指令按加载失败报出。
+	LookupAccount func(namespace, name string) (string, bool)
+
+	// IgnoreMissingEnv 让 {env.NAME} 未设置时不报错，取值留空。
+	// 供只读配置结构、又不保证进程环境的调用方使用（nova login 列出渠道）：
+	// 登录时配置里的 {env.NAME} 未导出是常态，不该让「列出可选渠道」先失败。
+	IgnoreMissingEnv bool
+
+	// IgnoreMissingAccount 让 account 引用的账号缺失时不报错，取值留空。
+	// 供只校验配置写法的调用方使用（nova config check）：凭据库是使用者 HOME 下的
+	// 状态，CI 里通常没有，不属于「写法对不对」的范围。要连上游的命令不能打开它。
+	IgnoreMissingAccount bool
 }
 
 // Load 读取并解析一份 Novafile。
@@ -551,11 +572,68 @@ func ParseWith(src []byte, filename string, opts Options) (*Config, error) {
 	}
 	cfg.Warnings = append(cfg.Warnings, im.warnings...)
 
-	p := &parser{lines: lines, cfg: cfg, seen: map[string]token{}, getenv: getenv}
+	p := &parser{
+		lines:            lines,
+		cfg:              cfg,
+		seen:             map[string]token{},
+		getenv:           getenv,
+		ignoreMissingEnv: opts.IgnoreMissingEnv,
+	}
 	if err := p.run(); err != nil {
 		return nil, err
 	}
+	if err := fillAccountCredentials(cfg, opts); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// fillAccountCredentials 把 account 指令声明的引用换成明文密钥。
+//
+// 取值排在解析之后、返回之前：account 行本身只表达「这个渠道用凭据库里的哪个账号」，
+// 密钥是外部状态，解析期不必依赖它；而装配期需要的是可直接注入的明文，因此在这里
+// 一次补齐。引用的账号不存在时报错并指回那一行，同时给出下一步命令。
+func fillAccountCredentials(cfg *Config, opts Options) error {
+	for i := range cfg.Providers {
+		provider := &cfg.Providers[i]
+		for j := range provider.Accounts {
+			account := &provider.Accounts[j]
+			if account.Name == "" {
+				continue
+			}
+			namespace := account.Namespace
+			if namespace == "" {
+				namespace = provider.Name
+			}
+			var key string
+			var ok bool
+			if opts.LookupAccount != nil {
+				key, ok = opts.LookupAccount(namespace, account.Name)
+			}
+			if !ok {
+				if opts.IgnoreMissingAccount {
+					// 宽松口径下取值留空，但不能让缺失无声通过：调用方（nova config
+					// check、nova models）会把这条提醒打出来，它同时回答「为什么发现
+					// 型端点会失败」与「下一步敲什么」。
+					cfg.Warnings = append(cfg.Warnings, Warning{
+						File: account.File,
+						Line: account.Line,
+						Msg: fmt.Sprintf(
+							"provider %s 引用的账号 %q 尚未登录（命名空间 %s）；"+
+								"运行时会装配失败，可跑 `nova login %s %s` 添加",
+							provider.Name, account.Name, namespace, namespace, account.Name),
+					})
+					continue
+				}
+				return errorf(account.File, account.Line, account.Col,
+					"provider %s 引用的账号 %q 不在凭据库里（命名空间 %s）；"+
+						"可跑 `nova login %s %s` 添加",
+					provider.Name, account.Name, namespace, namespace, account.Name)
+			}
+			account.APIKey = key
+		}
+	}
+	return nil
 }
 
 // InstructionNames 返回本二进制接受的配置指令名，已去重并按字典序升序排列。

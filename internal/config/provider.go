@@ -111,7 +111,7 @@ func (p *parser) applyProviderLine(
 	// 不是另一种写法。
 	if head.text != directiveModel && head.text != directiveAllow &&
 		head.text != directiveDeny && head.text != directiveExpose &&
-		head.text != directiveAPIKey {
+		head.text != directiveAPIKey && head.text != directiveAccount {
 		if err := p.rejectRepeat(head); err != nil {
 			return err
 		}
@@ -120,6 +120,9 @@ func (p *parser) applyProviderLine(
 	switch head.text {
 	case directiveAPIKey:
 		return p.appendAccount(ln, provider)
+
+	case directiveAccount:
+		return p.appendNamedAccount(ln, provider)
 
 	case directiveBalance:
 		return p.setBalance(ln, provider)
@@ -185,6 +188,76 @@ func (p *parser) appendAccount(ln line, provider *Provider) error {
 	}
 	provider.Accounts = append(provider.Accounts, account)
 	return nil
+}
+
+// appendNamedAccount 追加一个引用凭据库的账号。
+//
+// 形态是 `account <引用> [<权重>]`，引用形如 `[<命名空间>.]<账号名>`：
+// 省略命名空间时用本渠道名。命名空间写出来是为了让一个渠道引用另一份凭据
+// （同一平台的多条渠道共用一份密钥），或让渠道名与凭据命名空间分开。
+//
+// 密钥不在这里取：解析层只记下引用，取值由装配期完成。这样 `nova config check`
+// 与 `nova models` 才能在没有凭据的机器上工作，而「账号不存在」也在真正要用它时
+// 才报出来。
+func (p *parser) appendNamedAccount(ln line, provider *Provider) error {
+	head := ln.tokens[0]
+	switch {
+	case len(ln.tokens) < 2:
+		return errorf(ln.file, head.line, valueColumn(head),
+			"%s 缺少账号引用（形如 %s default，或 %s <命名空间>.<账号名>）",
+			directiveAccount, directiveAccount, directiveAccount)
+	case len(ln.tokens) > 3:
+		extra := ln.tokens[3]
+		return errorf(ln.file, extra.line, extra.col,
+			"%s 至多接受两个取值（账号引用与分摊权重），多出来的是 %q",
+			directiveAccount, extra.text)
+	}
+
+	refTok := ln.tokens[1]
+	if refTok.kind != tokenWord {
+		return errorf(ln.file, refTok.line, refTok.col,
+			"%s 的账号引用不能是花括号：%s 引用凭据库里的账号，不是 {env.NAME} 那种取值来源",
+			directiveAccount, directiveAccount)
+	}
+
+	namespace, name := splitAccountRef(provider.Name, refTok.text)
+	if namespace == "" || name == "" {
+		return errorf(ln.file, refTok.line, refTok.col,
+			"%s 的账号引用 %q 格式不对；形如 %s default 或 %s <命名空间>.<账号名>（两段都不能为空）",
+			directiveAccount, refTok.text, directiveAccount, directiveAccount)
+	}
+
+	account := Account{
+		Namespace: namespace,
+		Name:      name,
+		Weight:    1,
+		Index:     len(provider.Accounts) + 1,
+		File:      ln.file,
+		Line:      ln.no,
+		Col:       head.col,
+	}
+	if len(ln.tokens) == 3 {
+		weightTok := ln.tokens[2]
+		weight, err := strconv.Atoi(weightTok.text)
+		if err != nil || weight < 1 {
+			return errorf(ln.file, weightTok.line, weightTok.col,
+				"分摊权重 %q 不是正整数（形如 %s work 3）", weightTok.text, directiveAccount)
+		}
+		account.Weight = weight
+	}
+	provider.Accounts = append(provider.Accounts, account)
+	return nil
+}
+
+// splitAccountRef 把账号引用拆成命名空间与账号名。
+//
+// 引用形如 `[<命名空间>.]<账号名>`：带点时按第一个点拆开，不带点时命名空间取本渠道名。
+// 命名空间因此不含点，账号名可以含点。
+func splitAccountRef(providerName, ref string) (namespace, name string) {
+	if before, after, ok := strings.Cut(ref, "."); ok {
+		return before, after
+	}
+	return providerName, ref
 }
 
 // setBalance 处理 balance 指令。
@@ -588,8 +661,8 @@ func deriveListingURL(endpointURL string, protocol domain.Protocol) (string, boo
 func (p *parser) finishProvider(provider *Provider) error {
 	if len(provider.Accounts) == 0 {
 		return errorf(provider.File, provider.Line, provider.Col,
-			"provider %s 没有任何凭据：至少需要一条 %s",
-			provider.Name, directiveAPIKey)
+			"provider %s 没有任何凭据：至少需要一条 %s 或 %s",
+			provider.Name, directiveAPIKey, directiveAccount)
 	}
 	if len(provider.Endpoints) == 0 {
 		return errorf(provider.File, provider.Line, provider.Col,
@@ -635,10 +708,18 @@ func (p *parser) warnAccountPolicy(provider *Provider) {
 			File: account.File,
 			Line: account.Line,
 			Msg: fmt.Sprintf("provider %s 未写 %s，账号按声明顺序调度，这条 %s 的权重没有作用",
-				provider.Name, directiveBalance, directiveAPIKey),
+				provider.Name, directiveBalance, accountDirectiveName(account)),
 		})
 		return
 	}
+}
+
+// accountDirectiveName 返回一个账号来自哪条指令，用于提醒里指回那一行。
+func accountDirectiveName(account Account) string {
+	if account.Name != "" {
+		return directiveAccount
+	}
+	return directiveAPIKey
 }
 
 // finishEndpoint 校验一条端点并补齐缺省值。

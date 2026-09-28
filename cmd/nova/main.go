@@ -38,8 +38,17 @@ func main() {
 // 因此能在测试里换成 buffer，「打印了什么」与「退出码是几」都能被断言，
 // 而不必去捕获取进程的文件描述符。
 func execute(args []string, stdout, stderr io.Writer) int {
+	return executeWith(args, os.Stdin, stdout, stderr)
+}
+
+// executeWith 与 execute 相同，只是把标准输入也作为入参。
+//
+// 供测试注入输入：login / logout 会从标准输入读选择与密钥，而 os.Stdin 在测试里
+// 既不能喂数据、也会让并发测试互相干扰。
+func executeWith(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	cmd := newRootCmd(stdout, stderr)
 	cmd.SetArgs(normalizeArgs(args))
+	cmd.SetIn(stdin)
 
 	switch err := cmd.Execute(); {
 	case err == nil:

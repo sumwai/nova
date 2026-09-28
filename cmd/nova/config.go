@@ -5,8 +5,6 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-
-	"github.com/sumwai/nova/internal/config"
 )
 
 func newConfigCmd() *cobra.Command {
@@ -37,7 +35,7 @@ func newConfigCheckCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := config.Load(path)
+			cfg, err := loadConfigForInspection(path)
 			if err != nil {
 				return err
 			}
